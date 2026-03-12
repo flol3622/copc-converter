@@ -465,9 +465,10 @@ impl OctreeBuilder {
                     parts[1].parse::<i32>(),
                     parts[2].parse::<i32>(),
                     parts[3].parse::<i32>(),
-                ) {
-                    keys.push(VoxelKey { level: l, x, y, z });
-                }
+                )
+            {
+                keys.push(VoxelKey { level: l, x, y, z });
+            }
         }
         Ok(keys)
     }
@@ -503,10 +504,11 @@ impl OctreeBuilder {
 
             for ck in child_keys {
                 if let Some(parent) = ck.parent()
-                    && let Some(cpts) = node_map.get(&ck) {
-                        let sample = thin_sample(cpts, MAX_NODE_POINTS / 8);
-                        parent_candidates.entry(parent).or_default().extend(sample);
-                    }
+                    && let Some(cpts) = node_map.get(&ck)
+                {
+                    let sample = thin_sample(cpts, MAX_NODE_POINTS / 8);
+                    parent_candidates.entry(parent).or_default().extend(sample);
+                }
             }
 
             for (pk, mut pts) in parent_candidates {
