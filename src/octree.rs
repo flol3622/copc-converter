@@ -398,7 +398,7 @@ impl OctreeBuilder {
                 point_idx += 1;
 
                 // Flush buffers periodically to keep RAM usage low.
-                if point_idx % FLUSH_EVERY as u64 == 0 {
+                if point_idx.is_multiple_of(FLUSH_EVERY as u64) {
                     Self::flush_buffers(&mut buffers, &mut writers, &self.tmp_dir)?;
                 }
             }
@@ -459,8 +459,8 @@ impl OctreeBuilder {
             let entry = entry?;
             let name = entry.file_name().into_string().unwrap_or_default();
             let parts: Vec<&str> = name.split('_').collect();
-            if parts.len() == 4 {
-                if let (Ok(l), Ok(x), Ok(y), Ok(z)) = (
+            if parts.len() == 4
+                && let (Ok(l), Ok(x), Ok(y), Ok(z)) = (
                     parts[0].parse::<i32>(),
                     parts[1].parse::<i32>(),
                     parts[2].parse::<i32>(),
@@ -468,7 +468,6 @@ impl OctreeBuilder {
                 ) {
                     keys.push(VoxelKey { level: l, x, y, z });
                 }
-            }
         }
         Ok(keys)
     }
@@ -503,12 +502,11 @@ impl OctreeBuilder {
             let mut parent_candidates: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
 
             for ck in child_keys {
-                if let Some(parent) = ck.parent() {
-                    if let Some(cpts) = node_map.get(&ck) {
+                if let Some(parent) = ck.parent()
+                    && let Some(cpts) = node_map.get(&ck) {
                         let sample = thin_sample(cpts, MAX_NODE_POINTS / 8);
                         parent_candidates.entry(parent).or_default().extend(sample);
                     }
-                }
             }
 
             for (pk, mut pts) in parent_candidates {
