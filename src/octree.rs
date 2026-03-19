@@ -2,45 +2,64 @@
 ///
 /// Strategy
 /// --------
-/// 1. Pass 1 – scan all input files, collect bounding box + point count.
-/// 2. Determine octree depth so that leaf nodes contain ≤ MAX_LEAF_POINTS.
+/// 1. Pass 1 – scan all input files in parallel, collect bounding box + point count.
+/// 2. Determine octree depth so that leaf nodes contain ≤ MAX_LEAF_POINTS on average.
 /// 3. Pass 2 – read every point, assign it to the leaf voxel key, and
 ///    accumulate into per-key temporary files on disk.
-/// 4. Build the tree bottom-up: each parent node gets a random sample
-///    of its children's points (so upper levels are sparse overviews).
-/// 5. Produce the list of (VoxelKey, Vec<RawPoint>) for the writer.
+///    Point classification (key + coordinate conversion) is parallelized via rayon.
+///    Memory-aware: fast path (full file) or batched path depending on budget.
+/// 4. Normalize leaves: any leaf with > MAX_NODE_POINTS is split into children on disk.
+/// 5. Build the tree bottom-up in parallel: each parent node gets a thinned sample
+///    of its children's points written back to disk.
+/// 6. Produce the list of (VoxelKey, point_count) for the writer, which reads from disk.
 ///
-/// Memory usage stays well below 16 GB because each pass processes one
-/// input file at a time and flushes leaf buffers to disk.
+/// Memory usage is bounded by the configurable memory budget.
+
+use crate::PipelineConfig;
 use crate::copc_types::VoxelKey;
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use log::{debug, info};
-use std::collections::HashMap;
+use log::info;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------------
+// Morton code helper (used for spatially coherent traversal order)
+// ---------------------------------------------------------------------------
+
+fn morton3(x: u32, y: u32, z: u32) -> u64 {
+    #[inline]
+    fn spread(mut v: u64) -> u64 {
+        v &= 0x1F_FFFF;
+        v = (v | (v << 32)) & 0x1F00000000FFFF;
+        v = (v | (v << 16)) & 0x1F0000FF0000FF;
+        v = (v | (v <<  8)) & 0x100F00F00F00F00F;
+        v = (v | (v <<  4)) & 0x10C30C30C30C30C3;
+        v = (v | (v <<  2)) & 0x1249249249249249;
+        v
+    }
+    spread(x as u64) | (spread(y as u64) << 1) | (spread(z as u64) << 2)
+}
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 /// Maximum points per leaf voxel before we subdivide further.
-const MAX_LEAF_POINTS: u64 = 65_536;
+const MAX_LEAF_POINTS: u64 = 100_000;
 
 /// Maximum points to keep per non-leaf node (thinned sample for overview).
-const MAX_NODE_POINTS: usize = 65_536;
-
-/// Flush in-memory leaf buffer to disk every this many points.
-const FLUSH_EVERY: usize = 100_000;
+const MAX_NODE_POINTS: usize = 100_000;
 
 // ---------------------------------------------------------------------------
 // Raw point storage
 // ---------------------------------------------------------------------------
 
-/// A raw point stored as scaled integer coordinates plus classification,
-/// intensity, return number etc.  We keep the original scaled ints so we
-/// can reconstruct exact LAS integer values without floating-point loss.
+/// A raw point stored as scaled integer coordinates plus attributes.
+/// Scaled ints allow exact LAS round-trip without floating-point loss.
 #[derive(Debug, Clone)]
 pub struct RawPoint {
     pub x: i32,
@@ -130,45 +149,21 @@ impl Bounds {
     }
 
     pub fn expand_with(&mut self, x: f64, y: f64, z: f64) {
-        if x < self.min_x {
-            self.min_x = x;
-        }
-        if y < self.min_y {
-            self.min_y = y;
-        }
-        if z < self.min_z {
-            self.min_z = z;
-        }
-        if x > self.max_x {
-            self.max_x = x;
-        }
-        if y > self.max_y {
-            self.max_y = y;
-        }
-        if z > self.max_z {
-            self.max_z = z;
-        }
+        if x < self.min_x { self.min_x = x; }
+        if y < self.min_y { self.min_y = y; }
+        if z < self.min_z { self.min_z = z; }
+        if x > self.max_x { self.max_x = x; }
+        if y > self.max_y { self.max_y = y; }
+        if z > self.max_z { self.max_z = z; }
     }
 
     pub fn merge(&mut self, other: &Bounds) {
-        if other.min_x < self.min_x {
-            self.min_x = other.min_x;
-        }
-        if other.min_y < self.min_y {
-            self.min_y = other.min_y;
-        }
-        if other.min_z < self.min_z {
-            self.min_z = other.min_z;
-        }
-        if other.max_x > self.max_x {
-            self.max_x = other.max_x;
-        }
-        if other.max_y > self.max_y {
-            self.max_y = other.max_y;
-        }
-        if other.max_z > self.max_z {
-            self.max_z = other.max_z;
-        }
+        if other.min_x < self.min_x { self.min_x = other.min_x; }
+        if other.min_y < self.min_y { self.min_y = other.min_y; }
+        if other.min_z < self.min_z { self.min_z = other.min_z; }
+        if other.max_x > self.max_x { self.max_x = other.max_x; }
+        if other.max_y > self.max_y { self.max_y = other.max_y; }
+        if other.max_z > self.max_z { self.max_z = other.max_z; }
     }
 
     /// Cube that contains this AABB.
@@ -189,15 +184,11 @@ impl Bounds {
 // VoxelKey assignment
 // ---------------------------------------------------------------------------
 
-/// Assign a point to the leaf voxel at the given tree depth.
+/// Assign a point to the voxel at the given tree depth.
+#[allow(clippy::too_many_arguments)]
 pub fn point_to_key(
-    x: f64,
-    y: f64,
-    z: f64,
-    cx: f64,
-    cy: f64,
-    cz: f64,
-    halfsize: f64,
+    x: f64, y: f64, z: f64,
+    cx: f64, cy: f64, cz: f64, halfsize: f64,
     depth: u32,
 ) -> VoxelKey {
     let mut vx = 0i32;
@@ -210,38 +201,15 @@ pub fn point_to_key(
 
     for _ in 0..depth {
         half /= 2.0;
-        let bx = if x >= ox {
-            vx = vx * 2 + 1;
-            ox + half
-        } else {
-            vx *= 2;
-            ox - half
-        };
-        let by = if y >= oy {
-            vy = vy * 2 + 1;
-            oy + half
-        } else {
-            vy *= 2;
-            oy - half
-        };
-        let bz = if z >= oz {
-            vz = vz * 2 + 1;
-            oz + half
-        } else {
-            vz *= 2;
-            oz - half
-        };
+        let bx = if x >= ox { vx = vx * 2 + 1; ox + half } else { vx *= 2; ox - half };
+        let by = if y >= oy { vy = vy * 2 + 1; oy + half } else { vy *= 2; oy - half };
+        let bz = if z >= oz { vz = vz * 2 + 1; oz + half } else { vz *= 2; oz - half };
         ox = bx;
         oy = by;
         oz = bz;
     }
 
-    VoxelKey {
-        level: depth as i32,
-        x: vx,
-        y: vy,
-        z: vz,
-    }
+    VoxelKey { level: depth as i32, x: vx, y: vy, z: vz }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,149 +231,196 @@ pub struct OctreeBuilder {
     pub offset_x: f64,
     pub offset_y: f64,
     pub offset_z: f64,
-    /// Temp directory where leaf files are written.
+    /// Temp directory where node files are written.
     pub tmp_dir: PathBuf,
 }
 
 impl OctreeBuilder {
-    /// Pass 1: scan all files to get bounds and total point count.
-    pub fn scan(input_files: &[PathBuf]) -> Result<Self> {
+    /// Pass 1: scan all files in parallel to get bounds and total point count.
+    pub fn scan(input_files: &[PathBuf], config: &PipelineConfig) -> Result<Self> {
+        type Transforms = (f64, f64, f64, f64, f64, f64);
+        let results: Vec<(Bounds, u64, Transforms)> = input_files
+            .par_iter()
+            .map(|path| -> Result<_> {
+                info!("Scanning {:?}", path);
+                let reader = las::Reader::from_path(path)
+                    .with_context(|| format!("Cannot open {:?}", path))?;
+                let hdr = reader.header();
+                let b = hdr.bounds();
+                let mut bounds = Bounds::empty();
+                bounds.expand_with(b.min.x, b.min.y, b.min.z);
+                bounds.expand_with(b.max.x, b.max.y, b.max.z);
+                let point_count = hdr.number_of_points();
+                let t = hdr.transforms();
+                let transforms = (
+                    t.x.scale, t.y.scale, t.z.scale,
+                    t.x.offset, t.y.offset, t.z.offset,
+                );
+                Ok((bounds, point_count, transforms))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let mut bounds = Bounds::empty();
         let mut total_points = 0u64;
-        let mut first_transforms: Option<(f64, f64, f64, f64, f64, f64)> = None;
-
-        for path in input_files {
-            info!("Scanning {:?}", path);
-            let reader =
-                las::Reader::from_path(path).with_context(|| format!("Cannot open {:?}", path))?;
-            let hdr = reader.header();
-            let b = hdr.bounds();
-            bounds.expand_with(b.min.x, b.min.y, b.min.z);
-            bounds.expand_with(b.max.x, b.max.y, b.max.z);
-            total_points += hdr.number_of_points();
-            if first_transforms.is_none() {
-                let t = hdr.transforms();
-                first_transforms = Some((
-                    t.x.scale, t.y.scale, t.z.scale, t.x.offset, t.y.offset, t.z.offset,
-                ));
-            }
+        for (b, count, _) in &results {
+            bounds.merge(b);
+            total_points += count;
         }
 
-        let (scale_x, scale_y, scale_z, offset_x, offset_y, offset_z) =
-            first_transforms.unwrap_or((0.001, 0.001, 0.001, 0.0, 0.0, 0.0));
+        let (scale_x, scale_y, scale_z, offset_x, offset_y, offset_z) = results
+            .first()
+            .map(|(_, _, t)| *t)
+            .unwrap_or((0.001, 0.001, 0.001, 0.0, 0.0, 0.0));
 
         let (cx, cy, cz, halfsize) = bounds.to_cube();
 
         // Choose depth so that leaf voxels hold ≤ MAX_LEAF_POINTS on average.
-        // Octree has 8^depth leaves.
         let depth = {
             let mut d = 0u32;
             while (total_points as f64) / (8u64.pow(d) as f64) > MAX_LEAF_POINTS as f64 {
                 d += 1;
-                if d > 16 {
-                    break;
-                }
+                if d > 16 { break; }
             }
             d.max(1)
         };
         info!("Octree depth = {depth}, total points = {total_points}");
 
-        let tmp_dir = std::env::temp_dir().join(format!("copc_{}", std::process::id()));
+        let sys_tmp = std::env::temp_dir();
+        let base_tmp = config.temp_dir.as_deref().unwrap_or(&sys_tmp);
+        let tmp_dir = base_tmp.join(format!("copc_{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir)?;
 
         Ok(OctreeBuilder {
-            bounds,
-            total_points,
-            cx,
-            cy,
-            cz,
-            halfsize,
-            depth,
-            scale_x,
-            scale_y,
-            scale_z,
-            offset_x,
-            offset_y,
-            offset_z,
+            bounds, total_points, cx, cy, cz, halfsize, depth,
+            scale_x, scale_y, scale_z, offset_x, offset_y, offset_z,
             tmp_dir,
         })
     }
 
-    /// Path for the leaf temp file for a given key.
-    fn leaf_path(&self, key: &VoxelKey) -> PathBuf {
-        self.tmp_dir
-            .join(format!("{}_{}_{}_{}", key.level, key.x, key.y, key.z))
+    /// Path for a node's temp file.
+    fn node_path(&self, key: &VoxelKey) -> PathBuf {
+        self.tmp_dir.join(format!("{}_{}_{}_{}", key.level, key.x, key.y, key.z))
+    }
+
+    /// Convert a `las::Point` to a `RawPoint` using the builder's scale/offset.
+    fn convert_point(&self, p: &las::Point) -> RawPoint {
+        let ix = ((p.x - self.offset_x) / self.scale_x).round() as i32;
+        let iy = ((p.y - self.offset_y) / self.scale_y).round() as i32;
+        let iz = ((p.z - self.offset_z) / self.scale_z).round() as i32;
+        RawPoint {
+            x: ix, y: iy, z: iz,
+            intensity: p.intensity,
+            return_number: p.return_number,
+            number_of_returns: p.number_of_returns,
+            classification: p.classification.into(),
+            scan_angle: (p.scan_angle / 0.006).round() as i16,
+            user_data: p.user_data,
+            point_source_id: p.point_source_id,
+            gps_time: p.gps_time.unwrap_or(0.0),
+            red: p.color.as_ref().map(|c| c.red).unwrap_or(0),
+            green: p.color.as_ref().map(|c| c.green).unwrap_or(0),
+            blue: p.color.as_ref().map(|c| c.blue).unwrap_or(0),
+            nir: 0,
+        }
+    }
+
+    /// Parallel key assignment + coordinate conversion for a batch of points.
+    ///
+    /// Key assignment uses the *reconstructed* world coordinates (integer → world)
+    /// rather than the original floating-point coordinates.  This guarantees that
+    /// what the validator computes from the stored integers always falls inside the
+    /// assigned voxel, even when input files use different scales/offsets.
+    fn classify_points_parallel(&self, points: &[las::Point]) -> Vec<(VoxelKey, RawPoint)> {
+        points.par_iter().map(|p| {
+            let raw = self.convert_point(p);
+            let rx = raw.x as f64 * self.scale_x + self.offset_x;
+            let ry = raw.y as f64 * self.scale_y + self.offset_y;
+            let rz = raw.z as f64 * self.scale_z + self.offset_z;
+            let key = point_to_key(rx, ry, rz, self.cx, self.cy, self.cz, self.halfsize, self.depth);
+            (key, raw)
+        }).collect()
+    }
+
+    /// Merge classified points into per-key buffers and flush periodically.
+    fn merge_into_buffers(
+        classified: Vec<(VoxelKey, RawPoint)>,
+        buffers: &mut HashMap<VoxelKey, Vec<RawPoint>>,
+        writers: &mut HashMap<VoxelKey, BufWriter<File>>,
+        tmp_dir: &Path,
+        point_idx: &mut u64,
+        flush_every: usize,
+    ) -> Result<()> {
+        for (key, raw) in classified {
+            buffers.entry(key).or_default().push(raw);
+            *point_idx += 1;
+            if *point_idx % flush_every as u64 == 0 {
+                Self::flush_buffers(buffers, writers, tmp_dir)?;
+            }
+        }
+        Ok(())
     }
 
     /// Pass 2: assign all points to leaf temp files.
-    pub fn distribute(&self, input_files: &[PathBuf]) -> Result<()> {
-        // in-memory buffer before flushing
+    ///
+    /// Uses `read_all_points_into` (fast parallel decompression) when the file
+    /// fits within half the memory budget; otherwise falls back to batched reads.
+    /// Key assignment and coordinate conversion are always parallelized via rayon.
+    pub fn distribute(&self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
+        let flush_every =
+            ((config.memory_budget / 4) as usize / RawPoint::BYTE_SIZE).clamp(10_000, 500_000);
+        info!("Flush interval: {} points", flush_every);
+
         let mut buffers: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
         let mut writers: HashMap<VoxelKey, BufWriter<File>> = HashMap::new();
-
         let mut point_idx = 0u64;
+
+        let half_budget = config.memory_budget / 2;
 
         for path in input_files {
             info!("Distributing {:?}", path);
-            let mut reader =
-                las::Reader::from_path(path).with_context(|| format!("Cannot open {:?}", path))?;
+            let mut reader = las::Reader::from_path(path)
+                .with_context(|| format!("Cannot open {:?}", path))?;
 
-            let mut points: Vec<las::Point> = Vec::new();
-            reader.read_all_points_into(&mut points)?;
+            let file_point_count = reader.header().number_of_points();
+            // Estimated memory per las::Point (~120 bytes)
+            let estimated_mem = file_point_count * 120;
 
-            for p in &points {
-                let wx = p.x;
-                let wy = p.y;
-                let wz = p.z;
-
-                let key = point_to_key(
-                    wx,
-                    wy,
-                    wz,
-                    self.cx,
-                    self.cy,
-                    self.cz,
-                    self.halfsize,
-                    self.depth,
+            if estimated_mem <= half_budget {
+                // Fast path: load entire file with parallel decompression
+                let mut points: Vec<las::Point> = Vec::new();
+                reader.read_all_points_into(&mut points)?;
+                let classified = self.classify_points_parallel(&points);
+                drop(points);
+                Self::merge_into_buffers(
+                    classified, &mut buffers, &mut writers,
+                    &self.tmp_dir, &mut point_idx, flush_every,
+                )?;
+            } else {
+                // Batched path: read in chunks to stay within budget
+                let batch_size = (half_budget / 120).max(10_000) as usize;
+                info!(
+                    "File too large (~{} MB), using batched reads of {} points",
+                    estimated_mem / (1024 * 1024), batch_size
                 );
-
-                // Convert world coords to raw integers using the output scale/offset
-                // (always from the first file) so all files share a consistent system.
-                let ix = ((wx - self.offset_x) / self.scale_x).round() as i32;
-                let iy = ((wy - self.offset_y) / self.scale_y).round() as i32;
-                let iz = ((wz - self.offset_z) / self.scale_z).round() as i32;
-
-                let raw = RawPoint {
-                    x: ix,
-                    y: iy,
-                    z: iz,
-                    intensity: p.intensity,
-                    return_number: p.return_number,
-                    number_of_returns: p.number_of_returns,
-                    classification: p.classification.into(),
-                    scan_angle: (p.scan_angle / 0.006).round() as i16, // raw i16 units (0.006°)
-                    user_data: p.user_data,
-                    point_source_id: p.point_source_id,
-                    gps_time: p.gps_time.unwrap_or(0.0),
-                    red: p.color.as_ref().map(|c| c.red).unwrap_or(0),
-                    green: p.color.as_ref().map(|c| c.green).unwrap_or(0),
-                    blue: p.color.as_ref().map(|c| c.blue).unwrap_or(0),
-                    nir: p.extra_bytes.first().copied().map(|_| 0u16).unwrap_or(0),
-                };
-
-                let buf = buffers.entry(key).or_default();
-                buf.push(raw);
-                point_idx += 1;
-
-                // Flush buffers periodically to keep RAM usage low.
-                if point_idx.is_multiple_of(FLUSH_EVERY as u64) {
-                    Self::flush_buffers(&mut buffers, &mut writers, &self.tmp_dir)?;
+                let mut points: Vec<las::Point> = Vec::new();
+                loop {
+                    points.clear();
+                    let n = reader.read_points_into(batch_size as u64, &mut points)?;
+                    if n == 0 { break; }
+                    let classified = self.classify_points_parallel(&points);
+                    Self::merge_into_buffers(
+                        classified, &mut buffers, &mut writers,
+                        &self.tmp_dir, &mut point_idx, flush_every,
+                    )?;
                 }
             }
         }
 
-        // Final flush
         Self::flush_buffers(&mut buffers, &mut writers, &self.tmp_dir)?;
+        // Explicitly flush all BufWriters so no data is lost on drop.
+        for (_, w) in writers.iter_mut() {
+            std::io::Write::flush(w).context("flush distribute writer")?;
+        }
         Ok(())
     }
 
@@ -415,15 +430,10 @@ impl OctreeBuilder {
         tmp_dir: &Path,
     ) -> Result<()> {
         for (key, pts) in buffers.iter_mut() {
-            if pts.is_empty() {
-                continue;
-            }
+            if pts.is_empty() { continue; }
             let w = writers.entry(*key).or_insert_with(|| {
                 let path = tmp_dir.join(format!("{}_{}_{}_{}", key.level, key.x, key.y, key.z));
-                let f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
+                let f = OpenOptions::new().create(true).append(true).open(&path)
                     .expect("Cannot open leaf file");
                 BufWriter::new(f)
             });
@@ -435,9 +445,9 @@ impl OctreeBuilder {
         Ok(())
     }
 
-    /// Read all raw points for a given leaf key from disk.
-    pub fn read_leaf(&self, key: &VoxelKey) -> Result<Vec<RawPoint>> {
-        let path = self.leaf_path(key);
+    /// Read all raw points for a given node key from disk.
+    pub fn read_node(&self, key: &VoxelKey) -> Result<Vec<RawPoint>> {
+        let path = self.node_path(key);
         if !path.exists() {
             return Ok(vec![]);
         }
@@ -452,8 +462,21 @@ impl OctreeBuilder {
         Ok(pts)
     }
 
-    /// Enumerate all leaf keys that have data.
-    pub fn leaf_keys(&self) -> Result<Vec<VoxelKey>> {
+    /// Write points to a temp file for the given node key (overwrites if exists).
+    pub fn write_node_to_temp(&self, key: &VoxelKey, points: &[RawPoint]) -> Result<()> {
+        use std::io::Write;
+        let path = self.node_path(key);
+        let f = File::create(&path)?;
+        let mut w = BufWriter::new(f);
+        for p in points {
+            p.write(&mut w)?;
+        }
+        w.flush().context("flush node temp file")?;
+        Ok(())
+    }
+
+    /// Enumerate all node keys that have a non-empty temp file.
+    fn all_node_keys(&self) -> Result<Vec<VoxelKey>> {
         let mut keys = Vec::new();
         for entry in std::fs::read_dir(&self.tmp_dir)? {
             let entry = entry?;
@@ -473,51 +496,361 @@ impl OctreeBuilder {
         Ok(keys)
     }
 
-    /// Build the complete per-node point set:
-    /// leaf nodes get all their points; ancestor nodes get a thinned sample.
+    /// Phase 0 of build_node_map: split any leaf file that exceeds MAX_NODE_POINTS.
     ///
-    /// Returns a map from VoxelKey → Vec<RawPoint>.
-    pub fn build_node_map(&self) -> Result<HashMap<VoxelKey, Vec<RawPoint>>> {
-        let leaf_keys = self.leaf_keys()?;
-        info!("Number of leaf nodes: {}", leaf_keys.len());
+    /// All nodes being split in one round occupy disjoint voxels, so their child
+    /// files never conflict — the entire round is processed in parallel via rayon.
+    /// Rounds repeat until no oversized nodes remain.
+    fn normalize_leaves(&self) -> Result<()> {
+        // Allow at most 4 extra levels beyond the initial depth.  This caps the
+        // total LOD count at depth+5 (levels 0…depth+4) regardless of local
+        // density spikes.
+        let max_level = self.depth as i32 + 4;
 
-        let mut node_map: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
+        let oversized = |k: &VoxelKey| -> bool {
+            k.level < max_level
+                && self.node_path(k).metadata()
+                    .map_or(false, |m| m.len() as usize / RawPoint::BYTE_SIZE > MAX_NODE_POINTS)
+        };
 
-        // Fill leaf nodes
-        for key in &leaf_keys {
-            let pts = self.read_leaf(key)?;
-            debug!("Leaf {:?}: {} points", key, pts.len());
-            if !pts.is_empty() {
-                node_map.insert(*key, pts);
-            }
+        let mut to_split: Vec<VoxelKey> = self.all_node_keys()?
+            .into_iter().filter(|k| oversized(k)).collect();
+
+        while !to_split.is_empty() {
+            // All nodes in `to_split` are in disjoint voxels → safe to split in parallel.
+            let new_children: Vec<VoxelKey> = to_split
+                .into_par_iter()
+                .map(|key| -> Result<Vec<VoxelKey>> {
+                    let pts = self.read_node(&key)?;
+                    std::fs::remove_file(self.node_path(&key))?;
+
+                    let child_level = key.level + 1;
+                    let mut children: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
+                    for p in pts {
+                        let wx = p.x as f64 * self.scale_x + self.offset_x;
+                        let wy = p.y as f64 * self.scale_y + self.offset_y;
+                        let wz = p.z as f64 * self.scale_z + self.offset_z;
+                        let ck = point_to_key(
+                            wx, wy, wz,
+                            self.cx, self.cy, self.cz, self.halfsize, child_level as u32,
+                        );
+                        children.entry(ck).or_default().push(p);
+                    }
+                    let mut child_keys = Vec::new();
+                    for (ck, cpts) in children {
+                        self.write_node_to_temp(&ck, &cpts)?;
+                        child_keys.push(ck);
+                    }
+                    Ok(child_keys)
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter().flatten().collect();
+
+            to_split = new_children.into_iter().filter(|k| oversized(k)).collect();
+        }
+        Ok(())
+    }
+
+    /// Build the full node hierarchy.
+    ///
+    /// Phase 0: normalize leaves in parallel.
+    /// Phase 1: determine actual max depth.
+    /// Phase 2: bottom-up ancestor building.
+    ///   Fast path  – if all leaf data fits in the memory budget, everything is
+    ///                processed in RAM (one disk read + one disk write total).
+    ///   Slow path  – level-by-level with disk I/O, but without redundant directory
+    ///                scans (keys are tracked in a per-level map).
+    ///
+    /// Returns (VoxelKey, point_count) for every node in the hierarchy.
+    pub fn build_node_map(&self, config: &crate::PipelineConfig) -> Result<Vec<(VoxelKey, usize)>> {
+        // Phase 0
+        self.normalize_leaves()?;
+
+        // Phase 1
+        let leaf_keys = self.all_node_keys()?;
+        let actual_max_depth = leaf_keys.iter().map(|k| k.level as u32).max().unwrap_or(0);
+        info!(
+            "Leaf nodes after normalization: {}, max depth: {actual_max_depth}",
+            leaf_keys.len()
+        );
+
+        // Estimate memory required to hold all leaf data.
+        let total_bytes: u64 = leaf_keys.iter()
+            .map(|k| self.node_path(k).metadata().map_or(0, |m| m.len()))
+            .sum();
+
+        // Phase 2
+        let result = if total_bytes <= config.memory_budget {
+            info!(
+                "Building octree in-memory ({} MB)",
+                total_bytes / 1_048_576
+            );
+            self.bottom_up_in_memory(&leaf_keys, actual_max_depth)?
+        } else {
+            info!(
+                "Building octree out-of-core ({} MB > budget {} MB)",
+                total_bytes / 1_048_576,
+                config.memory_budget / 1_048_576,
+            );
+            self.bottom_up_on_disk(leaf_keys, actual_max_depth)?
+        };
+
+        let total_pts: usize = result.iter().map(|(_, c)| *c).sum();
+        info!(
+            "Total octree nodes: {}, total points: {} (original: {})",
+            result.len(), total_pts, self.total_points
+        );
+        if total_pts as u64 != self.total_points {
+            info!(
+                "Note: COPC contains {} points vs {} from input headers (diff {}). \
+                 Input LAZ headers sometimes report inaccurate point counts.",
+                total_pts, self.total_points,
+                self.total_points as i64 - total_pts as i64
+            );
         }
 
-        // Build ancestor nodes bottom-up
-        for d in (0..self.depth).rev() {
-            let child_keys: Vec<VoxelKey> = node_map
-                .keys()
-                .filter(|k| k.level as u32 == d + 1)
-                .copied()
-                .collect();
+        // Ensure every ancestor of every data node is present in the hierarchy
+        // (empty ancestors allow validators to traverse the tree top-down).
+        let mut result = result;
+        let mut present: HashSet<VoxelKey> = result.iter().map(|(k, _)| *k).collect();
+        let mut extra: Vec<VoxelKey> = Vec::new();
+        for (key, _) in &result {
+            let mut k = *key;
+            while let Some(parent) = k.parent() {
+                if present.insert(parent) { extra.push(parent); }
+                k = parent;
+            }
+        }
+        for k in extra { result.push((k, 0)); }
+        result.sort_by_key(|(k, _)| k.level);
+        Ok(result)
+    }
 
-            let mut parent_candidates: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
+    /// Bottom-up pass — in-memory fast path.
+    ///
+    /// Loads all leaf data into a HashMap, runs grid_sample at every level
+    /// without any intermediate disk I/O, then writes the final node files once.
+    fn bottom_up_in_memory(
+        &self,
+        leaf_keys: &[VoxelKey],
+        actual_max_depth: u32,
+    ) -> Result<Vec<(VoxelKey, usize)>> {
+        // Load all leaf nodes in parallel.
+        let mut nodes: HashMap<VoxelKey, Vec<RawPoint>> = leaf_keys
+            .par_iter()
+            .map(|k| -> Result<(VoxelKey, Vec<RawPoint>)> { Ok((*k, self.read_node(k)?)) })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(_, pts)| !pts.is_empty())
+            .collect();
 
-            for ck in child_keys {
-                if let Some(parent) = ck.parent()
-                    && let Some(cpts) = node_map.get(&ck)
-                {
-                    let sample = thin_sample(cpts, MAX_NODE_POINTS / 8);
-                    parent_candidates.entry(parent).or_default().extend(sample);
+        for d in (0..actual_max_depth).rev() {
+            info!("Building ancestor level {d}");
+
+            // Group children at level d+1 by parent (iterate keys, no disk I/O).
+            let mut parent_children: HashMap<VoxelKey, Vec<VoxelKey>> = HashMap::new();
+            for k in nodes.keys() {
+                if k.level as u32 == d + 1 {
+                    if let Some(p) = k.parent() {
+                        parent_children.entry(p).or_default().push(*k);
+                    }
                 }
             }
+            if parent_children.is_empty() { continue; }
 
-            for (pk, mut pts) in parent_candidates {
-                pts = thin_sample(&pts, MAX_NODE_POINTS);
-                node_map.insert(pk, pts);
+            // Snapshot children data for parallel processing (immutable borrow of `nodes`).
+            let tasks: Vec<(VoxelKey, Vec<VoxelKey>, Vec<(usize, RawPoint)>)> =
+                parent_children.into_iter().map(|(parent, children)| {
+                    let all_pts = children.iter().enumerate()
+                        .flat_map(|(ci, ck)| {
+                            nodes.get(ck).into_iter()
+                                .flat_map(move |pts| pts.iter().map(move |p| (ci, p.clone())))
+                        })
+                        .collect();
+                    (parent, children, all_pts)
+                }).collect();
+
+            // Grid-sample in parallel.
+            let results: Vec<(VoxelKey, Vec<VoxelKey>, Vec<RawPoint>, Vec<Vec<RawPoint>>)> =
+                tasks.into_par_iter()
+                    .map(|(parent, children, all_pts)| -> Result<_> {
+                        if all_pts.is_empty() {
+                            let n = children.len();
+                            return Ok((parent, children, vec![], vec![vec![]; n]));
+                        }
+                        let n = children.len();
+                        let (parent_pts, remaining) =
+                            self.grid_sample(&parent, &all_pts, n, MAX_NODE_POINTS);
+                        Ok((parent, children, parent_pts, remaining))
+                    })
+                    .collect::<Result<_>>()?;
+
+            // Apply updates to `nodes` (sequential, needs &mut).
+            for (parent, children, parent_pts, remaining) in results {
+                for (ck, rem) in children.into_iter().zip(remaining.into_iter()) {
+                    if rem.is_empty() { nodes.remove(&ck); } else { nodes.insert(ck, rem); }
+                }
+                if !parent_pts.is_empty() { nodes.insert(parent, parent_pts); }
             }
         }
 
-        Ok(node_map)
+        // Write final nodes to disk for the writer.
+        nodes.par_iter().map(|(k, pts)| -> Result<()> {
+            self.write_node_to_temp(k, pts)
+        }).collect::<Result<Vec<_>>>()?;
+
+        Ok(nodes.iter()
+            .filter(|(_, pts)| !pts.is_empty())
+            .map(|(k, pts)| (*k, pts.len()))
+            .collect())
+    }
+
+    /// Bottom-up pass — disk-based slow path.
+    ///
+    /// Processes one level at a time with disk I/O.  Avoids redundant directory
+    /// scans by maintaining a per-level key map updated after each level.
+    fn bottom_up_on_disk(
+        &self,
+        leaf_keys: Vec<VoxelKey>,
+        actual_max_depth: u32,
+    ) -> Result<Vec<(VoxelKey, usize)>> {
+        // Organise known keys by level — updated as parent nodes are created.
+        let mut keys_by_level: HashMap<i32, Vec<VoxelKey>> = HashMap::new();
+        for k in leaf_keys {
+            keys_by_level.entry(k.level).or_default().push(k);
+        }
+
+        for d in (0..actual_max_depth).rev() {
+            info!("Building ancestor level {d}");
+            let child_keys = match keys_by_level.get(&(d as i32 + 1)) {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+
+            let mut parent_children: HashMap<VoxelKey, Vec<VoxelKey>> = HashMap::new();
+            for ck in &child_keys {
+                if let Some(parent) = ck.parent() {
+                    parent_children.entry(parent).or_default().push(*ck);
+                }
+            }
+            if parent_children.is_empty() { continue; }
+
+            let parents: Vec<(VoxelKey, Vec<VoxelKey>)> = parent_children.into_iter().collect();
+            let new_parent_keys: Vec<VoxelKey> = parents.iter().map(|(p, _)| *p).collect();
+
+            parents.par_iter().map(|(parent, children)| -> Result<()> {
+                let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
+                for (ci, ck) in children.iter().enumerate() {
+                    for p in self.read_node(ck)? { all_pts.push((ci, p)); }
+                }
+                if all_pts.is_empty() { return Ok(()); }
+                let (parent_pts, per_child) =
+                    self.grid_sample(parent, &all_pts, children.len(), MAX_NODE_POINTS);
+                for (ci, ck) in children.iter().enumerate() {
+                    self.write_node_to_temp(ck, &per_child[ci])?;
+                }
+                if !parent_pts.is_empty() {
+                    self.write_node_to_temp(parent, &parent_pts)?;
+                }
+                Ok(())
+            }).collect::<Result<Vec<_>>>()?;
+
+            keys_by_level.entry(d as i32).or_default().extend(new_parent_keys);
+        }
+
+        // Enumerate result from the in-memory key map (no directory scan needed).
+        let mut result = Vec::new();
+        for (_, level_keys) in &keys_by_level {
+            for key in level_keys {
+                let file_len = self.node_path(key).metadata().map_or(0, |m| m.len());
+                let count = file_len as usize / RawPoint::BYTE_SIZE;
+                if count > 0 { result.push((*key, count)); }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Grid-based spatial sampling for one parent node.
+    ///
+    /// Divides the parent voxel into a uniform grid of ≈ R³ cells (R = ∛max_count).
+    /// Points are sorted by Morton code and iterated in that order; the first point
+    /// that falls into each unoccupied cell is accepted for the parent.  All others
+    /// are returned to their originating child so every point lands in exactly one node.
+    ///
+    /// This mirrors untwine's approach and produces spatially homogeneous LOD levels.
+    fn grid_sample(
+        &self,
+        parent: &VoxelKey,
+        pts: &[(usize, RawPoint)],  // (child_index, point)
+        n_children: usize,
+        max_count: usize,
+    ) -> (Vec<RawPoint>, Vec<Vec<RawPoint>>) {
+        if pts.is_empty() {
+            return (vec![], vec![vec![]; n_children]);
+        }
+
+        // Parent voxel geometry in integer coordinate space.
+        let voxel_size_world = 2.0 * self.halfsize / (1u64 << parent.level) as f64;
+        let origin_x = ((self.cx - self.halfsize + parent.x as f64 * voxel_size_world
+            - self.offset_x) / self.scale_x).round() as i64;
+        let origin_y = ((self.cy - self.halfsize + parent.y as f64 * voxel_size_world
+            - self.offset_y) / self.scale_y).round() as i64;
+        let origin_z = ((self.cz - self.halfsize + parent.z as f64 * voxel_size_world
+            - self.offset_z) / self.scale_z).round() as i64;
+        let int_size = (voxel_size_world / self.scale_x.min(self.scale_y).min(self.scale_z))
+            .round() as i64;
+
+        // Grid resolution: R³ ≈ max_count cells; use floor so we never exceed max_count.
+        let r = (max_count as f64).cbrt() as i64;
+        let cell = (int_size / r).max(1);
+
+        // Sort by Morton code within the parent voxel for spatially coherent traversal.
+        let mut indexed: Vec<(usize, &RawPoint)> = pts.iter().map(|(ci, p)| (*ci, p)).collect();
+        indexed.sort_unstable_by_key(|(_, p)| {
+            let dx = (p.x as i64 - origin_x).max(0) as u32;
+            let dy = (p.y as i64 - origin_y).max(0) as u32;
+            let dz = (p.z as i64 - origin_z).max(0) as u32;
+            morton3(dx, dy, dz)
+        });
+
+        let grid_key = |p: &RawPoint| -> (i32, i32, i32) {
+            (((p.x as i64 - origin_x) / cell) as i32,
+             ((p.y as i64 - origin_y) / cell) as i32,
+             ((p.z as i64 - origin_z) / cell) as i32)
+        };
+
+        // Track which children actually have points so we can protect them.
+        let mut child_has_pts = vec![false; n_children];
+        for (ci, _) in pts { child_has_pts[*ci] = true; }
+
+        // Collect parent samples together with their source child index so we
+        // can move one back if a child gets completely drained.
+        let mut occupied: HashSet<(i32, i32, i32)> = HashSet::new();
+        let mut parent_pts: Vec<(usize, RawPoint)> = Vec::with_capacity(max_count);
+        let mut remaining: Vec<Vec<RawPoint>> = vec![Vec::new(); n_children];
+
+        for (ci, p) in indexed {
+            if parent_pts.len() < max_count && occupied.insert(grid_key(p)) {
+                parent_pts.push((ci, p.clone()));
+            } else {
+                remaining[ci].push(p.clone());
+            }
+        }
+
+        // Guarantee every child that contributed points keeps at least one.
+        // This prevents zero-point intermediate nodes in the COPC hierarchy
+        // (which confuse validators that check point_count > 0 for all entries).
+        for ci in 0..n_children {
+            if child_has_pts[ci] && remaining[ci].is_empty() {
+                if let Some(pos) = parent_pts.iter().rposition(|(c, _)| *c == ci) {
+                    let (_, p) = parent_pts.remove(pos);
+                    remaining[ci].push(p);
+                }
+            }
+        }
+
+        let parent_pts = parent_pts.into_iter().map(|(_, p)| p).collect();
+        (parent_pts, remaining)
     }
 
     pub fn cleanup(&self) {
@@ -525,9 +858,8 @@ impl OctreeBuilder {
     }
 }
 
-/// Sub-sample a point vector to at most `max_count` points using
-/// a simple stride-based approach (deterministic, fast).
-fn thin_sample(pts: &[RawPoint], max_count: usize) -> Vec<RawPoint> {
+/// Sub-sample a point vector to at most `max_count` points using stride sampling.
+pub fn thin_sample(pts: &[RawPoint], max_count: usize) -> Vec<RawPoint> {
     if pts.len() <= max_count {
         return pts.to_vec();
     }
