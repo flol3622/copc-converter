@@ -54,14 +54,18 @@ fn parse_memory_limit(s: &str) -> Result<u64> {
     Ok((value * multiplier as f64) as u64)
 }
 
+const TOTAL_STEPS: u32 = 5;
+
 struct CliProgress {
     bar: Mutex<Option<ProgressBar>>,
+    step: std::sync::atomic::AtomicU32,
 }
 
 impl CliProgress {
     fn new() -> Self {
         Self {
             bar: Mutex::new(None),
+            step: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -71,20 +75,25 @@ impl ProgressObserver for CliProgress {
         let mut bar = self.bar.lock().unwrap();
         match event {
             ProgressEvent::StageStart { name, total } => {
+                let step = self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let prefix = format!("[{step}/{TOTAL_STEPS}] {name}");
                 let pb = if total > 0 {
                     let pb = ProgressBar::new(total);
                     pb.set_style(
-                        ProgressStyle::with_template("{msg} [{bar:40}] {pos}/{len} ({eta})")
-                            .unwrap()
-                            .progress_chars("=> "),
+                        ProgressStyle::with_template(
+                            "{msg} [{bar:40}] {human_pos}/{human_len} ({eta})",
+                        )
+                        .unwrap()
+                        .progress_chars("=> "),
                     );
+                    pb.set_message(prefix);
                     pb
                 } else {
                     let pb = ProgressBar::new_spinner();
                     pb.set_style(ProgressStyle::with_template("{msg} {spinner}").unwrap());
+                    pb.set_message(prefix);
                     pb
                 };
-                pb.set_message(name.to_string());
                 *bar = Some(pb);
             }
             ProgressEvent::StageProgress { done } => {
