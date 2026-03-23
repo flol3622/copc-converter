@@ -1,6 +1,7 @@
 # copc_converter
 
 [![Crates.io](https://img.shields.io/crates/v/copc_converter)](https://crates.io/crates/copc_converter)
+[![docs.rs](https://docs.rs/copc_converter/badge.svg)](https://docs.rs/copc_converter)
 
 A fast, memory-efficient converter that turns LAS/LAZ point cloud files into [COPC](https://copc.io/) (Cloud-Optimized Point Cloud) files.
 
@@ -11,6 +12,7 @@ A fast, memory-efficient converter that turns LAS/LAZ point cloud files into [CO
 - Out-of-core processing with a configurable memory budget — handles datasets larger than RAM
 - Parallel reading, octree construction, and LAZ compression via rayon
 - Preserves WKT CRS from input files
+- Optional temporal index for GPS-time-based filtering ([spec](docs/temporal-index-spec.md))
 
 ## Installation
 
@@ -54,11 +56,16 @@ copc_converter ./tiles/ merged.copc.laz
 |---|---|---|
 | `--memory-limit` | Max memory budget (`16G`, `4096M`, etc.) | `16G` |
 | `--temp-dir` | Directory for intermediate files | system temp |
+| `--temporal-index` | Write a temporal index EVLR for time-based queries | off |
+| `--temporal-stride` | Sampling stride for the temporal index (every n-th point) | `1000` |
 
-### Example
+### Examples
 
 ```sh
 copc_converter ./my_survey/ survey.copc.laz --memory-limit 8G
+
+# With temporal index (useful for multi-pass mobile mapping data)
+copc_converter ./my_survey/ survey.copc.laz --temporal-index
 ```
 
 ## How it works
