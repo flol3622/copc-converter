@@ -81,6 +81,7 @@ let config = PipelineConfig {
     temp_dir: None,
     temporal_index: false,
     temporal_stride: 1000,
+    progress: None, // or Some(Arc::new(your_observer))
 };
 
 Pipeline::scan(&files, config)?

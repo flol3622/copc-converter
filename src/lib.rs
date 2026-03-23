@@ -12,10 +12,11 @@
 //!     temp_dir: None,
 //!     temporal_index: false,
 //!     temporal_stride: 1000,
+//!     progress: None,
 //! };
 //! let files = copc_converter::collect_input_files("input.laz".into()).unwrap();
 //!
-//! Pipeline::scan(&files, &config).unwrap()
+//! Pipeline::scan(&files, config).unwrap()
 //!     .validate().unwrap()
 //!     .distribute().unwrap()
 //!     .build().unwrap()
