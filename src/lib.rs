@@ -1,10 +1,18 @@
-pub mod copc_types;
-pub mod octree;
-pub mod validate;
-pub mod writer;
+//! Fast, memory-efficient converter from LAS/LAZ to COPC (Cloud-Optimized Point Cloud).
+
+pub(crate) mod copc_types;
+pub(crate) mod octree;
+pub(crate) mod validate;
+pub(crate) mod writer;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+
+// Re-export the public API.
+pub use copc_types::VoxelKey;
+pub use octree::OctreeBuilder;
+pub use validate::{ValidatedInputs, validate};
+pub use writer::write_copc;
 
 /// Configuration threaded through the pipeline.
 pub struct PipelineConfig {
@@ -37,6 +45,9 @@ pub fn parse_memory_limit(s: &str) -> Result<u64> {
     Ok((value * multiplier as f64) as u64)
 }
 
+/// Expand a single input path into a list of LAZ/LAS files.
+/// If `raw` is a directory, all `.laz`/`.las` files in it are returned (sorted).
+/// If `raw` is a file, it is returned as-is.
 pub fn collect_input_files(raw: PathBuf) -> Result<Vec<PathBuf>> {
     if raw.is_dir() {
         let mut files: Vec<PathBuf> = std::fs::read_dir(&raw)

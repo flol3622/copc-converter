@@ -12,11 +12,16 @@ use std::io::Write;
 // VoxelKey – identifies a node in the octree
 // ---------------------------------------------------------------------------
 
+/// Identifies a node in the COPC octree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VoxelKey {
+    /// Octree level (0 = root).
     pub level: i32,
+    /// X coordinate at this level.
     pub x: i32,
+    /// Y coordinate at this level.
     pub y: i32,
+    /// Z coordinate at this level.
     pub z: i32,
 }
 
@@ -39,11 +44,14 @@ impl VoxelKey {
 // CopcInfo VLR payload (160 bytes)
 // ---------------------------------------------------------------------------
 
+/// COPC info VLR payload (160 bytes).
 #[derive(Debug, Clone)]
 pub struct CopcInfo {
-    /// Center of the octree root (world coordinates)
+    /// Center X of the octree root (world coordinates).
     pub center_x: f64,
+    /// Center Y of the octree root.
     pub center_y: f64,
+    /// Center Z of the octree root.
     pub center_z: f64,
     /// Half-size of the root voxel (cube)
     pub halfsize: f64,
@@ -60,6 +68,7 @@ pub struct CopcInfo {
 }
 
 impl CopcInfo {
+    /// Serialize the COPC info payload to a writer.
     pub fn write<W: Write>(&self, w: &mut W) -> anyhow::Result<()> {
         w.write_f64::<LittleEndian>(self.center_x)?;
         w.write_f64::<LittleEndian>(self.center_y)?;
@@ -82,8 +91,10 @@ impl CopcInfo {
 // HierarchyEntry – one record in the hierarchy page (32 bytes)
 // ---------------------------------------------------------------------------
 
+/// One record in the COPC hierarchy page (32 bytes).
 #[derive(Debug, Clone)]
 pub struct HierarchyEntry {
+    /// Octree node key.
     pub key: VoxelKey,
     /// Byte offset of the chunk in the file (0 if virtual / no data)
     pub offset: u64,

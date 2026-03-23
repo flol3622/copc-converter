@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use copc_converter::{PipelineConfig, collect_input_files, parse_memory_limit};
+use copc_converter::{
+    OctreeBuilder, PipelineConfig, collect_input_files, parse_memory_limit, validate, write_copc,
+};
 use log::info;
 use std::path::PathBuf;
 
@@ -57,14 +59,12 @@ fn main() -> Result<()> {
         "=== Pass 1: scanning {} input file(s) ===",
         input_files.len()
     );
-    let scan_results = copc_converter::octree::OctreeBuilder::scan(&input_files)?;
+    let scan_results = OctreeBuilder::scan(&input_files)?;
 
     info!("=== Validating inputs ===");
-    let validated =
-        copc_converter::validate::validate(&input_files, &scan_results, config.temporal_index)?;
+    let validated = validate(&input_files, &scan_results, config.temporal_index)?;
 
-    let builder =
-        copc_converter::octree::OctreeBuilder::from_scan(&scan_results, &validated, &config)?;
+    let builder = OctreeBuilder::from_scan(&scan_results, &validated, &config)?;
 
     info!("=== Pass 2: distributing points to leaf voxels ===");
     builder.distribute(&input_files, &config)?;
@@ -73,7 +73,7 @@ fn main() -> Result<()> {
     let node_keys = builder.build_node_map(&config)?;
 
     info!("=== Writing COPC file: {:?} ===", args.output);
-    copc_converter::writer::write_copc(&args.output, &builder, &node_keys, &config)?;
+    write_copc(&args.output, &builder, &node_keys, &config)?;
 
     drop(builder);
     info!("Done.");

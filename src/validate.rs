@@ -7,7 +7,9 @@ use std::path::PathBuf;
 /// Validated output: consistent properties across all input files.
 #[derive(Debug)]
 pub struct ValidatedInputs {
+    /// WKT CRS string from input files (if present).
     pub wkt_crs: Option<Vec<u8>>,
+    /// COPC output point format (6, 7, or 8).
     pub point_format: u8,
 }
 
@@ -19,6 +21,8 @@ fn format_has_gps_time(fmt: u8) -> bool {
     !matches!(fmt, 0 | 2)
 }
 
+/// Check that all scanned files agree on CRS and point format,
+/// and derive the COPC output point format.
 pub fn validate(
     input_files: &[PathBuf],
     results: &[ScanResult],

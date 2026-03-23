@@ -334,20 +334,33 @@ pub struct ScanResult {
     pub point_format_id: u8,
 }
 
+/// Builds a COPC octree from scanned input files.
 pub struct OctreeBuilder {
+    /// Spatial bounds of all input points.
     pub bounds: Bounds,
+    /// Total number of points across all input files.
     pub total_points: u64,
+    /// Octree root center X.
     pub cx: f64,
+    /// Octree root center Y.
     pub cy: f64,
+    /// Octree root center Z.
     pub cz: f64,
+    /// Half-size of the root voxel.
     pub halfsize: f64,
+    /// Initial octree depth before normalization.
     pub depth: u32,
-    /// Scale / offset from the first input file – used for all raw-integer conversions.
+    /// X scale factor from the first input file.
     pub scale_x: f64,
+    /// Y scale factor.
     pub scale_y: f64,
+    /// Z scale factor.
     pub scale_z: f64,
+    /// X offset.
     pub offset_x: f64,
+    /// Y offset.
     pub offset_y: f64,
+    /// Z offset.
     pub offset_z: f64,
     /// Temp directory where node files are written.
     pub tmp_dir: PathBuf,
