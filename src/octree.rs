@@ -18,12 +18,12 @@ use crate::PipelineConfig;
 use crate::copc_types::VoxelKey;
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use log::{debug, info};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+use tracing::{debug, info};
 
 /// Task fed into the parallel grid-sampling step: parent key, child keys, and
 /// indexed points (child-index, point).
@@ -372,8 +372,9 @@ pub struct OctreeBuilder {
 
 impl OctreeBuilder {
     /// Pass 1: scan all files in parallel to get bounds and total point count.
-    pub fn scan(input_files: &[PathBuf]) -> Result<Vec<ScanResult>> {
-        input_files
+    pub fn scan(input_files: &[PathBuf], config: &PipelineConfig) -> Result<Vec<ScanResult>> {
+        let done = std::sync::atomic::AtomicU64::new(0);
+        let results: Result<Vec<ScanResult>> = input_files
             .par_iter()
             .map(|path| -> Result<ScanResult> {
                 debug!("Scanning {:?}", path);
@@ -385,6 +386,8 @@ impl OctreeBuilder {
                 bounds.expand_with(b.min.x, b.min.y, b.min.z);
                 bounds.expand_with(b.max.x, b.max.y, b.max.z);
                 let t = hdr.transforms();
+                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                config.report(crate::ProgressEvent::StageProgress { done: n });
                 Ok(ScanResult {
                     bounds,
                     point_count: hdr.number_of_points(),
@@ -401,7 +404,8 @@ impl OctreeBuilder {
                     point_format_id: hdr.point_format().to_u8().unwrap_or(0),
                 })
             })
-            .collect()
+            .collect();
+        results
     }
 
     /// Build an OctreeBuilder from scan results and validated inputs.
@@ -578,6 +582,7 @@ impl OctreeBuilder {
                     &mut point_idx,
                     flush_every,
                 )?;
+                config.report(crate::ProgressEvent::StageProgress { done: point_idx });
             } else {
                 // Batched path: read in chunks to stay within budget
                 let batch_size = (half_budget / 120).max(10_000) as usize;
@@ -602,6 +607,7 @@ impl OctreeBuilder {
                         &mut point_idx,
                         flush_every,
                     )?;
+                    config.report(crate::ProgressEvent::StageProgress { done: point_idx });
                 }
             }
         }

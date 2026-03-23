@@ -27,9 +27,9 @@ pub(crate) mod octree;
 pub(crate) mod validate;
 pub(crate) mod writer;
 
-use log::info;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use tracing::info;
 
 use copc_types::VoxelKey;
 use octree::OctreeBuilder;
@@ -104,6 +104,42 @@ pub struct Built(());
 // PipelineConfig
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Progress reporting
+// ---------------------------------------------------------------------------
+
+/// Events emitted during pipeline execution.
+#[derive(Debug, Clone)]
+pub enum ProgressEvent {
+    /// A pipeline stage started. `total` is the number of work units (0 if unknown).
+    StageStart {
+        /// Human-readable stage name.
+        name: &'static str,
+        /// Total work units (0 if unknown).
+        total: u64,
+    },
+    /// Progress within the current stage.
+    StageProgress {
+        /// Cumulative work units completed so far.
+        done: u64,
+    },
+    /// Current stage finished.
+    StageDone,
+}
+
+/// Observer for pipeline progress events. Implement this to receive callbacks.
+///
+/// The default implementation is a no-op, so lib users who don't need progress
+/// reporting can ignore this entirely.
+pub trait ProgressObserver: Send + Sync {
+    /// Called when a progress event occurs.
+    fn on_progress(&self, event: ProgressEvent);
+}
+
+// ---------------------------------------------------------------------------
+// PipelineConfig
+// ---------------------------------------------------------------------------
+
 /// Configuration for the conversion pipeline.
 pub struct PipelineConfig {
     /// Effective memory budget in bytes.
@@ -114,6 +150,16 @@ pub struct PipelineConfig {
     pub temporal_index: bool,
     /// Sampling stride for temporal index.
     pub temporal_stride: u32,
+    /// Optional progress observer for reporting pipeline progress.
+    pub progress: Option<std::sync::Arc<dyn ProgressObserver>>,
+}
+
+impl PipelineConfig {
+    pub(crate) fn report(&self, event: ProgressEvent) {
+        if let Some(ref observer) = self.progress {
+            observer.on_progress(event);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -138,11 +184,12 @@ struct PipelineInner {
 impl Pipeline<Scanned> {
     /// Scan input files to read headers, bounds, CRS, and point format.
     pub fn scan(input_files: &[PathBuf], config: PipelineConfig) -> Result<Self> {
-        info!(
-            "=== Pass 1: scanning {} input file(s) ===",
-            input_files.len()
-        );
-        let scan_results = OctreeBuilder::scan(input_files)?;
+        config.report(ProgressEvent::StageStart {
+            name: "Scanning",
+            total: input_files.len() as u64,
+        });
+        let scan_results = OctreeBuilder::scan(input_files, &config)?;
+        config.report(ProgressEvent::StageDone);
         Ok(Pipeline {
             inner: PipelineInner {
                 input_files: input_files.to_vec(),
@@ -179,8 +226,13 @@ impl Pipeline<Validated> {
         let builder =
             OctreeBuilder::from_scan(&self.inner.scan_results, validated, &self.inner.config)?;
 
-        info!("=== Pass 2: distributing points to leaf voxels ===");
+        let total_points: u64 = self.inner.scan_results.iter().map(|r| r.point_count).sum();
+        self.inner.config.report(ProgressEvent::StageStart {
+            name: "Distributing",
+            total: total_points,
+        });
         builder.distribute(&self.inner.input_files, &self.inner.config)?;
+        self.inner.config.report(ProgressEvent::StageDone);
         self.inner.builder = Some(builder);
         Ok(Pipeline {
             inner: self.inner,
@@ -192,9 +244,13 @@ impl Pipeline<Validated> {
 impl Pipeline<Distributed> {
     /// Build the octree node map with LOD thinning.
     pub fn build(mut self) -> Result<Pipeline<Built>> {
-        info!("=== Building octree node map ===");
+        self.inner.config.report(ProgressEvent::StageStart {
+            name: "Building",
+            total: 0,
+        });
         let builder = self.inner.builder.as_ref().unwrap();
         let node_keys = builder.build_node_map(&self.inner.config)?;
+        self.inner.config.report(ProgressEvent::StageDone);
         self.inner.node_keys = Some(node_keys);
         Ok(Pipeline {
             inner: self.inner,
@@ -207,11 +263,22 @@ impl Pipeline<Built> {
     /// Write the COPC file.
     pub fn write(self, output_path: impl AsRef<Path>) -> Result<()> {
         let output_path = output_path.as_ref();
-        info!("=== Writing COPC file: {:?} ===", output_path);
+        let node_count = self
+            .inner
+            .node_keys
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|(_, c)| *c > 0)
+            .count() as u64;
+        self.inner.config.report(ProgressEvent::StageStart {
+            name: "Writing",
+            total: node_count,
+        });
         let builder = self.inner.builder.as_ref().unwrap();
         let node_keys = self.inner.node_keys.as_ref().unwrap();
         writer::write_copc(output_path, builder, node_keys, &self.inner.config)?;
-        info!("Done.");
+        self.inner.config.report(ProgressEvent::StageDone);
         Ok(())
     }
 }

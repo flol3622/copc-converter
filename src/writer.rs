@@ -26,10 +26,10 @@ use crate::octree::{OctreeBuilder, RawPoint};
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
 use laz::{LazVlrBuilder, ParLasZipCompressor};
-use log::{debug, error, info};
 use rayon::prelude::*;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
+use tracing::{debug, error, info};
 
 // ---------------------------------------------------------------------------
 // Point record sizes: format 6 = 30, format 7 = 36, format 8 = 38
@@ -400,6 +400,9 @@ pub fn write_copc(
             .compress_chunks(encoded)
             .context("compress_chunks")?;
 
+        config.report(crate::ProgressEvent::StageProgress {
+            done: batch_end as u64,
+        });
         batch_start = batch_end;
     }
 

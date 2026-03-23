@@ -1,8 +1,8 @@
 /// Validate consistency of scanned input files before building the octree.
 use crate::Error;
 use crate::octree::{ScanResult, input_to_copc_format};
-use log::debug;
 use std::path::PathBuf;
+use tracing::debug;
 
 /// Validated output: consistent properties across all input files.
 #[derive(Debug)]
