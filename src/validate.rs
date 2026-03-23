@@ -1,7 +1,7 @@
 /// Validate consistency of scanned input files before building the octree.
+use crate::Error;
 use crate::octree::{ScanResult, input_to_copc_format};
-use anyhow::Result;
-use log::info;
+use log::debug;
 use std::path::PathBuf;
 
 /// Validated output: consistent properties across all input files.
@@ -13,8 +13,6 @@ pub struct ValidatedInputs {
     pub point_format: u8,
 }
 
-/// Check that all scanned files agree on CRS and point format,
-/// and derive the COPC output point format.
 /// Returns true if the LAS point format includes GPS time.
 fn format_has_gps_time(fmt: u8) -> bool {
     // LAS formats 0 and 2 lack GPS time; all others (1, 3–10) include it.
@@ -27,38 +25,35 @@ pub fn validate(
     input_files: &[PathBuf],
     results: &[ScanResult],
     temporal_index: bool,
-) -> Result<ValidatedInputs> {
+) -> crate::Result<ValidatedInputs> {
     let wkt_crs = results[0].wkt_crs.clone();
     let first_format = results[0].point_format_id;
 
     for (i, r) in results.iter().enumerate().skip(1) {
         if r.wkt_crs != wkt_crs {
-            anyhow::bail!(
-                "CRS mismatch: {:?} has a different WKT CRS than {:?}",
-                input_files[i],
-                input_files[0],
-            );
+            return Err(Error::CrsMismatch {
+                file_a: input_files[0].clone(),
+                file_b: input_files[i].clone(),
+            });
         }
         if r.point_format_id != first_format {
-            anyhow::bail!(
-                "Point format mismatch: {:?} has format {} but {:?} has format {}",
-                input_files[i],
-                r.point_format_id,
-                input_files[0],
-                first_format,
-            );
+            return Err(Error::PointFormatMismatch {
+                file_a: input_files[0].clone(),
+                format_a: first_format,
+                file_b: input_files[i].clone(),
+                format_b: r.point_format_id,
+            });
         }
     }
 
     if temporal_index && !format_has_gps_time(first_format) {
-        anyhow::bail!(
-            "Temporal index requested but input point format {} does not include GPS time",
-            first_format,
-        );
+        return Err(Error::NoGpsTime {
+            format: first_format,
+        });
     }
 
     let point_format = input_to_copc_format(first_format);
-    info!("Input point format: {first_format}, output COPC point format: {point_format}");
+    debug!("Input point format: {first_format}, output COPC point format: {point_format}");
 
     Ok(ValidatedInputs {
         wkt_crs,
@@ -112,7 +107,7 @@ mod tests {
             make_result(Some(b"WKT_B".to_vec()), 7),
         ];
         let err = validate(&files, &results, false).unwrap_err();
-        assert!(err.to_string().contains("CRS mismatch"));
+        assert!(matches!(err, Error::CrsMismatch { .. }));
     }
 
     #[test]
@@ -120,21 +115,19 @@ mod tests {
         let files = vec![PathBuf::from("a.laz"), PathBuf::from("b.laz")];
         let results = vec![make_result(None, 3), make_result(None, 7)];
         let err = validate(&files, &results, false).unwrap_err();
-        assert!(err.to_string().contains("Point format mismatch"));
+        assert!(matches!(err, Error::PointFormatMismatch { .. }));
     }
 
     #[test]
     fn validate_temporal_index_requires_gps_time() {
-        // Format 0 has no GPS time
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(None, 0)];
         let err = validate(&files, &results, true).unwrap_err();
-        assert!(err.to_string().contains("does not include GPS time"));
+        assert!(matches!(err, Error::NoGpsTime { .. }));
     }
 
     #[test]
     fn validate_temporal_index_with_gps_time() {
-        // Format 1 has GPS time
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(None, 1)];
         let v = validate(&files, &results, true).unwrap();

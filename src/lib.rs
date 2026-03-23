@@ -27,13 +27,65 @@ pub(crate) mod octree;
 pub(crate) mod validate;
 pub(crate) mod writer;
 
-use anyhow::{Context, Result};
 use log::info;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use copc_types::VoxelKey;
 use octree::OctreeBuilder;
+
+// ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
+
+/// Errors returned by the conversion pipeline.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Input files have mismatched CRS.
+    #[error("CRS mismatch: {file_a:?} has a different WKT CRS than {file_b:?}")]
+    CrsMismatch {
+        /// Path of the first file.
+        file_a: PathBuf,
+        /// Path of the differing file.
+        file_b: PathBuf,
+    },
+
+    /// Input files have mismatched point formats.
+    #[error(
+        "Point format mismatch: {file_a:?} has format {format_a} but {file_b:?} has format {format_b}"
+    )]
+    PointFormatMismatch {
+        /// Path of the first file.
+        file_a: PathBuf,
+        /// Format of the first file.
+        format_a: u8,
+        /// Path of the differing file.
+        file_b: PathBuf,
+        /// Format of the differing file.
+        format_b: u8,
+    },
+
+    /// Temporal index requested but point format lacks GPS time.
+    #[error("Temporal index requested but input point format {format} does not include GPS time")]
+    NoGpsTime {
+        /// The incompatible point format.
+        format: u8,
+    },
+
+    /// No LAZ/LAS files found in a directory.
+    #[error("No LAZ/LAS files found in {path:?}")]
+    NoInputFiles {
+        /// The directory that was searched.
+        path: PathBuf,
+    },
+
+    /// I/O or other internal error.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Result type for the conversion pipeline.
+pub type Result<T> = std::result::Result<T, Error>;
 
 // ---------------------------------------------------------------------------
 // Pipeline typestate stages
@@ -168,32 +220,13 @@ impl Pipeline<Built> {
 // Utility functions
 // ---------------------------------------------------------------------------
 
-/// Parse a human-readable size string into bytes.
-/// Supports suffixes: G/g (GiB), M/m (MiB), K/k (KiB), or plain bytes.
-pub fn parse_memory_limit(s: &str) -> Result<u64> {
-    let s = s.trim();
-    let (num_part, multiplier) = if let Some(n) = s.strip_suffix(['G', 'g']) {
-        (n.trim(), 1024u64 * 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix(['M', 'm']) {
-        (n.trim(), 1024u64 * 1024)
-    } else if let Some(n) = s.strip_suffix(['K', 'k']) {
-        (n.trim(), 1024u64)
-    } else {
-        (s, 1u64)
-    };
-    let value: f64 = num_part
-        .parse()
-        .with_context(|| format!("Invalid memory limit: {s:?}"))?;
-    Ok((value * multiplier as f64) as u64)
-}
-
 /// Expand a single input path into a list of LAZ/LAS files.
 /// If `raw` is a directory, all `.laz`/`.las` files in it are returned (sorted).
 /// If `raw` is a file, it is returned as-is.
 pub fn collect_input_files(raw: PathBuf) -> Result<Vec<PathBuf>> {
     if raw.is_dir() {
         let mut files: Vec<PathBuf> = std::fs::read_dir(&raw)
-            .with_context(|| format!("Cannot read directory {:?}", raw))?
+            .map_err(|e| anyhow::anyhow!("Cannot read directory {:?}: {}", raw, e))?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| {
@@ -205,7 +238,9 @@ pub fn collect_input_files(raw: PathBuf) -> Result<Vec<PathBuf>> {
             })
             .collect();
         files.sort();
-        anyhow::ensure!(!files.is_empty(), "No LAZ/LAS files found in {:?}", raw);
+        if files.is_empty() {
+            return Err(Error::NoInputFiles { path: raw });
+        }
         Ok(files)
     } else {
         Ok(vec![raw])

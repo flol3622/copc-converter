@@ -1,8 +1,27 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use copc_converter::{Pipeline, PipelineConfig, collect_input_files, parse_memory_limit};
+use copc_converter::{Pipeline, PipelineConfig, collect_input_files};
 use log::info;
 use std::path::PathBuf;
+
+/// Parse a human-readable size string into bytes.
+/// Supports suffixes: G/g (GiB), M/m (MiB), K/k (KiB), or plain bytes.
+fn parse_memory_limit(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (num_part, multiplier) = if let Some(n) = s.strip_suffix(['G', 'g']) {
+        (n.trim(), 1024u64 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix(['M', 'm']) {
+        (n.trim(), 1024u64 * 1024)
+    } else if let Some(n) = s.strip_suffix(['K', 'k']) {
+        (n.trim(), 1024u64)
+    } else {
+        (s, 1u64)
+    };
+    let value: f64 = num_part
+        .parse()
+        .with_context(|| format!("Invalid memory limit: {s:?}"))?;
+    Ok((value * multiplier as f64) as u64)
+}
 
 /// Maximum fraction of the stated memory limit to actually use.
 const MEMORY_SAFETY_FACTOR: f64 = 0.75;

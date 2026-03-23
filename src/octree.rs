@@ -18,7 +18,7 @@ use crate::PipelineConfig;
 use crate::copc_types::VoxelKey;
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use log::info;
+use log::{debug, info};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -376,7 +376,7 @@ impl OctreeBuilder {
         input_files
             .par_iter()
             .map(|path| -> Result<ScanResult> {
-                info!("Scanning {:?}", path);
+                debug!("Scanning {:?}", path);
                 let reader = las::Reader::from_path(path)
                     .with_context(|| format!("Cannot open {:?}", path))?;
                 let hdr = reader.header();
@@ -434,7 +434,7 @@ impl OctreeBuilder {
             }
             d.max(1)
         };
-        info!("Octree depth = {depth}, total points = {total_points}");
+        debug!("Octree depth = {depth}, total points = {total_points}");
 
         let sys_tmp = std::env::temp_dir();
         let base_tmp = config.temp_dir.as_deref().unwrap_or(&sys_tmp);
@@ -547,7 +547,7 @@ impl OctreeBuilder {
     pub fn distribute(&self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
         let flush_every =
             ((config.memory_budget / 4) as usize / RawPoint::BYTE_SIZE).clamp(10_000, 500_000);
-        info!("Flush interval: {} points", flush_every);
+        debug!("Flush interval: {} points", flush_every);
 
         let mut buffers: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
         let mut writers: HashMap<VoxelKey, BufWriter<File>> = HashMap::new();
@@ -556,7 +556,7 @@ impl OctreeBuilder {
         let half_budget = config.memory_budget / 2;
 
         for path in input_files {
-            info!("Distributing {:?}", path);
+            debug!("Distributing {:?}", path);
             let mut reader =
                 las::Reader::from_path(path).with_context(|| format!("Cannot open {:?}", path))?;
 
@@ -581,7 +581,7 @@ impl OctreeBuilder {
             } else {
                 // Batched path: read in chunks to stay within budget
                 let batch_size = (half_budget / 120).max(10_000) as usize;
-                info!(
+                debug!(
                     "File too large (~{} MB), using batched reads of {} points",
                     estimated_mem / (1024 * 1024),
                     batch_size
@@ -806,8 +806,8 @@ impl OctreeBuilder {
             self.total_points
         );
         if total_pts as u64 != self.total_points {
-            info!(
-                "Note: COPC contains {} points vs {} from input headers (diff {}). \
+            debug!(
+                "COPC contains {} points vs {} from input headers (diff {}). \
                  Input LAZ headers sometimes report inaccurate point counts.",
                 total_pts,
                 self.total_points,
@@ -855,7 +855,7 @@ impl OctreeBuilder {
             .collect();
 
         for d in (0..actual_max_depth).rev() {
-            info!("Building ancestor level {d}");
+            debug!("Building ancestor level {d}");
 
             // Group children at level d+1 by parent (iterate keys, no disk I/O).
             let mut parent_children: HashMap<VoxelKey, Vec<VoxelKey>> = HashMap::new();
@@ -945,7 +945,7 @@ impl OctreeBuilder {
         }
 
         for d in (0..actual_max_depth).rev() {
-            info!("Building ancestor level {d}");
+            debug!("Building ancestor level {d}");
             let child_keys = match keys_by_level.get(&(d as i32 + 1)) {
                 Some(v) => v.clone(),
                 None => continue,

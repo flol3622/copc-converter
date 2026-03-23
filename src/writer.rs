@@ -26,7 +26,7 @@ use crate::octree::{OctreeBuilder, RawPoint};
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
 use laz::{LazVlrBuilder, ParLasZipCompressor};
-use log::info;
+use log::{debug, error, info};
 use rayon::prelude::*;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -122,7 +122,7 @@ pub fn write_copc(
     // Use the actual point count from node_keys (not builder.total_points which
     // is the original input count — the write-back sampling may have moved points).
     let actual_total_points: u64 = node_keys.iter().map(|(_, c)| *c as u64).sum();
-    info!(
+    debug!(
         "Header total_points: {} (original: {})",
         actual_total_points, builder.total_points
     );
@@ -166,7 +166,7 @@ pub fn write_copc(
             .then(a.z.cmp(&b.z))
     });
 
-    info!(
+    debug!(
         "Writing {} nodes, {} points",
         ordered_keys.len(),
         actual_total_points,
@@ -296,7 +296,7 @@ pub fn write_copc(
         .copied()
         .collect();
 
-    info!(
+    debug!(
         "Encoding {} data nodes ({} empty ancestors) in batches (budget {} MiB)",
         data_keys.len(),
         ordered_keys.len() - data_keys.len(),
@@ -440,8 +440,8 @@ pub fn write_copc(
     // -----------------------------------------------------------------------
     let evlr_start = end_pos;
     if chunk_table.len() != data_keys.len() {
-        info!(
-            "ERROR: chunk table has {} entries but we compressed {} chunks!",
+        error!(
+            "Chunk table has {} entries but we compressed {} chunks!",
             chunk_table.len(),
             data_keys.len()
         );
