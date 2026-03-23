@@ -56,9 +56,23 @@ fn parse_memory_limit(s: &str) -> Result<u64> {
 
 const TOTAL_STEPS: u32 = 5;
 
+fn human_count(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 struct CliProgress {
     bar: Mutex<Option<ProgressBar>>,
     step: std::sync::atomic::AtomicU32,
+    stage_prefix: Mutex<String>,
+    stage_total: std::sync::atomic::AtomicU64,
 }
 
 impl CliProgress {
@@ -66,6 +80,8 @@ impl CliProgress {
         Self {
             bar: Mutex::new(None),
             step: std::sync::atomic::AtomicU32::new(0),
+            stage_prefix: Mutex::new(String::new()),
+            stage_total: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -77,16 +93,17 @@ impl ProgressObserver for CliProgress {
             ProgressEvent::StageStart { name, total } => {
                 let step = self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let prefix = format!("[{step}/{TOTAL_STEPS}] {name}");
+                *self.stage_prefix.lock().unwrap() = prefix.clone();
+                self.stage_total
+                    .store(total, std::sync::atomic::Ordering::Relaxed);
                 let pb = if total > 0 {
                     let pb = ProgressBar::new(total);
                     pb.set_style(
-                        ProgressStyle::with_template(
-                            "{msg} [{bar:40}] {human_pos}/{human_len} ({eta})",
-                        )
-                        .unwrap()
-                        .progress_chars("=> "),
+                        ProgressStyle::with_template("{msg} [{bar:40}] ({eta})")
+                            .unwrap()
+                            .progress_chars("=> "),
                     );
-                    pb.set_message(prefix);
+                    pb.set_message(format!("{prefix} 0/{}", human_count(total)));
                     pb
                 } else {
                     let pb = ProgressBar::new_spinner();
@@ -99,11 +116,20 @@ impl ProgressObserver for CliProgress {
             ProgressEvent::StageProgress { done } => {
                 if let Some(ref pb) = *bar {
                     pb.set_position(done);
+                    let total = self.stage_total.load(std::sync::atomic::Ordering::Relaxed);
+                    let prefix = self.stage_prefix.lock().unwrap().clone();
+                    pb.set_message(format!(
+                        "{prefix} {}/{}",
+                        human_count(done),
+                        human_count(total)
+                    ));
                 }
             }
             ProgressEvent::StageDone => {
                 if let Some(pb) = bar.take() {
+                    let prefix = self.stage_prefix.lock().unwrap().clone();
                     pb.finish_and_clear();
+                    eprintln!("{prefix} done");
                 }
             }
         }
