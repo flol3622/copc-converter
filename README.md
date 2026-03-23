@@ -68,6 +68,28 @@ copc_converter ./my_survey/ survey.copc.laz --memory-limit 8G
 copc_converter ./my_survey/ survey.copc.laz --temporal-index
 ```
 
+## Library usage
+
+The crate exposes a typestate pipeline API that enforces correct step ordering at compile time:
+
+```rust
+use copc_converter::{Pipeline, PipelineConfig, collect_input_files};
+
+let files = collect_input_files("./tiles/".into())?;
+let config = PipelineConfig {
+    memory_budget: 12_884_901_888,
+    temp_dir: None,
+    temporal_index: false,
+    temporal_stride: 1000,
+};
+
+Pipeline::scan(&files, config)?
+    .validate()?
+    .distribute()?
+    .build()?
+    .write("output.copc.laz")?;
+```
+
 ## How it works
 
 1. **Scan** — reads headers from all input files in parallel to determine bounds, CRS, point format, and point count.

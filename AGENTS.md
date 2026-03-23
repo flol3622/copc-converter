@@ -15,30 +15,38 @@ A Rust CLI that converts LAS/LAZ point cloud files into [COPC](https://copc.io/)
 
 ## Architecture
 
-The pipeline runs in four sequential passes, all in `main.rs`:
+The public API is a typestate pipeline (`Pipeline<S>`) that enforces step ordering at compile time. Internal modules are `pub(crate)` — only `Pipeline`, `PipelineConfig`, and utility functions are public.
 
-1. **Scan** (`OctreeBuilder::scan`) — parallel header reads to get bounds, CRS, point format, total count
-2. **Validate** (`validate::validate`) — ensures consistent CRS and point format across inputs, selects output format (6/7/8)
-3. **Distribute** (`builder.distribute`) — reads all points, assigns to octree leaf voxels, writes to temp files on disk
-4. **Build** (`builder.build_node_map`) — bottom-up octree construction with LOD thinning
-5. **Write** (`writer::write_copc`) — parallel LAZ compression, writes single COPC file with hierarchy EVLR
+### Pipeline stages
+
+```
+Pipeline::scan(&files, config)?  -> Pipeline<Scanned>
+  .validate()?                   -> Pipeline<Validated>
+  .distribute()?                 -> Pipeline<Distributed>
+  .build()?                      -> Pipeline<Built>
+  .write(&output)?               -> ()
+```
 
 ### Source files
 
 | File | Purpose |
 |---|---|
-| `main.rs` | CLI args, pipeline orchestration, `PipelineConfig` |
+| `lib.rs` | Public API: `Pipeline<S>`, `PipelineConfig`, stage markers, utility functions |
+| `main.rs` | CLI args (clap), calls the pipeline |
 | `octree.rs` | `OctreeBuilder`, voxel key math, point distribution, octree construction |
-| `validate.rs` | Input validation (CRS, point format consistency) |
+| `validate.rs` | Input validation (CRS, point format, GPS time) |
 | `writer.rs` | COPC file writer with parallel LAZ encoding |
-| `copc_types.rs` | COPC-specific structs (header, VLRs, hierarchy entries) |
+| `copc_types.rs` | COPC-specific structs (header, VLRs, hierarchy entries, temporal index) |
 
 ### Key design decisions
 
+- **Typestate pipeline**: compile-time enforcement of step ordering — can't distribute before validating, can't write before building
+- **Minimal public API**: only `Pipeline`, `PipelineConfig`, stage markers, and two utility functions are public; all internal types are `pub(crate)`
 - **Out-of-core**: points are written to per-voxel temp files during distribution to stay within a configurable memory budget (default 16 GB, applied with a 0.75 safety factor)
 - **Temp cleanup**: `OctreeBuilder` implements `Drop` to remove the temp directory, ensuring cleanup even on error
-- **Point formats**: automatically selects LAS point format 6, 7, or 8 based on input — uses the `las` crate for reading (`read_all_points_into`) and `laz` for compression
+- **Point formats**: automatically selects LAS point format 6, 7, or 8 based on input — uses the `las` crate for reading and `laz` for compression
 - **Parallelism**: uses rayon throughout for reading, octree building, and LAZ compression
+- **LOD thinning**: 128 grid cells per axis (matching untwine's CellCount) for good progressive rendering
 - **Version in Cargo.toml**: kept as `0.0.0-dev`; CI patches it from the git tag at release time
 
 ## Development
