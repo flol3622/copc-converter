@@ -986,37 +986,51 @@ impl OctreeBuilder {
 
             // Estimate each parent's memory cost from its children's file sizes,
             // then batch parents so the total stays within the memory budget.
-            let mut parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = parent_children
-                .into_iter()
-                .map(|(parent, children)| {
-                    let child_bytes: u64 = children
-                        .iter()
-                        .map(|ck| self.node_path(ck).metadata().map_or(0, |m| m.len()))
-                        .sum();
-                    let est_points = child_bytes / RawPoint::BYTE_SIZE as u64;
-                    let est_mem = est_points * MEM_PER_POINT;
-                    (parent, children, est_mem)
-                })
-                .collect();
+            // Parents that exceed the budget on their own use a streaming path.
+            let mut small_parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = Vec::new();
+            let mut large_parents: Vec<(VoxelKey, Vec<VoxelKey>)> = Vec::new();
 
-            // Sort largest-first so big parents aren't all grouped in one batch.
-            parents.sort_by(|a, b| b.2.cmp(&a.2));
+            for (parent, children) in parent_children {
+                let child_bytes: u64 = children
+                    .iter()
+                    .map(|ck| self.node_path(ck).metadata().map_or(0, |m| m.len()))
+                    .sum();
+                let est_points = child_bytes / RawPoint::BYTE_SIZE as u64;
+                let est_mem = est_points * MEM_PER_POINT;
+                if est_mem > memory_budget {
+                    large_parents.push((parent, children));
+                } else {
+                    small_parents.push((parent, children, est_mem));
+                }
+            }
 
             let mut new_parent_keys: Vec<VoxelKey> = Vec::new();
+
+            // Process oversized parents sequentially with streaming grid_sample.
+            // Only one child is in memory at a time.
+            for (parent, children) in &large_parents {
+                self.grid_sample_streaming(parent, children)?;
+                new_parent_keys.push(*parent);
+            }
+
+            // Batch small parents for parallel processing.
+            small_parents.sort_by(|a, b| b.2.cmp(&a.2));
+
             let mut batch_start = 0;
-            while batch_start < parents.len() {
+            while batch_start < small_parents.len() {
                 let mut batch_mem: u64 = 0;
                 let mut batch_end = batch_start;
-                while batch_end < parents.len() {
-                    // Always include at least one parent per batch.
-                    if batch_end > batch_start && batch_mem + parents[batch_end].2 > memory_budget {
+                while batch_end < small_parents.len() {
+                    if batch_end > batch_start
+                        && batch_mem + small_parents[batch_end].2 > memory_budget
+                    {
                         break;
                     }
-                    batch_mem += parents[batch_end].2;
+                    batch_mem += small_parents[batch_end].2;
                     batch_end += 1;
                 }
 
-                let batch = &parents[batch_start..batch_end];
+                let batch = &small_parents[batch_start..batch_end];
                 batch
                     .par_iter()
                     .map(|(parent, children, _)| -> Result<()> {
@@ -1041,7 +1055,7 @@ impl OctreeBuilder {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                for (parent, _, _) in &parents[batch_start..batch_end] {
+                for (parent, _, _) in &small_parents[batch_start..batch_end] {
                     new_parent_keys.push(*parent);
                 }
                 batch_start = batch_end;
@@ -1065,6 +1079,102 @@ impl OctreeBuilder {
             }
         }
         Ok(result)
+    }
+
+    /// Streaming grid-sample for a single oversized parent.
+    ///
+    /// Processes one child at a time so that only one child's points are ever in
+    /// memory. The grid occupancy set (max 128³ entries ≈ 48 MB) and the parent
+    /// accumulator (max 128³ points ≈ 80 MB) stay resident; everything else is
+    /// streamed from/to disk.
+    ///
+    /// Tradeoff: points are not Morton-sorted across children, so spatial
+    /// coherence of the parent is slightly worse than the in-memory path.
+    fn grid_sample_streaming(
+        &self,
+        parent: &VoxelKey,
+        children: &[VoxelKey],
+    ) -> Result<()> {
+        let voxel_size_world = 2.0 * self.halfsize / (1u64 << parent.level) as f64;
+        let origin_x = ((self.cx - self.halfsize + parent.x as f64 * voxel_size_world
+            - self.offset_x)
+            / self.scale_x)
+            .round() as i64;
+        let origin_y = ((self.cy - self.halfsize + parent.y as f64 * voxel_size_world
+            - self.offset_y)
+            / self.scale_y)
+            .round() as i64;
+        let origin_z = ((self.cz - self.halfsize + parent.z as f64 * voxel_size_world
+            - self.offset_z)
+            / self.scale_z)
+            .round() as i64;
+        let int_size =
+            (voxel_size_world / self.scale_x.min(self.scale_y).min(self.scale_z)).round() as i64;
+        let cell = (int_size / GRID_CELLS_PER_AXIS).max(1);
+
+        let grid_key = |p: &RawPoint| -> (i32, i32, i32) {
+            (
+                ((p.x as i64 - origin_x) / cell) as i32,
+                ((p.y as i64 - origin_y) / cell) as i32,
+                ((p.z as i64 - origin_z) / cell) as i32,
+            )
+        };
+
+        let max_accepted =
+            (GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS) as usize;
+        let mut occupied: HashSet<(i32, i32, i32)> = HashSet::new();
+        let mut parent_pts: Vec<RawPoint> = Vec::new();
+
+        // Track which children had points, to guarantee at least one per child.
+        let mut child_donated: Vec<bool> = vec![false; children.len()];
+
+        // Pass 1: iterate children one at a time, accept points into the parent
+        // grid, write remaining back to the child's temp file.
+        for (ci, ck) in children.iter().enumerate() {
+            let pts = self.read_node(ck)?;
+            if pts.is_empty() {
+                continue;
+            }
+            let mut remaining: Vec<RawPoint> = Vec::new();
+            for p in pts {
+                if parent_pts.len() < max_accepted && occupied.insert(grid_key(&p)) {
+                    child_donated[ci] = true;
+                    parent_pts.push(p);
+                } else {
+                    remaining.push(p);
+                }
+            }
+            // If this child had points but none remain (all promoted), we need to
+            // return at least one. Done in pass 2 below.
+            if remaining.is_empty() && child_donated[ci] {
+                // Will be fixed in pass 2.
+                child_donated[ci] = false;
+            }
+            self.write_node_to_temp(ck, &remaining)?;
+        }
+
+        // Pass 2: guarantee every child that contributed keeps at least one point.
+        for (ci, ck) in children.iter().enumerate() {
+            if !child_donated[ci] {
+                // Check if this child originally had points (file might now be
+                // empty because all were promoted).
+                let file_len = self.node_path(ck).metadata().map_or(0, |m| m.len());
+                if file_len == 0 && !parent_pts.is_empty() {
+                    // Return one point from the parent back to this child.
+                    // Find the last parent point that came from any child — we
+                    // can't track origin in the streaming path, so just pop the last.
+                    if let Some(p) = parent_pts.pop() {
+                        self.write_node_to_temp(ck, &[p])?;
+                    }
+                }
+            }
+        }
+
+        if !parent_pts.is_empty() {
+            self.write_node_to_temp(parent, &parent_pts)?;
+        }
+
+        Ok(())
     }
 
     /// Grid-based spatial sampling for one parent node.
