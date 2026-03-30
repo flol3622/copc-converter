@@ -19,8 +19,8 @@ use crate::PipelineConfig;
 /// compressed in parallel via compress_chunks(). The chunk table is read
 /// back from the file to recover per-chunk byte sizes for the hierarchy.
 use crate::copc_types::{
-    CopcInfo, EVLR_HEADER_SIZE, HierarchyEntry, TemporalIndexEntry, TemporalIndexHeader, VoxelKey,
-    write_evlr, write_vlr,
+    CopcInfo, EVLR_HEADER_SIZE, HierarchyEntry, TEMPORAL_HEADER_SIZE, TemporalIndexEntry,
+    TemporalIndexHeader, TemporalPagePointer, VoxelKey, write_evlr, write_vlr,
 };
 use crate::octree::{OctreeBuilder, RawPoint};
 use anyhow::{Context, Result};
@@ -496,19 +496,17 @@ pub fn write_copc(
     write_evlr(&mut w, "copc", 1000, "copc hierarchy", &hier_payload)?;
 
     // -----------------------------------------------------------------------
-    // EVLR: temporal index (optional)
+    // EVLR: temporal index (optional) — v2 paged layout
     // -----------------------------------------------------------------------
     if config.temporal_index {
-        let mut temporal_payload = Vec::new();
-        TemporalIndexHeader {
-            version: 1,
-            stride: config.temporal_stride,
-            node_count: temporal_entries.len() as u32,
-        }
-        .write(&mut temporal_payload)?;
-        for entry in &temporal_entries {
-            entry.write(&mut temporal_payload)?;
-        }
+        // Current file position is where the EVLR record header starts.
+        // The EVLR data payload begins 60 bytes later.
+        let temporal_evlr_start = w.stream_position()?;
+        let evlr_data_start = temporal_evlr_start + EVLR_HEADER_SIZE as u64;
+
+        let temporal_payload =
+            build_temporal_payload(&temporal_entries, config.temporal_stride, evlr_data_start)?;
+
         write_evlr(
             &mut w,
             "copc_temporal",
@@ -554,6 +552,298 @@ pub fn write_copc(
 
     info!("COPC file written: {:?}", output_path);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Temporal index v2 paged layout
+// ---------------------------------------------------------------------------
+
+/// Choose multiple page boundary levels for nested pages.
+///
+/// Places boundaries every 3 levels of the octree, starting at level 3.
+/// For example:
+///  - max_level=9:  [3]
+///  - max_level=12: [3, 6, 9]
+///  - max_level=15: [3, 6, 9, 12]
+///
+/// If the tree is very shallow (max_level <= 3), returns an empty vec (single
+/// root page, no child pages needed).
+fn choose_page_boundaries(max_level: i32) -> Vec<i32> {
+    let mut boundaries = Vec::new();
+    let mut l = 3;
+    while l < max_level {
+        boundaries.push(l);
+        l += 3;
+    }
+    if boundaries.is_empty() && max_level > 3 {
+        boundaries.push(max_level.min(3));
+    }
+    boundaries
+}
+
+/// Returns the ancestor VoxelKey at the given level.
+fn ancestor_at_level(key: VoxelKey, level: i32) -> VoxelKey {
+    let mut k = key;
+    while k.level > level {
+        k = k.parent().unwrap();
+    }
+    k
+}
+
+/// Compute the time range (min, max) across all entries in a slice.
+///
+/// Returns `(f64::MAX, f64::MIN)` if no entries have samples.
+fn time_range_of(entries: &[&TemporalIndexEntry]) -> (f64, f64) {
+    let mut tmin = f64::MAX;
+    let mut tmax = f64::MIN;
+    for e in entries {
+        if let Some(&first) = e.samples.first()
+            && first < tmin
+        {
+            tmin = first;
+        }
+        if let Some(&last) = e.samples.last()
+            && last > tmax
+        {
+            tmax = last;
+        }
+    }
+    (tmin, tmax)
+}
+
+/// A page produced by the recursive page builder. Contains its serialized node
+/// entries and page pointers (with placeholder offsets), plus metadata needed to
+/// patch in the correct absolute offsets in a second pass.
+struct BuiltPage {
+    /// Serialized bytes: node entries followed by page pointers.
+    data: Vec<u8>,
+    /// For each page pointer written into `data`, the byte offset within `data`
+    /// where the `child_page_offset` u64 field starts, plus the index of the
+    /// child `BuiltPage` in the flat page list.
+    pointer_patches: Vec<(usize, usize)>,
+}
+
+/// Recursively build pages for a set of entries.
+///
+/// `entries` — all entries belonging to this page's subtree.
+/// `boundaries` — the full list of page boundary levels.
+/// `boundary_idx` — which boundary we are splitting at (index into `boundaries`).
+/// `pages` — accumulator for all built pages (flat list, appended in order).
+///
+/// Returns the index of this page in `pages`.
+fn build_page_recursive(
+    entries: &[&TemporalIndexEntry],
+    boundaries: &[i32],
+    boundary_idx: usize,
+    pages: &mut Vec<BuiltPage>,
+) -> anyhow::Result<usize> {
+    // If no more boundaries, or the subtree is empty, write all entries into one page.
+    if boundary_idx >= boundaries.len() || entries.is_empty() {
+        let mut data = Vec::new();
+        for entry in entries {
+            entry.write(&mut data)?;
+        }
+        let page_idx = pages.len();
+        pages.push(BuiltPage {
+            data,
+            pointer_patches: Vec::new(),
+        });
+        return Ok(page_idx);
+    }
+
+    let boundary_level = boundaries[boundary_idx];
+
+    // Split entries into those that belong in this page (level <= boundary)
+    // and those that go into child pages (level > boundary).
+    let mut this_page_entries: Vec<&TemporalIndexEntry> = Vec::new();
+    let mut child_groups: std::collections::BTreeMap<VoxelKey, Vec<&TemporalIndexEntry>> =
+        std::collections::BTreeMap::new();
+
+    for &entry in entries {
+        if entry.key.level <= boundary_level {
+            this_page_entries.push(entry);
+        } else {
+            let subtree_root = ancestor_at_level(entry.key, boundary_level);
+            child_groups.entry(subtree_root).or_default().push(entry);
+        }
+    }
+
+    // If there are no child groups, just write everything into one page.
+    if child_groups.is_empty() {
+        let mut data = Vec::new();
+        for entry in &this_page_entries {
+            entry.write(&mut data)?;
+        }
+        let page_idx = pages.len();
+        pages.push(BuiltPage {
+            data,
+            pointer_patches: Vec::new(),
+        });
+        return Ok(page_idx);
+    }
+
+    // Reserve a slot for this page in the flat list.
+    let this_page_idx = pages.len();
+    pages.push(BuiltPage {
+        data: Vec::new(),
+        pointer_patches: Vec::new(),
+    });
+
+    // Recursively build child pages. We need to collect their info before
+    // writing this page, since we need child page indices for patching.
+    struct ChildInfo {
+        subtree_root: VoxelKey,
+        child_page_idx: usize,
+        /// Time range across ALL descendants in this subtree (including entries
+        /// at the boundary level that are in the parent page).
+        time_min: f64,
+        time_max: f64,
+    }
+
+    let mut children: Vec<ChildInfo> = Vec::new();
+    for (subtree_root, child_entries) in &child_groups {
+        // Compute time range over ALL descendants: child_entries (deeper) plus
+        // the subtree root node itself if it appears in this_page_entries.
+        let (mut tmin, mut tmax) = time_range_of(child_entries);
+        if let Some(root_entry) = this_page_entries.iter().find(|e| e.key == *subtree_root) {
+            let (rmin, rmax) = time_range_of(&[root_entry]);
+            tmin = tmin.min(rmin);
+            tmax = tmax.max(rmax);
+        }
+
+        let child_refs: Vec<&TemporalIndexEntry> = child_entries.to_vec();
+        let child_page_idx =
+            build_page_recursive(&child_refs, boundaries, boundary_idx + 1, pages)?;
+
+        children.push(ChildInfo {
+            subtree_root: *subtree_root,
+            child_page_idx,
+            time_min: tmin,
+            time_max: tmax,
+        });
+    }
+
+    // Now serialize this page: node entries first, then page pointers.
+    let mut data = Vec::new();
+    for entry in &this_page_entries {
+        entry.write(&mut data)?;
+    }
+
+    let mut pointer_patches = Vec::new();
+    for child in &children {
+        // Record where the child_page_offset field will be so we can patch it.
+        // In the TemporalPagePointer layout:
+        //   VoxelKey (16) + sample_count=0 (4) + child_page_offset (8) ...
+        // So child_page_offset starts at current position + 20.
+        let patch_offset = data.len() + 20;
+
+        TemporalPagePointer {
+            key: child.subtree_root,
+            child_page_offset: 0, // placeholder — patched later
+            child_page_size: 0,   // placeholder — patched later
+            subtree_time_min: child.time_min,
+            subtree_time_max: child.time_max,
+        }
+        .write(&mut data)?;
+
+        pointer_patches.push((patch_offset, child.child_page_idx));
+    }
+
+    pages[this_page_idx] = BuiltPage {
+        data,
+        pointer_patches,
+    };
+
+    Ok(this_page_idx)
+}
+
+/// Build the complete temporal index EVLR payload with nested pages.
+///
+/// `evlr_data_start` is the absolute file offset where the EVLR data payload
+/// begins (i.e., after the 60-byte EVLR record header).
+fn build_temporal_payload(
+    entries: &[TemporalIndexEntry],
+    stride: u32,
+    evlr_data_start: u64,
+) -> anyhow::Result<Vec<u8>> {
+    if entries.is_empty() {
+        let mut payload = Vec::new();
+        TemporalIndexHeader {
+            version: 1,
+            stride,
+            node_count: 0,
+            page_count: 1,
+            root_page_offset: evlr_data_start + TEMPORAL_HEADER_SIZE as u64,
+            root_page_size: 0,
+        }
+        .write(&mut payload)?;
+        return Ok(payload);
+    }
+
+    let max_level = entries.iter().map(|e| e.key.level).max().unwrap_or(0);
+    let boundaries = choose_page_boundaries(max_level);
+
+    // Build all pages recursively into a flat list.
+    let entry_refs: Vec<&TemporalIndexEntry> = entries.iter().collect();
+    let mut pages: Vec<BuiltPage> = Vec::new();
+    let root_page_idx = build_page_recursive(&entry_refs, &boundaries, 0, &mut pages)?;
+
+    // Compute absolute offsets for each page. Pages are laid out sequentially
+    // after the header.
+    let pages_start = evlr_data_start + TEMPORAL_HEADER_SIZE as u64;
+    let mut page_offsets: Vec<u64> = Vec::with_capacity(pages.len());
+    let mut offset = pages_start;
+    for page in &pages {
+        page_offsets.push(offset);
+        offset += page.data.len() as u64;
+    }
+
+    // Patch child_page_offset and child_page_size in each page's data.
+    for i in 0..pages.len() {
+        // Collect patches first to avoid borrow issues.
+        let patches: Vec<(usize, u64, u32)> = pages[i]
+            .pointer_patches
+            .iter()
+            .map(|&(patch_offset, child_idx)| {
+                (
+                    patch_offset,
+                    page_offsets[child_idx],
+                    pages[child_idx].data.len() as u32,
+                )
+            })
+            .collect();
+
+        for (patch_offset, abs_offset, size) in patches {
+            // Patch child_page_offset (8 bytes at patch_offset).
+            pages[i].data[patch_offset..patch_offset + 8]
+                .copy_from_slice(&abs_offset.to_le_bytes());
+            // Patch child_page_size (4 bytes immediately after).
+            pages[i].data[patch_offset + 8..patch_offset + 12].copy_from_slice(&size.to_le_bytes());
+        }
+    }
+
+    let root_page_offset = page_offsets[root_page_idx];
+    let root_page_size = pages[root_page_idx].data.len() as u32;
+    let page_count = pages.len() as u32;
+    let node_count = entries.len() as u32;
+
+    // Assemble the final payload: header + all pages in order.
+    let mut payload = Vec::new();
+    TemporalIndexHeader {
+        version: 1,
+        stride,
+        node_count,
+        page_count,
+        root_page_offset,
+        root_page_size,
+    }
+    .write(&mut payload)?;
+
+    for page in &pages {
+        payload.extend_from_slice(&page.data);
+    }
+
+    Ok(payload)
 }
 
 #[cfg(test)]

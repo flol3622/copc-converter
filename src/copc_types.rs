@@ -13,7 +13,7 @@ use std::io::Write;
 // ---------------------------------------------------------------------------
 
 /// Identifies a node in the COPC octree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VoxelKey {
     /// Octree level (0 = root).
     pub level: i32,
@@ -186,11 +186,14 @@ pub const EVLR_HEADER_SIZE: usize = 60;
 // Temporal Index EVLR (optional extension)
 // ---------------------------------------------------------------------------
 
-/// Header for the temporal index EVLR (16 bytes).
+/// Header for the temporal index EVLR (32 bytes).
 pub struct TemporalIndexHeader {
     pub version: u32,
     pub stride: u32,
     pub node_count: u32,
+    pub page_count: u32,
+    pub root_page_offset: u64,
+    pub root_page_size: u32,
 }
 
 impl TemporalIndexHeader {
@@ -198,7 +201,50 @@ impl TemporalIndexHeader {
         w.write_u32::<LittleEndian>(self.version)?;
         w.write_u32::<LittleEndian>(self.stride)?;
         w.write_u32::<LittleEndian>(self.node_count)?;
+        w.write_u32::<LittleEndian>(self.page_count)?;
+        w.write_u64::<LittleEndian>(self.root_page_offset)?;
+        w.write_u32::<LittleEndian>(self.root_page_size)?;
         w.write_u32::<LittleEndian>(0)?; // reserved
+        Ok(())
+    }
+}
+
+/// Size of the temporal index header in bytes.
+pub const TEMPORAL_HEADER_SIZE: usize = 32;
+
+/// A page pointer entry in the temporal index (48 bytes on disk).
+///
+/// Distinguished from a node entry by `sample_count == 0` in the binary stream.
+pub struct TemporalPagePointer {
+    /// VoxelKey of the subtree root.
+    pub key: VoxelKey,
+    /// Absolute file offset of the child page.
+    pub child_page_offset: u64,
+    /// Size of the child page in bytes.
+    pub child_page_size: u32,
+    /// Minimum GPS time across all nodes in the subtree.
+    pub subtree_time_min: f64,
+    /// Maximum GPS time across all nodes in the subtree.
+    pub subtree_time_max: f64,
+}
+
+impl TemporalPagePointer {
+    pub fn write<W: Write>(&self, w: &mut W) -> anyhow::Result<()> {
+        // VoxelKey (16 bytes)
+        w.write_i32::<LittleEndian>(self.key.level)?;
+        w.write_i32::<LittleEndian>(self.key.x)?;
+        w.write_i32::<LittleEndian>(self.key.y)?;
+        w.write_i32::<LittleEndian>(self.key.z)?;
+        // sample_count = 0 (discriminator, 4 bytes)
+        w.write_u32::<LittleEndian>(0)?;
+        // child_page_offset (8 bytes)
+        w.write_u64::<LittleEndian>(self.child_page_offset)?;
+        // child_page_size (4 bytes)
+        w.write_u32::<LittleEndian>(self.child_page_size)?;
+        // subtree_time_min (8 bytes)
+        w.write_f64::<LittleEndian>(self.subtree_time_min)?;
+        // subtree_time_max (8 bytes)
+        w.write_f64::<LittleEndian>(self.subtree_time_max)?;
         Ok(())
     }
 }
@@ -236,10 +282,62 @@ mod tests {
             version: 1,
             stride: 1000,
             node_count: 5,
+            page_count: 2,
+            root_page_offset: 1024,
+            root_page_size: 256,
         }
         .write(&mut buf)
         .unwrap();
-        assert_eq!(buf.len(), 16);
+        assert_eq!(buf.len(), 32);
+    }
+
+    #[test]
+    fn temporal_page_pointer_size() {
+        let mut buf = Vec::new();
+        TemporalPagePointer {
+            key: VoxelKey {
+                level: 3,
+                x: 1,
+                y: 2,
+                z: 3,
+            },
+            child_page_offset: 4096,
+            child_page_size: 512,
+            subtree_time_min: 100.0,
+            subtree_time_max: 200.0,
+        }
+        .write(&mut buf)
+        .unwrap();
+        assert_eq!(buf.len(), 48);
+    }
+
+    #[test]
+    fn temporal_page_pointer_roundtrip() {
+        let ptr = TemporalPagePointer {
+            key: VoxelKey {
+                level: 3,
+                x: 5,
+                y: 6,
+                z: 7,
+            },
+            child_page_offset: 99999,
+            child_page_size: 1024,
+            subtree_time_min: 42.5,
+            subtree_time_max: 99.9,
+        };
+        let mut buf = Vec::new();
+        ptr.write(&mut buf).unwrap();
+
+        let mut r = Cursor::new(&buf);
+        assert_eq!(r.read_i32::<LittleEndian>().unwrap(), 3); // level
+        assert_eq!(r.read_i32::<LittleEndian>().unwrap(), 5); // x
+        assert_eq!(r.read_i32::<LittleEndian>().unwrap(), 6); // y
+        assert_eq!(r.read_i32::<LittleEndian>().unwrap(), 7); // z
+        assert_eq!(r.read_u32::<LittleEndian>().unwrap(), 0); // sample_count == 0
+        assert_eq!(r.read_u64::<LittleEndian>().unwrap(), 99999); // offset
+        assert_eq!(r.read_u32::<LittleEndian>().unwrap(), 1024); // size
+        assert_eq!(r.read_f64::<LittleEndian>().unwrap(), 42.5); // time_min
+        assert_eq!(r.read_f64::<LittleEndian>().unwrap(), 99.9); // time_max
     }
 
     #[test]

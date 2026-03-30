@@ -202,6 +202,9 @@ struct TemporalIndexHeader {
     version: u32,
     stride: u32,
     node_count: u32,
+    page_count: u32,
+    root_page_offset: u64,
+    root_page_size: u32,
 }
 
 #[derive(Debug)]
@@ -247,11 +250,18 @@ fn read_temporal_index(data: &[u8]) -> Option<(TemporalIndexHeader, Vec<Temporal
         version: r.read_u32::<LittleEndian>().unwrap(),
         stride: r.read_u32::<LittleEndian>().unwrap(),
         node_count: r.read_u32::<LittleEndian>().unwrap(),
+        page_count: r.read_u32::<LittleEndian>().unwrap(),
+        root_page_offset: r.read_u64::<LittleEndian>().unwrap(),
+        root_page_size: r.read_u32::<LittleEndian>().unwrap(),
     };
     let _reserved = r.read_u32::<LittleEndian>().unwrap();
 
+    // Read all entries from all pages sequentially.
+    // In the v2 layout, pages are written sequentially after the header.
+    // We read all entries by scanning the remaining payload, distinguishing
+    // node entries (sample_count >= 1) from page pointers (sample_count == 0).
     let mut entries = Vec::new();
-    for _ in 0..header.node_count {
+    while (r.position() as usize) < payload.len() {
         let key = VoxelKey {
             level: r.read_i32::<LittleEndian>().unwrap(),
             x: r.read_i32::<LittleEndian>().unwrap(),
@@ -259,11 +269,17 @@ fn read_temporal_index(data: &[u8]) -> Option<(TemporalIndexHeader, Vec<Temporal
             z: r.read_i32::<LittleEndian>().unwrap(),
         };
         let sample_count = r.read_u32::<LittleEndian>().unwrap();
-        let mut samples = Vec::with_capacity(sample_count as usize);
-        for _ in 0..sample_count {
-            samples.push(r.read_f64::<LittleEndian>().unwrap());
+        if sample_count == 0 {
+            // Page pointer: skip child_page_offset(8) + child_page_size(4) +
+            // subtree_time_min(8) + subtree_time_max(8) = 28 bytes
+            r.seek(SeekFrom::Current(28)).unwrap();
+        } else {
+            let mut samples = Vec::with_capacity(sample_count as usize);
+            for _ in 0..sample_count {
+                samples.push(r.read_f64::<LittleEndian>().unwrap());
+            }
+            entries.push(TemporalIndexNodeEntry { key, samples });
         }
-        entries.push(TemporalIndexNodeEntry { key, samples });
     }
 
     Some((header, entries))
