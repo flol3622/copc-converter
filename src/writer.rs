@@ -339,6 +339,18 @@ pub fn write_copc(
         }
 
         let batch = &data_keys[batch_start..batch_end];
+        let batch_points: u64 = batch
+            .iter()
+            .map(|k| point_counts.get(k).copied().unwrap_or(0) as u64)
+            .sum();
+        debug!(
+            "Write batch {}: {} nodes, {} points, est {} MB (budget {} MB)",
+            batch_start,
+            batch.len(),
+            batch_points,
+            batch_bytes / 1_048_576,
+            memory_budget / 1_048_576,
+        );
         type NodeResult = (Vec<u8>, [u64; 15], f64, f64, Vec<f64>);
         let results: Vec<NodeResult> = batch
             .par_iter()

@@ -39,6 +39,10 @@ struct Args {
     /// or "json" (NDJSON, one JSON object per line)
     #[arg(long, value_enum, default_value_t = ProgressMode::Bar)]
     progress: ProgressMode,
+
+    /// Maximum number of parallel threads. Default: all available cores
+    #[arg(long)]
+    threads: Option<usize>,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -344,6 +348,14 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if let Some(n) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .context("Failed to set rayon thread count")?;
+    }
+
     let input_files = collect_input_files(args.input)?;
 
     let raw_limit = parse_memory_limit(&args.memory_limit)?;
