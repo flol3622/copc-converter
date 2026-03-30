@@ -1090,11 +1090,7 @@ impl OctreeBuilder {
     ///
     /// Tradeoff: points are not Morton-sorted across children, so spatial
     /// coherence of the parent is slightly worse than the in-memory path.
-    fn grid_sample_streaming(
-        &self,
-        parent: &VoxelKey,
-        children: &[VoxelKey],
-    ) -> Result<()> {
+    fn grid_sample_streaming(&self, parent: &VoxelKey, children: &[VoxelKey]) -> Result<()> {
         let voxel_size_world = 2.0 * self.halfsize / (1u64 << parent.level) as f64;
         let origin_x = ((self.cx - self.halfsize + parent.x as f64 * voxel_size_world
             - self.offset_x)
