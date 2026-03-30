@@ -577,7 +577,11 @@ impl OctreeBuilder {
                 file_point_count,
                 estimated_mem / 1_048_576,
                 half_budget / 1_048_576,
-                if estimated_mem <= half_budget { "fast path" } else { "batched path" }
+                if estimated_mem <= half_budget {
+                    "fast path"
+                } else {
+                    "batched path"
+                }
             );
 
             if estimated_mem <= half_budget {
@@ -739,8 +743,7 @@ impl OctreeBuilder {
         let num_threads = rayon::current_num_threads() as u64;
         let per_thread_budget = memory_budget / num_threads.max(1);
         // 2.5x overhead → divide by 3 for safety margin
-        let chunk_points =
-            ((per_thread_budget / 3) as usize / RawPoint::BYTE_SIZE).max(100_000);
+        let chunk_points = ((per_thread_budget / 3) as usize / RawPoint::BYTE_SIZE).max(100_000);
 
         let mut round = 0u32;
         while !to_split.is_empty() {
@@ -792,8 +795,12 @@ impl OctreeBuilder {
                             let wy = p.y as f64 * self.scale_y + self.offset_y;
                             let wz = p.z as f64 * self.scale_z + self.offset_z;
                             let ck = point_to_key(
-                                wx, wy, wz,
-                                self.cx, self.cy, self.cz,
+                                wx,
+                                wy,
+                                wz,
+                                self.cx,
+                                self.cy,
+                                self.cz,
                                 self.halfsize,
                                 child_level as u32,
                             );
@@ -817,8 +824,7 @@ impl OctreeBuilder {
 
                     // Flush all child writers.
                     for (_, mut w) in child_writers {
-                        std::io::Write::flush(&mut w)
-                            .context("flush child temp file")?;
+                        std::io::Write::flush(&mut w).context("flush child temp file")?;
                     }
 
                     // Remove the parent file now that all data has been written to children.
