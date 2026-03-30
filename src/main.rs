@@ -188,7 +188,10 @@ impl ProgressObserver for PlainProgress {
                 self.last_percent
                     .store(0, std::sync::atomic::Ordering::Relaxed);
                 if total > 0 {
-                    eprintln!("[{step}/{TOTAL_STEPS}] {name} started ({} units)", human_count(total));
+                    eprintln!(
+                        "[{step}/{TOTAL_STEPS}] {name} started ({} units)",
+                        human_count(total)
+                    );
                 } else {
                     eprintln!("[{step}/{TOTAL_STEPS}] {name} started");
                 }
