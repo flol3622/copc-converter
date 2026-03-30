@@ -177,6 +177,15 @@ impl PlainProgress {
     }
 }
 
+/// Write a line to stdout and flush immediately so K8s log collectors see it.
+fn log_line(msg: std::fmt::Arguments) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let _ = writeln!(out, "{msg}");
+    let _ = out.flush();
+}
+
 impl ProgressObserver for PlainProgress {
     fn on_progress(&self, event: ProgressEvent) {
         match event {
@@ -188,12 +197,12 @@ impl ProgressObserver for PlainProgress {
                 self.last_percent
                     .store(0, std::sync::atomic::Ordering::Relaxed);
                 if total > 0 {
-                    eprintln!(
+                    log_line(format_args!(
                         "[{step}/{TOTAL_STEPS}] {name} started ({} units)",
                         human_count(total)
-                    );
+                    ));
                 } else {
-                    eprintln!("[{step}/{TOTAL_STEPS}] {name} started");
+                    log_line(format_args!("[{step}/{TOTAL_STEPS}] {name} started"));
                 }
             }
             ProgressEvent::StageProgress { done } => {
@@ -218,24 +227,24 @@ impl ProgressObserver for PlainProgress {
                 {
                     let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
                     let name = self.stage_name.lock().unwrap().clone();
-                    eprintln!(
+                    log_line(format_args!(
                         "[{step}/{TOTAL_STEPS}] {name} {bucket}% ({}/{})",
                         human_count(done),
                         human_count(total),
-                    );
+                    ));
                 }
             }
             ProgressEvent::StageDone => {
                 let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
                 let name = self.stage_name.lock().unwrap().clone();
-                eprintln!("[{step}/{TOTAL_STEPS}] {name} done");
+                log_line(format_args!("[{step}/{TOTAL_STEPS}] {name} done"));
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// JSON progress (NDJSON on stdout)
+// JSON progress (NDJSON on stdout, flushed per line)
 // ---------------------------------------------------------------------------
 
 struct JsonProgress {
@@ -256,9 +265,7 @@ impl JsonProgress {
     }
 
     fn emit(&self, value: &serde_json::Value) {
-        // Write to stderr so it doesn't interfere with stdout data piping.
-        // unwrap: serialization of our values cannot fail.
-        eprintln!("{}", serde_json::to_string(value).unwrap());
+        log_line(format_args!("{}", serde_json::to_string(value).unwrap()));
     }
 }
 
