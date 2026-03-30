@@ -785,15 +785,23 @@ impl OctreeBuilder {
             leaf_keys.len()
         );
 
-        // Estimate memory required to hold all leaf data.
+        // Estimate memory required to hold all leaf data. The in-memory path
+        // keeps all points in a HashMap<VoxelKey, Vec<RawPoint>> and during
+        // grid_sample temporarily holds both input and output, so the peak is
+        // roughly 2x the raw data size.
         let total_bytes: u64 = leaf_keys
             .iter()
             .map(|k| self.node_path(k).metadata().map_or(0, |m| m.len()))
             .sum();
+        let estimated_peak = total_bytes * 2;
 
         // Phase 2
-        let result = if total_bytes <= config.memory_budget {
-            info!("Building octree in-memory ({} MB)", total_bytes / 1_048_576);
+        let result = if estimated_peak <= config.memory_budget {
+            info!(
+                "Building octree in-memory ({} MB, ~{} MB peak)",
+                total_bytes / 1_048_576,
+                estimated_peak / 1_048_576
+            );
             self.bottom_up_in_memory(&leaf_keys, actual_max_depth)?
         } else {
             info!(
@@ -801,7 +809,7 @@ impl OctreeBuilder {
                 total_bytes / 1_048_576,
                 config.memory_budget / 1_048_576,
             );
-            self.bottom_up_on_disk(leaf_keys, actual_max_depth)?
+            self.bottom_up_on_disk(leaf_keys, actual_max_depth, config.memory_budget)?
         };
 
         let total_pts: usize = result.iter().map(|(_, c)| *c).sum();
@@ -939,16 +947,25 @@ impl OctreeBuilder {
     ///
     /// Processes one level at a time with disk I/O.  Avoids redundant directory
     /// scans by maintaining a per-level key map updated after each level.
+    /// Parents are batched so that the estimated peak memory of all concurrently
+    /// loaded points stays within the configured memory budget.
     fn bottom_up_on_disk(
         &self,
         leaf_keys: Vec<VoxelKey>,
         actual_max_depth: u32,
+        memory_budget: u64,
     ) -> Result<Vec<(VoxelKey, usize)>> {
         // Organise known keys by level — updated as parent nodes are created.
         let mut keys_by_level: HashMap<i32, Vec<VoxelKey>> = HashMap::new();
         for k in leaf_keys {
             keys_by_level.entry(k.level).or_default().push(k);
         }
+
+        // In-memory cost per point during grid_sample: the (usize, RawPoint) input
+        // vec plus the output vecs (parent + per-child remaining) — roughly 2x the
+        // input since points move from input to output.
+        const MEM_PER_POINT: u64 =
+            (std::mem::size_of::<(usize, RawPoint)>() + std::mem::size_of::<RawPoint>()) as u64;
 
         for d in (0..actual_max_depth).rev() {
             debug!("Building ancestor level {d}");
@@ -967,31 +984,68 @@ impl OctreeBuilder {
                 continue;
             }
 
-            let parents: Vec<(VoxelKey, Vec<VoxelKey>)> = parent_children.into_iter().collect();
-            let new_parent_keys: Vec<VoxelKey> = parents.iter().map(|(p, _)| *p).collect();
-
-            parents
-                .par_iter()
-                .map(|(parent, children)| -> Result<()> {
-                    let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
-                    for (ci, ck) in children.iter().enumerate() {
-                        for p in self.read_node(ck)? {
-                            all_pts.push((ci, p));
-                        }
-                    }
-                    if all_pts.is_empty() {
-                        return Ok(());
-                    }
-                    let (parent_pts, per_child) = self.grid_sample(parent, all_pts, children.len());
-                    for (ci, ck) in children.iter().enumerate() {
-                        self.write_node_to_temp(ck, &per_child[ci])?;
-                    }
-                    if !parent_pts.is_empty() {
-                        self.write_node_to_temp(parent, &parent_pts)?;
-                    }
-                    Ok(())
+            // Estimate each parent's memory cost from its children's file sizes,
+            // then batch parents so the total stays within the memory budget.
+            let mut parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = parent_children
+                .into_iter()
+                .map(|(parent, children)| {
+                    let child_bytes: u64 = children
+                        .iter()
+                        .map(|ck| self.node_path(ck).metadata().map_or(0, |m| m.len()))
+                        .sum();
+                    let est_points = child_bytes / RawPoint::BYTE_SIZE as u64;
+                    let est_mem = est_points * MEM_PER_POINT;
+                    (parent, children, est_mem)
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect();
+
+            // Sort largest-first so big parents aren't all grouped in one batch.
+            parents.sort_by(|a, b| b.2.cmp(&a.2));
+
+            let mut new_parent_keys: Vec<VoxelKey> = Vec::new();
+            let mut batch_start = 0;
+            while batch_start < parents.len() {
+                let mut batch_mem: u64 = 0;
+                let mut batch_end = batch_start;
+                while batch_end < parents.len() {
+                    // Always include at least one parent per batch.
+                    if batch_end > batch_start && batch_mem + parents[batch_end].2 > memory_budget {
+                        break;
+                    }
+                    batch_mem += parents[batch_end].2;
+                    batch_end += 1;
+                }
+
+                let batch = &parents[batch_start..batch_end];
+                batch
+                    .par_iter()
+                    .map(|(parent, children, _)| -> Result<()> {
+                        let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
+                        for (ci, ck) in children.iter().enumerate() {
+                            for p in self.read_node(ck)? {
+                                all_pts.push((ci, p));
+                            }
+                        }
+                        if all_pts.is_empty() {
+                            return Ok(());
+                        }
+                        let (parent_pts, per_child) =
+                            self.grid_sample(parent, all_pts, children.len());
+                        for (ci, ck) in children.iter().enumerate() {
+                            self.write_node_to_temp(ck, &per_child[ci])?;
+                        }
+                        if !parent_pts.is_empty() {
+                            self.write_node_to_temp(parent, &parent_pts)?;
+                        }
+                        Ok(())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                for (parent, _, _) in &parents[batch_start..batch_end] {
+                    new_parent_keys.push(*parent);
+                }
+                batch_start = batch_end;
+            }
 
             keys_by_level
                 .entry(d as i32)
