@@ -310,6 +310,7 @@ fn run_converter_with_args(input: &Path, output: &Path, extra_args: &[&str]) {
     let status = Command::new(converter_bin())
         .arg(input)
         .arg(output)
+        .args(["--progress", "plain"])
         .args(extra_args)
         .status()
         .expect("failed to run copc_converter");

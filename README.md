@@ -58,6 +58,7 @@ copc_converter ./tiles/ merged.copc.laz
 | `--temp-dir` | Directory for intermediate files | system temp |
 | `--temporal-index` | Write a temporal index EVLR for time-based queries | off |
 | `--temporal-stride` | Sampling stride for the temporal index (every n-th point) | `1000` |
+| `--progress` | Progress output format: `bar`, `plain`, or `json` | `bar` |
 
 ### Examples
 
