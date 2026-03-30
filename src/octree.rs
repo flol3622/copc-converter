@@ -797,7 +797,11 @@ impl OctreeBuilder {
 
         // Phase 2
         let result = if estimated_peak <= config.memory_budget {
-            info!("Building octree in-memory ({} MB, ~{} MB peak)", total_bytes / 1_048_576, estimated_peak / 1_048_576);
+            info!(
+                "Building octree in-memory ({} MB, ~{} MB peak)",
+                total_bytes / 1_048_576,
+                estimated_peak / 1_048_576
+            );
             self.bottom_up_in_memory(&leaf_keys, actual_max_depth)?
         } else {
             info!(
@@ -960,8 +964,8 @@ impl OctreeBuilder {
         // In-memory cost per point during grid_sample: the (usize, RawPoint) input
         // vec plus the output vecs (parent + per-child remaining) — roughly 2x the
         // input since points move from input to output.
-        const MEM_PER_POINT: u64 = (std::mem::size_of::<(usize, RawPoint)>()
-            + std::mem::size_of::<RawPoint>()) as u64;
+        const MEM_PER_POINT: u64 =
+            (std::mem::size_of::<(usize, RawPoint)>() + std::mem::size_of::<RawPoint>()) as u64;
 
         for d in (0..actual_max_depth).rev() {
             debug!("Building ancestor level {d}");

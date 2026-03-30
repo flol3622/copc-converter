@@ -329,8 +329,7 @@ pub fn write_copc(
         let mut batch_end = batch_start;
         while batch_end < data_keys.len() {
             let key = &data_keys[batch_end];
-            let node_bytes =
-                (point_counts.get(key).copied().unwrap_or(0) as u64) * mem_per_point;
+            let node_bytes = (point_counts.get(key).copied().unwrap_or(0) as u64) * mem_per_point;
             // Always include at least one node per batch to avoid stalling.
             if batch_end > batch_start && batch_bytes + node_bytes > memory_budget {
                 break;
