@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use copc_converter::{
     Pipeline, PipelineConfig, ProgressEvent, ProgressObserver, collect_input_files,
 };
@@ -34,6 +34,21 @@ struct Args {
     /// Sampling stride for temporal index (every n-th point). Default: 1000
     #[arg(long, default_value_t = 1000)]
     temporal_stride: u32,
+
+    /// Progress output format: "bar" (default, interactive), "plain" (log lines),
+    /// or "json" (NDJSON, one JSON object per line)
+    #[arg(long, value_enum, default_value_t = ProgressMode::Bar)]
+    progress: ProgressMode,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum ProgressMode {
+    /// Interactive progress bar (default)
+    Bar,
+    /// Plain text log lines
+    Plain,
+    /// NDJSON — one JSON object per line
+    Json,
 }
 
 /// Parse a human-readable size string into bytes.
@@ -68,14 +83,18 @@ fn human_count(n: u64) -> String {
     }
 }
 
-struct CliProgress {
+// ---------------------------------------------------------------------------
+// Bar progress (interactive terminal)
+// ---------------------------------------------------------------------------
+
+struct BarProgress {
     bar: Mutex<Option<ProgressBar>>,
     step: std::sync::atomic::AtomicU32,
     stage_prefix: Mutex<String>,
     stage_total: std::sync::atomic::AtomicU64,
 }
 
-impl CliProgress {
+impl BarProgress {
     fn new() -> Self {
         Self {
             bar: Mutex::new(None),
@@ -86,7 +105,7 @@ impl CliProgress {
     }
 }
 
-impl ProgressObserver for CliProgress {
+impl ProgressObserver for BarProgress {
     fn on_progress(&self, event: ProgressEvent) {
         let mut bar = self.bar.lock().unwrap();
         match event {
@@ -136,6 +155,178 @@ impl ProgressObserver for CliProgress {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Plain progress (log-friendly text lines on stderr)
+// ---------------------------------------------------------------------------
+
+struct PlainProgress {
+    step: std::sync::atomic::AtomicU32,
+    stage_name: Mutex<String>,
+    stage_total: std::sync::atomic::AtomicU64,
+    last_percent: std::sync::atomic::AtomicU32,
+}
+
+impl PlainProgress {
+    fn new() -> Self {
+        Self {
+            step: std::sync::atomic::AtomicU32::new(0),
+            stage_name: Mutex::new(String::new()),
+            stage_total: std::sync::atomic::AtomicU64::new(0),
+            last_percent: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+impl ProgressObserver for PlainProgress {
+    fn on_progress(&self, event: ProgressEvent) {
+        match event {
+            ProgressEvent::StageStart { name, total } => {
+                let step = self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                *self.stage_name.lock().unwrap() = name.to_string();
+                self.stage_total
+                    .store(total, std::sync::atomic::Ordering::Relaxed);
+                self.last_percent
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                if total > 0 {
+                    eprintln!(
+                        "[{step}/{TOTAL_STEPS}] {name} started ({} units)",
+                        human_count(total)
+                    );
+                } else {
+                    eprintln!("[{step}/{TOTAL_STEPS}] {name} started");
+                }
+            }
+            ProgressEvent::StageProgress { done } => {
+                let total = self.stage_total.load(std::sync::atomic::Ordering::Relaxed);
+                if total == 0 {
+                    return;
+                }
+                let pct = (done as f64 / total as f64 * 100.0) as u32;
+                // Log every 10%
+                let bucket = pct / 10 * 10;
+                let prev = self.last_percent.load(std::sync::atomic::Ordering::Relaxed);
+                if bucket > prev
+                    && self
+                        .last_percent
+                        .compare_exchange(
+                            prev,
+                            bucket,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
+                    let name = self.stage_name.lock().unwrap().clone();
+                    eprintln!(
+                        "[{step}/{TOTAL_STEPS}] {name} {bucket}% ({}/{})",
+                        human_count(done),
+                        human_count(total),
+                    );
+                }
+            }
+            ProgressEvent::StageDone => {
+                let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
+                let name = self.stage_name.lock().unwrap().clone();
+                eprintln!("[{step}/{TOTAL_STEPS}] {name} done");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSON progress (NDJSON on stdout)
+// ---------------------------------------------------------------------------
+
+struct JsonProgress {
+    step: std::sync::atomic::AtomicU32,
+    stage_name: Mutex<String>,
+    stage_total: std::sync::atomic::AtomicU64,
+    last_percent: std::sync::atomic::AtomicU32,
+}
+
+impl JsonProgress {
+    fn new() -> Self {
+        Self {
+            step: std::sync::atomic::AtomicU32::new(0),
+            stage_name: Mutex::new(String::new()),
+            stage_total: std::sync::atomic::AtomicU64::new(0),
+            last_percent: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn emit(&self, value: &serde_json::Value) {
+        // Write to stderr so it doesn't interfere with stdout data piping.
+        // unwrap: serialization of our values cannot fail.
+        eprintln!("{}", serde_json::to_string(value).unwrap());
+    }
+}
+
+impl ProgressObserver for JsonProgress {
+    fn on_progress(&self, event: ProgressEvent) {
+        match event {
+            ProgressEvent::StageStart { name, total } => {
+                let step = self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                *self.stage_name.lock().unwrap() = name.to_string();
+                self.stage_total
+                    .store(total, std::sync::atomic::Ordering::Relaxed);
+                self.last_percent
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                self.emit(&serde_json::json!({
+                    "event": "stage_start",
+                    "stage": name,
+                    "step": step,
+                    "total_steps": TOTAL_STEPS,
+                    "total_units": total,
+                }));
+            }
+            ProgressEvent::StageProgress { done } => {
+                let total = self.stage_total.load(std::sync::atomic::Ordering::Relaxed);
+                if total == 0 {
+                    return;
+                }
+                let pct = (done as f64 / total as f64 * 100.0) as u32;
+                let bucket = pct / 10 * 10;
+                let prev = self.last_percent.load(std::sync::atomic::Ordering::Relaxed);
+                if bucket > prev
+                    && self
+                        .last_percent
+                        .compare_exchange(
+                            prev,
+                            bucket,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
+                    let name = self.stage_name.lock().unwrap().clone();
+                    let percent = done as f64 / total as f64 * 100.0;
+                    self.emit(&serde_json::json!({
+                        "event": "stage_progress",
+                        "stage": name,
+                        "step": step,
+                        "total_steps": TOTAL_STEPS,
+                        "done": done,
+                        "total": total,
+                        "percent": (percent * 10.0).round() / 10.0,
+                    }));
+                }
+            }
+            ProgressEvent::StageDone => {
+                let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
+                let name = self.stage_name.lock().unwrap().clone();
+                self.emit(&serde_json::json!({
+                    "event": "stage_done",
+                    "stage": name,
+                    "step": step,
+                    "total_steps": TOTAL_STEPS,
+                }));
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -151,7 +342,11 @@ fn main() -> Result<()> {
     let raw_limit = parse_memory_limit(&args.memory_limit)?;
     let memory_budget = (raw_limit as f64 * MEMORY_SAFETY_FACTOR) as u64;
 
-    let progress = std::sync::Arc::new(CliProgress::new());
+    let progress: std::sync::Arc<dyn ProgressObserver> = match args.progress {
+        ProgressMode::Bar => std::sync::Arc::new(BarProgress::new()),
+        ProgressMode::Plain => std::sync::Arc::new(PlainProgress::new()),
+        ProgressMode::Json => std::sync::Arc::new(JsonProgress::new()),
+    };
 
     let config = PipelineConfig {
         memory_budget,
