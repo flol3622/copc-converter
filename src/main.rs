@@ -130,7 +130,7 @@ impl ProgressObserver for BarProgress {
                     pb
                 } else {
                     let pb = ProgressBar::new_spinner();
-                    pb.set_style(ProgressStyle::with_template("{msg} {spinner}").unwrap());
+                    pb.set_style(ProgressStyle::with_template("{msg}...").unwrap());
                     pb.set_message(prefix);
                     pb
                 };
@@ -358,6 +358,12 @@ fn main() -> Result<()> {
 
     let input_files = collect_input_files(args.input)?;
 
+    let output = if args.output.is_dir() {
+        args.output.join("output.copc.laz")
+    } else {
+        args.output
+    };
+
     let raw_limit = parse_memory_limit(&args.memory_limit)?;
     let memory_budget = (raw_limit as f64 * MEMORY_SAFETY_FACTOR) as u64;
 
@@ -379,7 +385,7 @@ fn main() -> Result<()> {
         .validate()?
         .distribute()?
         .build()?
-        .write(&args.output)?;
+        .write(&output)?;
 
     Ok(())
 }
