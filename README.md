@@ -12,7 +12,7 @@ A fast, memory-efficient converter that turns LAS/LAZ point cloud files into [CO
 - Out-of-core processing with a configurable memory budget — handles datasets larger than RAM
 - Parallel reading, octree construction, and LAZ compression via rayon
 - Preserves WKT CRS from input files
-- Optional temporal index for GPS-time-based filtering ([spec](docs/temporal-index-spec.md))
+- Optional temporal index for GPS-time-based filtering ([spec](https://github.com/360-geo/copc/blob/master/copc-temporal/docs/temporal-index-spec.md))
 
 ## Installation
 
