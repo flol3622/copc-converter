@@ -716,17 +716,10 @@ impl OctreeBuilder {
     /// files never conflict — the entire round is processed in parallel via rayon.
     /// Rounds repeat until no oversized nodes remain.
     fn normalize_leaves(&self, memory_budget: u64) -> Result<()> {
-        // Allow at most 4 extra levels beyond the initial depth.  This caps the
-        // total LOD count at depth+5 (levels 0…depth+4) regardless of local
-        // density spikes.
-        let max_level = self.depth as i32 + 4;
-
         let oversized = |k: &VoxelKey| -> bool {
-            k.level < max_level
-                && self
-                    .node_path(k)
-                    .metadata()
-                    .is_ok_and(|m| m.len() / RawPoint::BYTE_SIZE as u64 > MAX_LEAF_POINTS)
+            self.node_path(k)
+                .metadata()
+                .is_ok_and(|m| m.len() / RawPoint::BYTE_SIZE as u64 > MAX_LEAF_POINTS)
         };
 
         let mut to_split: Vec<VoxelKey> = self
