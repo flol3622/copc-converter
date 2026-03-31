@@ -115,7 +115,7 @@ fn detect_available_memory() -> u64 {
                 avail_virtual: u64,
                 avail_extended_virtual: u64,
             }
-            extern "system" {
+            unsafe extern "system" {
                 fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
             }
             let mut status = MaybeUninit::<MemoryStatusEx>::zeroed().assume_init();
