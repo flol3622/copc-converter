@@ -443,6 +443,13 @@ impl OctreeBuilder {
         let sys_tmp = std::env::temp_dir();
         let base_tmp = config.temp_dir.as_deref().unwrap_or(&sys_tmp);
         let tmp_dir = base_tmp.join(format!("copc_{}", std::process::id()));
+        // Remove any leftover temp dir from a previous run (e.g. crashed pod
+        // that never ran Drop cleanup). Without this, append-mode writes in
+        // distribute/normalize would double-count points from the old run.
+        if tmp_dir.exists() {
+            info!("Removing stale temp dir {:?}", tmp_dir);
+            std::fs::remove_dir_all(&tmp_dir)?;
+        }
         std::fs::create_dir_all(&tmp_dir)?;
 
         Ok(OctreeBuilder {
