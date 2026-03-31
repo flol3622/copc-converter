@@ -19,9 +19,10 @@ struct Args {
     /// Output COPC file path
     output: PathBuf,
 
-    /// Maximum memory budget (e.g. "16G", "8G", "4096M", "512M"). Default: "16G"
-    #[arg(long, default_value = "16G")]
-    memory_limit: String,
+    /// Maximum memory budget (e.g. "16G", "8G", "4096M", "512M").
+    /// If not specified, auto-detects from cgroup limits (K8s) or system RAM.
+    #[arg(long)]
+    memory_limit: Option<String>,
 
     /// Temp directory for intermediate files. Default: system temp
     #[arg(long)]
@@ -53,6 +54,79 @@ enum ProgressMode {
     Plain,
     /// NDJSON — one JSON object per line
     Json,
+}
+
+/// Detect available memory from cgroup limits (v2 then v1) or system RAM.
+fn detect_available_memory() -> u64 {
+    // Try cgroup v2
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let s = s.trim();
+        if s != "max"
+            && let Ok(v) = s.parse::<u64>()
+        {
+            return v;
+        }
+    }
+    // Try cgroup v1
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        && let Ok(v) = s.trim().parse::<u64>()
+    {
+        // v1 returns a huge sentinel value when unlimited
+        if v < 0x7FFF_FFFF_FFFF_F000 {
+            return v;
+        }
+    }
+    // Fallback: read /proc/meminfo (Linux) or use sysctl (macOS)
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb_str = rest.trim().trim_end_matches(" kB").trim();
+                if let Ok(kb) = kb_str.parse::<u64>() {
+                    return kb * 1024;
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        if let Ok(output) = Command::new("sysctl").arg("-n").arg("hw.memsize").output()
+            && let Ok(s) = std::str::from_utf8(&output.stdout)
+            && let Ok(v) = s.trim().parse::<u64>()
+        {
+            return v;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem::MaybeUninit;
+        // SAFETY: GlobalMemoryStatusEx is a well-defined Windows API call.
+        unsafe {
+            #[repr(C)]
+            struct MemoryStatusEx {
+                length: u32,
+                memory_load: u32,
+                total_phys: u64,
+                avail_phys: u64,
+                total_page_file: u64,
+                avail_page_file: u64,
+                total_virtual: u64,
+                avail_virtual: u64,
+                avail_extended_virtual: u64,
+            }
+            extern "system" {
+                fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
+            }
+            let mut status = MaybeUninit::<MemoryStatusEx>::zeroed().assume_init();
+            status.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+            if GlobalMemoryStatusEx(&mut status) != 0 {
+                return status.total_phys;
+            }
+        }
+    }
+    // Last resort: 16 GB
+    16 * 1024 * 1024 * 1024
 }
 
 /// Parse a human-readable size string into bytes.
@@ -364,8 +438,28 @@ fn main() -> Result<()> {
         args.output
     };
 
-    let raw_limit = parse_memory_limit(&args.memory_limit)?;
+    let raw_limit = match &args.memory_limit {
+        Some(s) => parse_memory_limit(s)?,
+        None => detect_available_memory(),
+    };
     let memory_budget = (raw_limit as f64 * MEMORY_SAFETY_FACTOR) as u64;
+    let human_bytes = |b: u64| -> String {
+        if b >= 1024 * 1024 * 1024 {
+            format!("{:.1} GB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else {
+            format!("{:.0} MB", b as f64 / (1024.0 * 1024.0))
+        }
+    };
+    eprintln!(
+        "Memory: {} limit, {} budget ({})",
+        human_bytes(raw_limit),
+        human_bytes(memory_budget),
+        if args.memory_limit.is_some() {
+            "user-specified"
+        } else {
+            "auto-detected"
+        },
+    );
 
     let progress: std::sync::Arc<dyn ProgressObserver> = match args.progress {
         ProgressMode::Bar => std::sync::Arc::new(BarProgress::new()),
