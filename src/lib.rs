@@ -245,15 +245,8 @@ impl Pipeline<Validated> {
 impl Pipeline<Distributed> {
     /// Build the octree node map with LOD thinning.
     pub fn build(mut self) -> Result<Pipeline<Built>> {
-        // total is set to 0 here; build_node_map will re-report with the
-        // actual depth once it's known.
-        self.inner.config.report(ProgressEvent::StageStart {
-            name: "Building",
-            total: 0,
-        });
         let builder = self.inner.builder.as_ref().unwrap();
         let node_keys = builder.build_node_map(&self.inner.config)?;
-        self.inner.config.report(ProgressEvent::StageDone);
         self.inner.node_keys = Some(node_keys);
         Ok(Pipeline {
             inner: self.inner,

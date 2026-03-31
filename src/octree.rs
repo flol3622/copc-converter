@@ -722,7 +722,7 @@ impl OctreeBuilder {
     /// All nodes being split in one round occupy disjoint voxels, so their child
     /// files never conflict — the entire round is processed in parallel via rayon.
     /// Rounds repeat until no oversized nodes remain.
-    fn normalize_leaves(&self, memory_budget: u64) -> Result<()> {
+    fn normalize_leaves(&self, memory_budget: u64, config: &crate::PipelineConfig) -> Result<()> {
         let oversized = |k: &VoxelKey| -> bool {
             self.node_path(k)
                 .metadata()
@@ -734,6 +734,17 @@ impl OctreeBuilder {
             .into_iter()
             .filter(|k| oversized(k))
             .collect();
+
+        if to_split.is_empty() {
+            return Ok(());
+        }
+
+        // Report normalize as its own stage. We don't know the total upfront
+        // (each round can produce new oversized children), so use 0 = spinner.
+        config.report(crate::ProgressEvent::StageStart {
+            name: "Normalizing",
+            total: 0,
+        });
 
         // Points per chunk when streaming a split. Each rayon thread holds one
         // chunk (~40 bytes/point) plus a HashMap of classified output (~40 bytes/
@@ -748,17 +759,15 @@ impl OctreeBuilder {
         let mut round = 0u32;
         while !to_split.is_empty() {
             round += 1;
+            let split_count = to_split.len();
             let total_split_bytes: u64 = to_split
                 .iter()
                 .map(|k| self.node_path(k).metadata().map_or(0, |m| m.len()))
                 .sum();
-            debug!(
-                "normalize_leaves round {round}: splitting {} nodes, \
-                 total {} MB on disk, budget {} MB, chunk {} points",
-                to_split.len(),
+            info!(
+                "normalize round {round}: splitting {} nodes ({} MB on disk)",
+                split_count,
                 total_split_bytes / 1_048_576,
-                memory_budget / 1_048_576,
-                chunk_points,
             );
 
             // All nodes in a round occupy disjoint voxels → their children
@@ -839,6 +848,7 @@ impl OctreeBuilder {
 
             to_split = new_children.into_iter().filter(|k| oversized(k)).collect();
         }
+        config.report(crate::ProgressEvent::StageDone);
         Ok(())
     }
 
@@ -854,25 +864,8 @@ impl OctreeBuilder {
     ///
     /// Returns (VoxelKey, point_count) for every node in the hierarchy.
     pub fn build_node_map(&self, config: &crate::PipelineConfig) -> Result<Vec<(VoxelKey, usize)>> {
-        // Checkpoint: count points on disk before any building
-        {
-            let pre_keys = self.all_node_keys()?;
-            let pre_total: u64 = pre_keys
-                .iter()
-                .map(|k| {
-                    self.node_path(k).metadata().map_or(0, |m| m.len()) / RawPoint::BYTE_SIZE as u64
-                })
-                .sum();
-            info!(
-                "CHECKPOINT pre-normalize: {} leaf files, {} points on disk (input header: {})",
-                pre_keys.len(),
-                pre_total,
-                self.total_points
-            );
-        }
-
         // Phase 0
-        self.normalize_leaves(config.memory_budget)?;
+        self.normalize_leaves(config.memory_budget, config)?;
 
         // Phase 1
         let leaf_keys = self.all_node_keys()?;
@@ -881,17 +874,6 @@ impl OctreeBuilder {
             "Leaf nodes after normalization: {}, max depth: {actual_max_depth}",
             leaf_keys.len()
         );
-
-        // Checkpoint: count points on disk after normalize
-        {
-            let post_total: u64 = leaf_keys
-                .iter()
-                .map(|k| {
-                    self.node_path(k).metadata().map_or(0, |m| m.len()) / RawPoint::BYTE_SIZE as u64
-                })
-                .sum();
-            info!("CHECKPOINT post-normalize: {} points on disk", post_total,);
-        }
 
         // Estimate memory required to hold all leaf data. The in-memory path
         // keeps all points in a HashMap<VoxelKey, Vec<RawPoint>> and during
@@ -903,14 +885,10 @@ impl OctreeBuilder {
             .sum();
         let estimated_peak = total_bytes * 2;
 
-        // Re-report stage start now that we know the depth (levels to process).
-        // Phase 0 (normalize) + actual_max_depth levels of bottom-up building.
-        let build_total = actual_max_depth as u64 + 1; // +1 for normalize
         config.report(crate::ProgressEvent::StageStart {
             name: "Building",
-            total: build_total,
+            total: actual_max_depth as u64,
         });
-        config.report(crate::ProgressEvent::StageProgress { done: 1 }); // normalize done
 
         // Phase 2
         let result = if estimated_peak <= config.memory_budget {
@@ -930,6 +908,7 @@ impl OctreeBuilder {
             );
             self.bottom_up_on_disk(leaf_keys, actual_max_depth, config.memory_budget, config)?
         };
+        config.report(crate::ProgressEvent::StageDone);
 
         let total_pts: usize = result.iter().map(|(_, c)| *c).sum();
         info!(
@@ -1002,7 +981,7 @@ impl OctreeBuilder {
 
         for d in (0..actual_max_depth).rev() {
             config.report(crate::ProgressEvent::StageProgress {
-                done: (actual_max_depth - d) as u64 + 1,
+                done: (actual_max_depth - d) as u64,
             });
             let level_points: usize = nodes
                 .iter()
@@ -1119,7 +1098,7 @@ impl OctreeBuilder {
 
         for d in (0..actual_max_depth).rev() {
             config.report(crate::ProgressEvent::StageProgress {
-                done: (actual_max_depth - d) as u64 + 1,
+                done: (actual_max_depth - d) as u64,
             });
             debug!("Building ancestor level {d}");
             let child_keys: Vec<VoxelKey> = match keys_by_level.get(&(d as i32 + 1)) {
@@ -1241,21 +1220,6 @@ impl OctreeBuilder {
                 .entry(d as i32)
                 .or_default()
                 .extend(new_parent_keys.into_iter());
-
-            // Per-level point conservation check: count ALL points on disk.
-            let disk_total: u64 = keys_by_level
-                .values()
-                .flat_map(|ks| ks.iter())
-                .map(|k| {
-                    self.node_path(k).metadata().map_or(0, |m| m.len()) / RawPoint::BYTE_SIZE as u64
-                })
-                .sum();
-            info!(
-                "LEVEL-CHECK after d={d}: {} total points on disk (input: {}, diff: {})",
-                disk_total,
-                self.total_points,
-                disk_total as i64 - self.total_points as i64,
-            );
         }
 
         // Enumerate result from the in-memory key map (no directory scan needed).

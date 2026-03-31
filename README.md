@@ -54,7 +54,7 @@ copc_converter ./tiles/ merged.copc.laz
 
 | Flag | Description | Default |
 |---|---|---|
-| `--memory-limit` | Max memory budget (`16G`, `4096M`, etc.) | `16G` |
+| `--memory-limit` | Max memory budget (`16G`, `4096M`, etc.) | auto-detected |
 | `--temp-dir` | Directory for intermediate files | system temp |
 | `--temporal-index` | Write a temporal index EVLR for time-based queries | off |
 | `--temporal-stride` | Sampling stride for the temporal index (every n-th point) | `1000` |
@@ -92,6 +92,18 @@ Pipeline::scan(&files, config)?
     .build()?
     .write("output.copc.laz")?;
 ```
+
+## Compare tool
+
+A `compare_copc` binary is available behind the `compare` feature for inspecting and comparing COPC files over HTTP (e.g. from cloud storage):
+
+```sh
+cargo build --release --features compare --bin compare_copc
+
+compare_copc <url_a> <url_b>
+```
+
+This fetches only the headers and hierarchy (not point data) and prints a side-by-side comparison of node counts, point distribution, compressed sizes, and compression ratios per octree level.
 
 ## How it works
 
