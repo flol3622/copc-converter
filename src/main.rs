@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use copc_converter::{
     Pipeline, PipelineConfig, ProgressEvent, ProgressObserver, collect_input_files,
 };
@@ -19,9 +19,10 @@ struct Args {
     /// Output COPC file path
     output: PathBuf,
 
-    /// Maximum memory budget (e.g. "16G", "8G", "4096M", "512M"). Default: "16G"
-    #[arg(long, default_value = "16G")]
-    memory_limit: String,
+    /// Maximum memory budget (e.g. "16G", "8G", "4096M", "512M").
+    /// If not specified, auto-detects from cgroup limits (K8s) or system RAM.
+    #[arg(long)]
+    memory_limit: Option<String>,
 
     /// Temp directory for intermediate files. Default: system temp
     #[arg(long)]
@@ -34,6 +35,98 @@ struct Args {
     /// Sampling stride for temporal index (every n-th point). Default: 1000
     #[arg(long, default_value_t = 1000)]
     temporal_stride: u32,
+
+    /// Progress output format: "bar" (default, interactive), "plain" (log lines),
+    /// or "json" (NDJSON, one JSON object per line)
+    #[arg(long, value_enum, default_value_t = ProgressMode::Bar)]
+    progress: ProgressMode,
+
+    /// Maximum number of parallel threads. Default: all available cores
+    #[arg(long)]
+    threads: Option<usize>,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum ProgressMode {
+    /// Interactive progress bar (default)
+    Bar,
+    /// Plain text log lines
+    Plain,
+    /// NDJSON — one JSON object per line
+    Json,
+}
+
+/// Detect available memory from cgroup limits (v2 then v1) or system RAM.
+fn detect_available_memory() -> u64 {
+    // Try cgroup v2
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let s = s.trim();
+        if s != "max"
+            && let Ok(v) = s.parse::<u64>()
+        {
+            return v;
+        }
+    }
+    // Try cgroup v1
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        && let Ok(v) = s.trim().parse::<u64>()
+    {
+        // v1 returns a huge sentinel value when unlimited
+        if v < 0x7FFF_FFFF_FFFF_F000 {
+            return v;
+        }
+    }
+    // Fallback: read /proc/meminfo (Linux) or use sysctl (macOS)
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb_str = rest.trim().trim_end_matches(" kB").trim();
+                if let Ok(kb) = kb_str.parse::<u64>() {
+                    return kb * 1024;
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        if let Ok(output) = Command::new("sysctl").arg("-n").arg("hw.memsize").output()
+            && let Ok(s) = std::str::from_utf8(&output.stdout)
+            && let Ok(v) = s.trim().parse::<u64>()
+        {
+            return v;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem::MaybeUninit;
+        // SAFETY: GlobalMemoryStatusEx is a well-defined Windows API call.
+        unsafe {
+            #[repr(C)]
+            struct MemoryStatusEx {
+                length: u32,
+                memory_load: u32,
+                total_phys: u64,
+                avail_phys: u64,
+                total_page_file: u64,
+                avail_page_file: u64,
+                total_virtual: u64,
+                avail_virtual: u64,
+                avail_extended_virtual: u64,
+            }
+            extern "system" {
+                fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
+            }
+            let mut status = MaybeUninit::<MemoryStatusEx>::zeroed().assume_init();
+            status.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+            if GlobalMemoryStatusEx(&mut status) != 0 {
+                return status.total_phys;
+            }
+        }
+    }
+    // Last resort: 16 GB
+    16 * 1024 * 1024 * 1024
 }
 
 /// Parse a human-readable size string into bytes.
@@ -68,14 +161,18 @@ fn human_count(n: u64) -> String {
     }
 }
 
-struct CliProgress {
+// ---------------------------------------------------------------------------
+// Bar progress (interactive terminal)
+// ---------------------------------------------------------------------------
+
+struct BarProgress {
     bar: Mutex<Option<ProgressBar>>,
     step: std::sync::atomic::AtomicU32,
     stage_prefix: Mutex<String>,
     stage_total: std::sync::atomic::AtomicU64,
 }
 
-impl CliProgress {
+impl BarProgress {
     fn new() -> Self {
         Self {
             bar: Mutex::new(None),
@@ -86,7 +183,7 @@ impl CliProgress {
     }
 }
 
-impl ProgressObserver for CliProgress {
+impl ProgressObserver for BarProgress {
     fn on_progress(&self, event: ProgressEvent) {
         let mut bar = self.bar.lock().unwrap();
         match event {
@@ -107,7 +204,7 @@ impl ProgressObserver for CliProgress {
                     pb
                 } else {
                     let pb = ProgressBar::new_spinner();
-                    pb.set_style(ProgressStyle::with_template("{msg} {spinner}").unwrap());
+                    pb.set_style(ProgressStyle::with_template("{msg}...").unwrap());
                     pb.set_message(prefix);
                     pb
                 };
@@ -136,6 +233,185 @@ impl ProgressObserver for CliProgress {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Plain progress (log-friendly text lines on stderr)
+// ---------------------------------------------------------------------------
+
+struct PlainProgress {
+    step: std::sync::atomic::AtomicU32,
+    stage_name: Mutex<String>,
+    stage_total: std::sync::atomic::AtomicU64,
+    last_percent: std::sync::atomic::AtomicU32,
+}
+
+impl PlainProgress {
+    fn new() -> Self {
+        Self {
+            step: std::sync::atomic::AtomicU32::new(0),
+            stage_name: Mutex::new(String::new()),
+            stage_total: std::sync::atomic::AtomicU64::new(0),
+            last_percent: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+/// Write a line to stdout and flush immediately so K8s log collectors see it.
+fn log_line(msg: std::fmt::Arguments) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let _ = writeln!(out, "{msg}");
+    let _ = out.flush();
+}
+
+impl ProgressObserver for PlainProgress {
+    fn on_progress(&self, event: ProgressEvent) {
+        match event {
+            ProgressEvent::StageStart { name, total } => {
+                let step = self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                *self.stage_name.lock().unwrap() = name.to_string();
+                self.stage_total
+                    .store(total, std::sync::atomic::Ordering::Relaxed);
+                self.last_percent
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                if total > 0 {
+                    log_line(format_args!(
+                        "[{step}/{TOTAL_STEPS}] {name} started ({} units)",
+                        human_count(total)
+                    ));
+                } else {
+                    log_line(format_args!("[{step}/{TOTAL_STEPS}] {name} started"));
+                }
+            }
+            ProgressEvent::StageProgress { done } => {
+                let total = self.stage_total.load(std::sync::atomic::Ordering::Relaxed);
+                if total == 0 {
+                    return;
+                }
+                let pct = (done as f64 / total as f64 * 100.0) as u32;
+                // Log every 10%
+                let bucket = pct / 10 * 10;
+                let prev = self.last_percent.load(std::sync::atomic::Ordering::Relaxed);
+                if bucket > prev
+                    && self
+                        .last_percent
+                        .compare_exchange(
+                            prev,
+                            bucket,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
+                    let name = self.stage_name.lock().unwrap().clone();
+                    log_line(format_args!(
+                        "[{step}/{TOTAL_STEPS}] {name} {bucket}% ({}/{})",
+                        human_count(done),
+                        human_count(total),
+                    ));
+                }
+            }
+            ProgressEvent::StageDone => {
+                let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
+                let name = self.stage_name.lock().unwrap().clone();
+                log_line(format_args!("[{step}/{TOTAL_STEPS}] {name} done"));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSON progress (NDJSON on stdout, flushed per line)
+// ---------------------------------------------------------------------------
+
+struct JsonProgress {
+    step: std::sync::atomic::AtomicU32,
+    stage_name: Mutex<String>,
+    stage_total: std::sync::atomic::AtomicU64,
+    last_percent: std::sync::atomic::AtomicU32,
+}
+
+impl JsonProgress {
+    fn new() -> Self {
+        Self {
+            step: std::sync::atomic::AtomicU32::new(0),
+            stage_name: Mutex::new(String::new()),
+            stage_total: std::sync::atomic::AtomicU64::new(0),
+            last_percent: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn emit(&self, value: &serde_json::Value) {
+        log_line(format_args!("{}", serde_json::to_string(value).unwrap()));
+    }
+}
+
+impl ProgressObserver for JsonProgress {
+    fn on_progress(&self, event: ProgressEvent) {
+        match event {
+            ProgressEvent::StageStart { name, total } => {
+                let step = self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                *self.stage_name.lock().unwrap() = name.to_string();
+                self.stage_total
+                    .store(total, std::sync::atomic::Ordering::Relaxed);
+                self.last_percent
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                self.emit(&serde_json::json!({
+                    "event": "stage_start",
+                    "stage": name,
+                    "step": step,
+                    "total_steps": TOTAL_STEPS,
+                    "total_units": total,
+                }));
+            }
+            ProgressEvent::StageProgress { done } => {
+                let total = self.stage_total.load(std::sync::atomic::Ordering::Relaxed);
+                if total == 0 {
+                    return;
+                }
+                let pct = (done as f64 / total as f64 * 100.0) as u32;
+                let bucket = pct / 10 * 10;
+                let prev = self.last_percent.load(std::sync::atomic::Ordering::Relaxed);
+                if bucket > prev
+                    && self
+                        .last_percent
+                        .compare_exchange(
+                            prev,
+                            bucket,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
+                    let name = self.stage_name.lock().unwrap().clone();
+                    let percent = done as f64 / total as f64 * 100.0;
+                    self.emit(&serde_json::json!({
+                        "event": "stage_progress",
+                        "stage": name,
+                        "step": step,
+                        "total_steps": TOTAL_STEPS,
+                        "done": done,
+                        "total": total,
+                        "percent": (percent * 10.0).round() / 10.0,
+                    }));
+                }
+            }
+            ProgressEvent::StageDone => {
+                let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
+                let name = self.stage_name.lock().unwrap().clone();
+                self.emit(&serde_json::json!({
+                    "event": "stage_done",
+                    "stage": name,
+                    "step": step,
+                    "total_steps": TOTAL_STEPS,
+                }));
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -146,12 +422,50 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if let Some(n) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .context("Failed to set rayon thread count")?;
+    }
+
     let input_files = collect_input_files(args.input)?;
 
-    let raw_limit = parse_memory_limit(&args.memory_limit)?;
-    let memory_budget = (raw_limit as f64 * MEMORY_SAFETY_FACTOR) as u64;
+    let output = if args.output.is_dir() {
+        args.output.join("output.copc.laz")
+    } else {
+        args.output
+    };
 
-    let progress = std::sync::Arc::new(CliProgress::new());
+    let raw_limit = match &args.memory_limit {
+        Some(s) => parse_memory_limit(s)?,
+        None => detect_available_memory(),
+    };
+    let memory_budget = (raw_limit as f64 * MEMORY_SAFETY_FACTOR) as u64;
+    let human_bytes = |b: u64| -> String {
+        if b >= 1024 * 1024 * 1024 {
+            format!("{:.1} GB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else {
+            format!("{:.0} MB", b as f64 / (1024.0 * 1024.0))
+        }
+    };
+    eprintln!(
+        "Memory: {} limit, {} budget ({})",
+        human_bytes(raw_limit),
+        human_bytes(memory_budget),
+        if args.memory_limit.is_some() {
+            "user-specified"
+        } else {
+            "auto-detected"
+        },
+    );
+
+    let progress: std::sync::Arc<dyn ProgressObserver> = match args.progress {
+        ProgressMode::Bar => std::sync::Arc::new(BarProgress::new()),
+        ProgressMode::Plain => std::sync::Arc::new(PlainProgress::new()),
+        ProgressMode::Json => std::sync::Arc::new(JsonProgress::new()),
+    };
 
     let config = PipelineConfig {
         memory_budget,
@@ -165,7 +479,7 @@ fn main() -> Result<()> {
         .validate()?
         .distribute()?
         .build()?
-        .write(&args.output)?;
+        .write(&output)?;
 
     Ok(())
 }

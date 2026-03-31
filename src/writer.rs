@@ -301,16 +301,21 @@ pub fn write_copc(
         .copied()
         .collect();
 
+    // Memory per point in a batch:
+    //   - read_node loads Vec<RawPoint>: ~40 bytes/point (struct with padding)
+    //   - encode produces Vec<u8>:       point_record_len bytes/point (30-38)
+    //   - both live simultaneously in the results vec before compression
+    // We budget using this combined cost so batches don't exceed the limit.
+    let mem_per_point: u64 = RawPoint::BYTE_SIZE as u64 + point_record_len as u64;
+
     debug!(
-        "Encoding {} data nodes ({} empty ancestors) in batches (budget {} MiB)",
+        "Encoding {} data nodes ({} empty ancestors) in batches (budget {} MiB, {} bytes/point)",
         data_keys.len(),
         ordered_keys.len() - data_keys.len(),
         memory_budget / 1_048_576,
+        mem_per_point,
     );
 
-    // Split data_keys into batches whose total uncompressed bytes fit within
-    // memory_budget, then encode+compress each batch before moving to the next.
-    // Also accumulate per-return point counts and GPS time extents.
     let mut return_counts = [0u64; 15];
     let mut gpstime_min = f64::MAX;
     let mut gpstime_max = f64::MIN;
@@ -324,8 +329,7 @@ pub fn write_copc(
         let mut batch_end = batch_start;
         while batch_end < data_keys.len() {
             let key = &data_keys[batch_end];
-            let node_bytes =
-                (point_counts.get(key).copied().unwrap_or(0) as u64) * point_record_len as u64;
+            let node_bytes = (point_counts.get(key).copied().unwrap_or(0) as u64) * mem_per_point;
             // Always include at least one node per batch to avoid stalling.
             if batch_end > batch_start && batch_bytes + node_bytes > memory_budget {
                 break;
@@ -335,6 +339,18 @@ pub fn write_copc(
         }
 
         let batch = &data_keys[batch_start..batch_end];
+        let batch_points: u64 = batch
+            .iter()
+            .map(|k| point_counts.get(k).copied().unwrap_or(0) as u64)
+            .sum();
+        debug!(
+            "Write batch {}: {} nodes, {} points, est {} MB (budget {} MB)",
+            batch_start,
+            batch.len(),
+            batch_points,
+            batch_bytes / 1_048_576,
+            memory_budget / 1_048_576,
+        );
         type NodeResult = (Vec<u8>, [u64; 15], f64, f64, Vec<f64>);
         let results: Vec<NodeResult> = batch
             .par_iter()

@@ -443,6 +443,13 @@ impl OctreeBuilder {
         let sys_tmp = std::env::temp_dir();
         let base_tmp = config.temp_dir.as_deref().unwrap_or(&sys_tmp);
         let tmp_dir = base_tmp.join(format!("copc_{}", std::process::id()));
+        // Remove any leftover temp dir from a previous run (e.g. crashed pod
+        // that never ran Drop cleanup). Without this, append-mode writes in
+        // distribute/normalize would double-count points from the old run.
+        if tmp_dir.exists() {
+            info!("Removing stale temp dir {:?}", tmp_dir);
+            std::fs::remove_dir_all(&tmp_dir)?;
+        }
         std::fs::create_dir_all(&tmp_dir)?;
 
         Ok(OctreeBuilder {
@@ -551,7 +558,11 @@ impl OctreeBuilder {
     pub fn distribute(&self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
         let flush_every =
             ((config.memory_budget / 4) as usize / RawPoint::BYTE_SIZE).clamp(10_000, 500_000);
-        debug!("Flush interval: {} points", flush_every);
+        debug!(
+            "Distribute: budget={} MB, flush_every={} points",
+            config.memory_budget / 1_048_576,
+            flush_every
+        );
 
         let mut buffers: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
         let mut writers: HashMap<VoxelKey, BufWriter<File>> = HashMap::new();
@@ -560,13 +571,25 @@ impl OctreeBuilder {
         let half_budget = config.memory_budget / 2;
 
         for path in input_files {
-            debug!("Distributing {:?}", path);
             let mut reader =
                 las::Reader::from_path(path).with_context(|| format!("Cannot open {:?}", path))?;
 
             let file_point_count = reader.header().number_of_points();
             // Estimated memory per las::Point (~120 bytes)
             let estimated_mem = file_point_count * 120;
+
+            debug!(
+                "Distribute file {:?}: {} points, est {} MB, half_budget={} MB → {}",
+                path.file_name().unwrap_or_default(),
+                file_point_count,
+                estimated_mem / 1_048_576,
+                half_budget / 1_048_576,
+                if estimated_mem <= half_budget {
+                    "fast path"
+                } else {
+                    "batched path"
+                }
+            );
 
             if estimated_mem <= half_budget {
                 // Fast path: load entire file with parallel decompression
@@ -699,18 +722,11 @@ impl OctreeBuilder {
     /// All nodes being split in one round occupy disjoint voxels, so their child
     /// files never conflict — the entire round is processed in parallel via rayon.
     /// Rounds repeat until no oversized nodes remain.
-    fn normalize_leaves(&self) -> Result<()> {
-        // Allow at most 4 extra levels beyond the initial depth.  This caps the
-        // total LOD count at depth+5 (levels 0…depth+4) regardless of local
-        // density spikes.
-        let max_level = self.depth as i32 + 4;
-
+    fn normalize_leaves(&self, memory_budget: u64) -> Result<()> {
         let oversized = |k: &VoxelKey| -> bool {
-            k.level < max_level
-                && self
-                    .node_path(k)
-                    .metadata()
-                    .is_ok_and(|m| m.len() / RawPoint::BYTE_SIZE as u64 > MAX_LEAF_POINTS)
+            self.node_path(k)
+                .metadata()
+                .is_ok_and(|m| m.len() / RawPoint::BYTE_SIZE as u64 > MAX_LEAF_POINTS)
         };
 
         let mut to_split: Vec<VoxelKey> = self
@@ -719,38 +735,102 @@ impl OctreeBuilder {
             .filter(|k| oversized(k))
             .collect();
 
-        while !to_split.is_empty() {
-            // All nodes in `to_split` are in disjoint voxels → safe to split in parallel.
-            let new_children: Vec<VoxelKey> = to_split
-                .into_par_iter()
-                .map(|key| -> Result<Vec<VoxelKey>> {
-                    let pts = self.read_node(&key)?;
-                    std::fs::remove_file(self.node_path(&key))?;
+        // Points per chunk when streaming a split. Each rayon thread holds one
+        // chunk (~40 bytes/point) plus a HashMap of classified output (~40 bytes/
+        // point + hash overhead ≈ 1.3x), so peak per thread ≈ 2.5x chunk size.
+        // Divide the budget by (threads × 2.5) to size chunks so all threads
+        // can be active simultaneously without exceeding the budget.
+        let num_threads = rayon::current_num_threads() as u64;
+        let per_thread_budget = memory_budget / num_threads.max(1);
+        // 2.5x overhead → divide by 3 for safety margin
+        let chunk_points = ((per_thread_budget / 3) as usize / RawPoint::BYTE_SIZE).max(100_000);
 
+        let mut round = 0u32;
+        while !to_split.is_empty() {
+            round += 1;
+            let total_split_bytes: u64 = to_split
+                .iter()
+                .map(|k| self.node_path(k).metadata().map_or(0, |m| m.len()))
+                .sum();
+            debug!(
+                "normalize_leaves round {round}: splitting {} nodes, \
+                 total {} MB on disk, budget {} MB, chunk {} points",
+                to_split.len(),
+                total_split_bytes / 1_048_576,
+                memory_budget / 1_048_576,
+                chunk_points,
+            );
+
+            // All nodes in a round occupy disjoint voxels → their children
+            // are also disjoint → safe to split in parallel. Each node is
+            // streamed in chunks so memory stays bounded regardless of node size.
+            let new_children: Vec<VoxelKey> = to_split
+                .par_iter()
+                .map(|key| -> Result<Vec<VoxelKey>> {
+                    let path = self.node_path(key);
+                    let f = File::open(&path)?;
+                    let file_len = f.metadata()?.len();
+                    let total_count = file_len as usize / RawPoint::BYTE_SIZE;
+                    let mut reader = BufReader::new(f);
+
+                    // Open child writers in append mode so successive chunks
+                    // accumulate into the same files.
                     let child_level = key.level + 1;
-                    let mut children: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
-                    for p in pts {
-                        let wx = p.x as f64 * self.scale_x + self.offset_x;
-                        let wy = p.y as f64 * self.scale_y + self.offset_y;
-                        let wz = p.z as f64 * self.scale_z + self.offset_z;
-                        let ck = point_to_key(
-                            wx,
-                            wy,
-                            wz,
-                            self.cx,
-                            self.cy,
-                            self.cz,
-                            self.halfsize,
-                            child_level as u32,
-                        );
-                        children.entry(ck).or_default().push(p);
+                    let mut child_writers: HashMap<VoxelKey, BufWriter<File>> = HashMap::new();
+                    let mut child_keys_set: HashSet<VoxelKey> = HashSet::new();
+
+                    let mut read_so_far = 0usize;
+                    while read_so_far < total_count {
+                        let n = chunk_points.min(total_count - read_so_far);
+                        let mut chunk = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            chunk.push(RawPoint::read(&mut reader)?);
+                        }
+                        read_so_far += n;
+
+                        // Classify and append to child files.
+                        let mut per_child: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
+                        for p in chunk {
+                            let wx = p.x as f64 * self.scale_x + self.offset_x;
+                            let wy = p.y as f64 * self.scale_y + self.offset_y;
+                            let wz = p.z as f64 * self.scale_z + self.offset_z;
+                            let ck = point_to_key(
+                                wx,
+                                wy,
+                                wz,
+                                self.cx,
+                                self.cy,
+                                self.cz,
+                                self.halfsize,
+                                child_level as u32,
+                            );
+                            per_child.entry(ck).or_default().push(p);
+                        }
+
+                        for (ck, pts) in per_child {
+                            child_keys_set.insert(ck);
+                            let w = child_writers.entry(ck).or_insert_with(|| {
+                                let child_path = self.node_path(&ck);
+                                let f = OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(&child_path)
+                                    .expect("Cannot open child temp file");
+                                BufWriter::new(f)
+                            });
+                            RawPoint::write_bulk(&pts, w)?;
+                        }
                     }
-                    let mut child_keys = Vec::new();
-                    for (ck, cpts) in children {
-                        self.write_node_to_temp(&ck, &cpts)?;
-                        child_keys.push(ck);
+
+                    // Flush all child writers.
+                    for (_, mut w) in child_writers {
+                        std::io::Write::flush(&mut w).context("flush child temp file")?;
                     }
-                    Ok(child_keys)
+
+                    // Remove the parent file now that all data has been written to children.
+                    std::fs::remove_file(&path)?;
+
+                    Ok(child_keys_set.into_iter().collect())
                 })
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
@@ -774,8 +854,25 @@ impl OctreeBuilder {
     ///
     /// Returns (VoxelKey, point_count) for every node in the hierarchy.
     pub fn build_node_map(&self, config: &crate::PipelineConfig) -> Result<Vec<(VoxelKey, usize)>> {
+        // Checkpoint: count points on disk before any building
+        {
+            let pre_keys = self.all_node_keys()?;
+            let pre_total: u64 = pre_keys
+                .iter()
+                .map(|k| {
+                    self.node_path(k).metadata().map_or(0, |m| m.len()) / RawPoint::BYTE_SIZE as u64
+                })
+                .sum();
+            info!(
+                "CHECKPOINT pre-normalize: {} leaf files, {} points on disk (input header: {})",
+                pre_keys.len(),
+                pre_total,
+                self.total_points
+            );
+        }
+
         // Phase 0
-        self.normalize_leaves()?;
+        self.normalize_leaves(config.memory_budget)?;
 
         // Phase 1
         let leaf_keys = self.all_node_keys()?;
@@ -785,23 +882,53 @@ impl OctreeBuilder {
             leaf_keys.len()
         );
 
-        // Estimate memory required to hold all leaf data.
+        // Checkpoint: count points on disk after normalize
+        {
+            let post_total: u64 = leaf_keys
+                .iter()
+                .map(|k| {
+                    self.node_path(k).metadata().map_or(0, |m| m.len()) / RawPoint::BYTE_SIZE as u64
+                })
+                .sum();
+            info!("CHECKPOINT post-normalize: {} points on disk", post_total,);
+        }
+
+        // Estimate memory required to hold all leaf data. The in-memory path
+        // keeps all points in a HashMap<VoxelKey, Vec<RawPoint>> and during
+        // grid_sample temporarily holds both input and output, so the peak is
+        // roughly 2x the raw data size.
         let total_bytes: u64 = leaf_keys
             .iter()
             .map(|k| self.node_path(k).metadata().map_or(0, |m| m.len()))
             .sum();
+        let estimated_peak = total_bytes * 2;
+
+        // Re-report stage start now that we know the depth (levels to process).
+        // Phase 0 (normalize) + actual_max_depth levels of bottom-up building.
+        let build_total = actual_max_depth as u64 + 1; // +1 for normalize
+        config.report(crate::ProgressEvent::StageStart {
+            name: "Building",
+            total: build_total,
+        });
+        config.report(crate::ProgressEvent::StageProgress { done: 1 }); // normalize done
 
         // Phase 2
-        let result = if total_bytes <= config.memory_budget {
-            info!("Building octree in-memory ({} MB)", total_bytes / 1_048_576);
-            self.bottom_up_in_memory(&leaf_keys, actual_max_depth)?
-        } else {
+        let result = if estimated_peak <= config.memory_budget {
             info!(
-                "Building octree out-of-core ({} MB > budget {} MB)",
+                "Build path: IN-MEMORY (leaf data={} MB, est peak={} MB, budget={} MB)",
                 total_bytes / 1_048_576,
+                estimated_peak / 1_048_576,
                 config.memory_budget / 1_048_576,
             );
-            self.bottom_up_on_disk(leaf_keys, actual_max_depth)?
+            self.bottom_up_in_memory(&leaf_keys, actual_max_depth, config)?
+        } else {
+            info!(
+                "Build path: OUT-OF-CORE (leaf data={} MB, est peak={} MB > budget={} MB)",
+                total_bytes / 1_048_576,
+                estimated_peak / 1_048_576,
+                config.memory_budget / 1_048_576,
+            );
+            self.bottom_up_on_disk(leaf_keys, actual_max_depth, config.memory_budget, config)?
         };
 
         let total_pts: usize = result.iter().map(|(_, c)| *c).sum();
@@ -850,7 +977,12 @@ impl OctreeBuilder {
         &self,
         leaf_keys: &[VoxelKey],
         actual_max_depth: u32,
+        config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
+        debug!(
+            "In-memory build: loading {} leaf nodes in parallel",
+            leaf_keys.len()
+        );
         // Load all leaf nodes in parallel.
         let mut nodes: HashMap<VoxelKey, Vec<RawPoint>> = leaf_keys
             .par_iter()
@@ -860,8 +992,30 @@ impl OctreeBuilder {
             .filter(|(_, pts)| !pts.is_empty())
             .collect();
 
+        let total_in_mem: usize = nodes.values().map(|v| v.len()).sum();
+        debug!(
+            "In-memory build: loaded {} nodes, {} points ({} MB)",
+            nodes.len(),
+            total_in_mem,
+            (total_in_mem * std::mem::size_of::<RawPoint>()) / 1_048_576,
+        );
+
         for d in (0..actual_max_depth).rev() {
-            debug!("Building ancestor level {d}");
+            config.report(crate::ProgressEvent::StageProgress {
+                done: (actual_max_depth - d) as u64 + 1,
+            });
+            let level_points: usize = nodes
+                .iter()
+                .filter(|(k, _)| k.level as u32 == d + 1)
+                .map(|(_, v)| v.len())
+                .sum();
+            debug!(
+                "In-memory level {d}: {} total points at child level, {} nodes in map ({} MB est)",
+                level_points,
+                nodes.len(),
+                (nodes.values().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<RawPoint>())
+                    / 1_048_576,
+            );
 
             // Group children at level d+1 by parent (iterate keys, no disk I/O).
             let mut parent_children: HashMap<VoxelKey, Vec<VoxelKey>> = HashMap::new();
@@ -939,21 +1093,37 @@ impl OctreeBuilder {
     ///
     /// Processes one level at a time with disk I/O.  Avoids redundant directory
     /// scans by maintaining a per-level key map updated after each level.
+    /// Parents are batched so that the estimated peak memory of all concurrently
+    /// loaded points stays within the configured memory budget.
     fn bottom_up_on_disk(
         &self,
         leaf_keys: Vec<VoxelKey>,
         actual_max_depth: u32,
+        memory_budget: u64,
+        config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
         // Organise known keys by level — updated as parent nodes are created.
-        let mut keys_by_level: HashMap<i32, Vec<VoxelKey>> = HashMap::new();
+        // Use a set per level to prevent duplicate keys (a leaf and a parent
+        // created by the bottom-up pass can share the same key when
+        // normalize_leaves produces leaves at mixed depths).
+        let mut keys_by_level: HashMap<i32, HashSet<VoxelKey>> = HashMap::new();
         for k in leaf_keys {
-            keys_by_level.entry(k.level).or_default().push(k);
+            keys_by_level.entry(k.level).or_default().insert(k);
         }
 
+        // In-memory cost per point during grid_sample: the (usize, RawPoint) input
+        // vec plus the output vecs (parent + per-child remaining) — roughly 2x the
+        // input since points move from input to output.
+        const MEM_PER_POINT: u64 =
+            (std::mem::size_of::<(usize, RawPoint)>() + std::mem::size_of::<RawPoint>()) as u64;
+
         for d in (0..actual_max_depth).rev() {
+            config.report(crate::ProgressEvent::StageProgress {
+                done: (actual_max_depth - d) as u64 + 1,
+            });
             debug!("Building ancestor level {d}");
-            let child_keys = match keys_by_level.get(&(d as i32 + 1)) {
-                Some(v) => v.clone(),
+            let child_keys: Vec<VoxelKey> = match keys_by_level.get(&(d as i32 + 1)) {
+                Some(v) => v.iter().copied().collect(),
                 None => continue,
             };
 
@@ -967,36 +1137,125 @@ impl OctreeBuilder {
                 continue;
             }
 
-            let parents: Vec<(VoxelKey, Vec<VoxelKey>)> = parent_children.into_iter().collect();
-            let new_parent_keys: Vec<VoxelKey> = parents.iter().map(|(p, _)| *p).collect();
+            // Estimate each parent's memory cost from its children's file sizes,
+            // then batch parents so the total stays within the memory budget.
+            // Parents that exceed the budget on their own use a streaming path.
+            let mut small_parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = Vec::new();
+            let mut large_parents: Vec<(VoxelKey, Vec<VoxelKey>)> = Vec::new();
 
-            parents
-                .par_iter()
-                .map(|(parent, children)| -> Result<()> {
-                    let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
-                    for (ci, ck) in children.iter().enumerate() {
-                        for p in self.read_node(ck)? {
-                            all_pts.push((ci, p));
+            for (parent, children) in parent_children {
+                let child_bytes: u64 = children
+                    .iter()
+                    .map(|ck| self.node_path(ck).metadata().map_or(0, |m| m.len()))
+                    .sum();
+                let est_points = child_bytes / RawPoint::BYTE_SIZE as u64;
+                let est_mem = est_points * MEM_PER_POINT;
+                if est_mem > memory_budget {
+                    large_parents.push((parent, children));
+                } else {
+                    small_parents.push((parent, children, est_mem));
+                }
+            }
+
+            debug!(
+                "Level {d}: {} parents ({} small, {} large/streaming), budget={} MB",
+                small_parents.len() + large_parents.len(),
+                small_parents.len(),
+                large_parents.len(),
+                memory_budget / 1_048_576,
+            );
+
+            let mut new_parent_keys: Vec<VoxelKey> = Vec::new();
+
+            // Process oversized parents sequentially with streaming grid_sample.
+            // Only one child is in memory at a time.
+            for (parent, children) in &large_parents {
+                let child_bytes: u64 = children
+                    .iter()
+                    .map(|ck| self.node_path(ck).metadata().map_or(0, |m| m.len()))
+                    .sum();
+                debug!(
+                    "  STREAMING parent {:?}: {} children, {} MB on disk",
+                    parent,
+                    children.len(),
+                    child_bytes / 1_048_576,
+                );
+                self.grid_sample_streaming(parent, children)?;
+                new_parent_keys.push(*parent);
+            }
+
+            // Batch small parents for parallel processing.
+            small_parents.sort_by(|a, b| b.2.cmp(&a.2));
+
+            let mut batch_start = 0;
+            while batch_start < small_parents.len() {
+                let mut batch_mem: u64 = 0;
+                let mut batch_end = batch_start;
+                while batch_end < small_parents.len() {
+                    if batch_end > batch_start
+                        && batch_mem + small_parents[batch_end].2 > memory_budget
+                    {
+                        break;
+                    }
+                    batch_mem += small_parents[batch_end].2;
+                    batch_end += 1;
+                }
+
+                let batch = &small_parents[batch_start..batch_end];
+                debug!(
+                    "  Batch: {} parents, est {} MB",
+                    batch.len(),
+                    batch_mem / 1_048_576,
+                );
+                batch
+                    .par_iter()
+                    .map(|(parent, children, _)| -> Result<()> {
+                        let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
+                        for (ci, ck) in children.iter().enumerate() {
+                            for p in self.read_node(ck)? {
+                                all_pts.push((ci, p));
+                            }
                         }
-                    }
-                    if all_pts.is_empty() {
-                        return Ok(());
-                    }
-                    let (parent_pts, per_child) = self.grid_sample(parent, all_pts, children.len());
-                    for (ci, ck) in children.iter().enumerate() {
-                        self.write_node_to_temp(ck, &per_child[ci])?;
-                    }
-                    if !parent_pts.is_empty() {
-                        self.write_node_to_temp(parent, &parent_pts)?;
-                    }
-                    Ok(())
-                })
-                .collect::<Result<Vec<_>>>()?;
+                        if all_pts.is_empty() {
+                            return Ok(());
+                        }
+                        let (parent_pts, per_child) =
+                            self.grid_sample(parent, all_pts, children.len());
+                        for (ci, ck) in children.iter().enumerate() {
+                            self.write_node_to_temp(ck, &per_child[ci])?;
+                        }
+                        if !parent_pts.is_empty() {
+                            self.write_node_to_temp(parent, &parent_pts)?;
+                        }
+                        Ok(())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                for (parent, _, _) in &small_parents[batch_start..batch_end] {
+                    new_parent_keys.push(*parent);
+                }
+                batch_start = batch_end;
+            }
 
             keys_by_level
                 .entry(d as i32)
                 .or_default()
-                .extend(new_parent_keys);
+                .extend(new_parent_keys.into_iter());
+
+            // Per-level point conservation check: count ALL points on disk.
+            let disk_total: u64 = keys_by_level
+                .values()
+                .flat_map(|ks| ks.iter())
+                .map(|k| {
+                    self.node_path(k).metadata().map_or(0, |m| m.len()) / RawPoint::BYTE_SIZE as u64
+                })
+                .sum();
+            info!(
+                "LEVEL-CHECK after d={d}: {} total points on disk (input: {}, diff: {})",
+                disk_total,
+                self.total_points,
+                disk_total as i64 - self.total_points as i64,
+            );
         }
 
         // Enumerate result from the in-memory key map (no directory scan needed).
@@ -1010,7 +1269,121 @@ impl OctreeBuilder {
                 }
             }
         }
+
+        // Verify point conservation — flag if total differs from input.
+        let total: u64 = result.iter().map(|(_, c)| *c as u64).sum();
+        if total != self.total_points {
+            info!(
+                "Point conservation check: octree has {} points vs {} input (diff {})",
+                total,
+                self.total_points,
+                total as i64 - self.total_points as i64
+            );
+        }
+
         Ok(result)
+    }
+
+    /// Streaming grid-sample for a single oversized parent.
+    ///
+    /// Processes one child at a time so that only one child's points are ever in
+    /// memory. The grid occupancy set (max 128³ entries ≈ 48 MB) and the parent
+    /// accumulator (max 128³ points ≈ 80 MB) stay resident; everything else is
+    /// streamed from/to disk.
+    ///
+    /// Tradeoff: points are not Morton-sorted across children, so spatial
+    /// coherence of the parent is slightly worse than the in-memory path.
+    fn grid_sample_streaming(&self, parent: &VoxelKey, children: &[VoxelKey]) -> Result<()> {
+        let voxel_size_world = 2.0 * self.halfsize / (1u64 << parent.level) as f64;
+        let origin_x = ((self.cx - self.halfsize + parent.x as f64 * voxel_size_world
+            - self.offset_x)
+            / self.scale_x)
+            .round() as i64;
+        let origin_y = ((self.cy - self.halfsize + parent.y as f64 * voxel_size_world
+            - self.offset_y)
+            / self.scale_y)
+            .round() as i64;
+        let origin_z = ((self.cz - self.halfsize + parent.z as f64 * voxel_size_world
+            - self.offset_z)
+            / self.scale_z)
+            .round() as i64;
+        let int_size =
+            (voxel_size_world / self.scale_x.min(self.scale_y).min(self.scale_z)).round() as i64;
+        let cell = (int_size / GRID_CELLS_PER_AXIS).max(1);
+
+        let grid_key = |p: &RawPoint| -> (i32, i32, i32) {
+            (
+                ((p.x as i64 - origin_x) / cell) as i32,
+                ((p.y as i64 - origin_y) / cell) as i32,
+                ((p.z as i64 - origin_z) / cell) as i32,
+            )
+        };
+
+        let max_accepted =
+            (GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS) as usize;
+        let mut occupied: HashSet<(i32, i32, i32)> = HashSet::new();
+        let mut parent_pts: Vec<RawPoint> = Vec::new();
+
+        // Track which children had points, to guarantee at least one per child.
+        let mut child_donated: Vec<bool> = vec![false; children.len()];
+
+        // Pass 1: iterate children one at a time, accept points into the parent
+        // grid, write remaining back to the child's temp file.
+        for (ci, ck) in children.iter().enumerate() {
+            let pts = self.read_node(ck)?;
+            if pts.is_empty() {
+                continue;
+            }
+            debug!(
+                "    streaming child {}/{}: {:?} → {} points ({} MB), grid {}/{} full",
+                ci + 1,
+                children.len(),
+                ck,
+                pts.len(),
+                (pts.len() * std::mem::size_of::<RawPoint>()) / 1_048_576,
+                occupied.len(),
+                max_accepted,
+            );
+            let mut remaining: Vec<RawPoint> = Vec::new();
+            for p in pts {
+                if parent_pts.len() < max_accepted && occupied.insert(grid_key(&p)) {
+                    child_donated[ci] = true;
+                    parent_pts.push(p);
+                } else {
+                    remaining.push(p);
+                }
+            }
+            // If this child had points but none remain (all promoted), we need to
+            // return at least one. Done in pass 2 below.
+            if remaining.is_empty() && child_donated[ci] {
+                // Will be fixed in pass 2.
+                child_donated[ci] = false;
+            }
+            self.write_node_to_temp(ck, &remaining)?;
+        }
+
+        // Pass 2: guarantee every child that contributed keeps at least one point.
+        for (ci, ck) in children.iter().enumerate() {
+            if !child_donated[ci] {
+                // Check if this child originally had points (file might now be
+                // empty because all were promoted).
+                let file_len = self.node_path(ck).metadata().map_or(0, |m| m.len());
+                if file_len == 0 && !parent_pts.is_empty() {
+                    // Return one point from the parent back to this child.
+                    // Find the last parent point that came from any child — we
+                    // can't track origin in the streaming path, so just pop the last.
+                    if let Some(p) = parent_pts.pop() {
+                        self.write_node_to_temp(ck, &[p])?;
+                    }
+                }
+            }
+        }
+
+        if !parent_pts.is_empty() {
+            self.write_node_to_temp(parent, &parent_pts)?;
+        }
+
+        Ok(())
     }
 
     /// Grid-based spatial sampling for one parent node.

@@ -310,6 +310,7 @@ fn run_converter_with_args(input: &Path, output: &Path, extra_args: &[&str]) {
     let status = Command::new(converter_bin())
         .arg(input)
         .arg(output)
+        .args(["--progress", "plain"])
         .args(extra_args)
         .status()
         .expect("failed to run copc_converter");
@@ -777,4 +778,72 @@ fn temporal_index_custom_stride() {
     );
 
     let _ = std::fs::remove_file(output2);
+}
+
+// ---------------------------------------------------------------------------
+// Low-memory / streaming path tests
+// ---------------------------------------------------------------------------
+
+/// Run with a tiny memory limit to force the streaming grid_sample path
+/// (and smaller write batches). Verify the output is a valid COPC file
+/// with the correct total point count.
+#[test]
+fn low_memory_produces_valid_output() {
+    let output = Path::new("tests/data/test_low_mem.copc.laz");
+    // 1 MB budget forces the out-of-core build path and streaming grid_sample
+    // for parents whose children exceed this tiny limit.
+    run_converter_with_args(
+        Path::new("tests/data/input.laz"),
+        output,
+        &["--memory-limit", "1M"],
+    );
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let reference = read_file(Path::new("tests/data/untwine_reference.copc.laz"));
+    let ref_header = read_las_header(&reference);
+
+    // Must preserve all points
+    assert_eq!(
+        header.total_points, ref_header.total_points,
+        "total points must match reference"
+    );
+
+    // Hierarchy must be present and have a root node
+    let hier = read_hierarchy(&data);
+    let root = VoxelKey {
+        level: 0,
+        x: 0,
+        y: 0,
+        z: 0,
+    };
+    assert!(
+        hier.iter().any(|e| e.key == root),
+        "hierarchy must have root node"
+    );
+
+    // Total points across hierarchy must match header
+    let hier_total: i64 = hier
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as i64)
+        .sum();
+    assert_eq!(
+        hier_total, header.total_points as i64,
+        "hierarchy point sum must match header"
+    );
+
+    // Every data node must have valid offset and byte_size
+    for entry in &hier {
+        if entry.point_count > 0 {
+            assert!(entry.offset > 0, "node {:?} must have offset", entry.key);
+            assert!(
+                entry.byte_size > 0,
+                "node {:?} must have byte_size",
+                entry.key
+            );
+        }
+    }
+
+    let _ = std::fs::remove_file(output);
 }
