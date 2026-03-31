@@ -853,8 +853,7 @@ impl OctreeBuilder {
             let pre_total: u64 = pre_keys
                 .iter()
                 .map(|k| {
-                    self.node_path(k).metadata().map_or(0, |m| m.len()) as u64
-                        / RawPoint::BYTE_SIZE as u64
+                    self.node_path(k).metadata().map_or(0, |m| m.len()) / RawPoint::BYTE_SIZE as u64
                 })
                 .sum();
             info!(
@@ -881,14 +880,10 @@ impl OctreeBuilder {
             let post_total: u64 = leaf_keys
                 .iter()
                 .map(|k| {
-                    self.node_path(k).metadata().map_or(0, |m| m.len()) as u64
-                        / RawPoint::BYTE_SIZE as u64
+                    self.node_path(k).metadata().map_or(0, |m| m.len()) / RawPoint::BYTE_SIZE as u64
                 })
                 .sum();
-            info!(
-                "CHECKPOINT post-normalize: {} points on disk",
-                post_total,
-            );
+            info!("CHECKPOINT post-normalize: {} points on disk", post_total,);
         }
 
         // Estimate memory required to hold all leaf data. The in-memory path
@@ -1245,8 +1240,7 @@ impl OctreeBuilder {
                 .values()
                 .flat_map(|ks| ks.iter())
                 .map(|k| {
-                    self.node_path(k).metadata().map_or(0, |m| m.len()) as u64
-                        / RawPoint::BYTE_SIZE as u64
+                    self.node_path(k).metadata().map_or(0, |m| m.len()) / RawPoint::BYTE_SIZE as u64
                 })
                 .sum();
             info!(
