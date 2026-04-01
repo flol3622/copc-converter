@@ -101,12 +101,16 @@ Optional analysis tools are available behind the `tools` feature:
 cargo build --release --features tools
 ```
 
-### compare_copc
+### inspect_copc
 
-Side-by-side comparison of two COPC files over HTTP (headers + hierarchy only, no point data):
+Inspect a COPC file's structure, or compare two files side-by-side. Works with local files and HTTP URLs.
 
 ```sh
-compare_copc <url_a> <url_b>
+# Inspect a single file
+inspect_copc pointcloud.copc.laz
+
+# Compare two files
+inspect_copc pointcloud.copc.laz --compare other.copc.laz
 ```
 
 Prints node counts, point distribution, compressed sizes, and compression ratios per octree level.

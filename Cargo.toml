@@ -19,8 +19,8 @@ name = "copc_converter"
 path = "src/main.rs"
 
 [[bin]]
-name = "compare_copc"
-path = "src/bin/compare_copc.rs"
+name = "inspect_copc"
+path = "src/bin/inspect_copc.rs"
 required-features = ["tools"]
 
 [[bin]]

@@ -1,8 +1,8 @@
-//! Compare two COPC files side-by-side: hierarchy depth, node counts,
-//! chunk sizes, point counts, and compression ratios.
+//! Inspect a COPC file's structure, or compare two COPC files side-by-side.
 //!
 //! Usage:
-//!   cargo run --release --features tools --bin compare_copc -- <url_a> <url_b>
+//!   inspect_copc <file_or_url>
+//!   inspect_copc <file_or_url> --compare <other_file_or_url>
 
 use copc_converter::tools::Source;
 use copc_streaming::CopcStreamingReader;
@@ -32,9 +32,9 @@ struct CopcStats {
     copc_info_str: String,
 }
 
-async fn gather_stats(url: &str, label: &str) -> anyhow::Result<CopcStats> {
+async fn gather_stats(path: &str, label: &str) -> anyhow::Result<CopcStats> {
     eprintln!("[{label}] Opening...");
-    let source = Source::from_arg(url)?;
+    let source = Source::from_arg(path)?;
     let file_size = copc_streaming::ByteSource::size(&source)
         .await?
         .unwrap_or(0);
@@ -56,11 +56,6 @@ async fn gather_stats(url: &str, label: &str) -> anyhow::Result<CopcStats> {
         copc_info.spacing,
         copc_info.gpstime_minimum,
         copc_info.gpstime_maximum,
-    );
-
-    eprintln!(
-        "[{label}] Header: format={}, record_len={}, points={}",
-        point_format, point_record_len, total_points,
     );
 
     eprintln!("[{label}] Loading hierarchy...");
@@ -205,19 +200,27 @@ fn print_comparison(a: &CopcStats, b: &CopcStats) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: compare_copc <url_a> <url_b>");
-        std::process::exit(1);
+
+    let (input, compare_with) = match args.len() {
+        2 => (args[1].as_str(), None),
+        4 if args[2] == "--compare" => (args[1].as_str(), Some(args[3].as_str())),
+        _ => {
+            eprintln!("Usage: inspect_copc <file_or_url> [--compare <other>]");
+            std::process::exit(1);
+        }
+    };
+
+    if let Some(other) = compare_with {
+        let (stats_a, stats_b) = tokio::join!(gather_stats(input, "A"), gather_stats(other, "B"));
+        let stats_a = stats_a?;
+        let stats_b = stats_b?;
+        print_stats(&stats_a);
+        print_stats(&stats_b);
+        print_comparison(&stats_a, &stats_b);
+    } else {
+        let stats = gather_stats(input, input).await?;
+        print_stats(&stats);
     }
-
-    let (stats_a, stats_b) =
-        tokio::join!(gather_stats(&args[1], "A"), gather_stats(&args[2], "B"),);
-    let stats_a = stats_a?;
-    let stats_b = stats_b?;
-
-    print_stats(&stats_a);
-    print_stats(&stats_b);
-    print_comparison(&stats_a, &stats_b);
 
     Ok(())
 }
