@@ -847,3 +847,84 @@ fn low_memory_produces_valid_output() {
 
     let _ = std::fs::remove_file(output);
 }
+
+// ---------------------------------------------------------------------------
+// copc-streaming / copc-temporal round-trip test
+// ---------------------------------------------------------------------------
+
+/// Verify that copc-streaming and copc-temporal can read the COPC output
+/// produced by our converter (temporal index enabled). This exercises the
+/// same code paths as the inspect_temporal tool.
+#[cfg(feature = "tools")]
+#[test]
+fn temporal_index_readable_by_streaming_crate() {
+    use copc_streaming::{CopcStreamingReader, FileSource};
+    use copc_temporal::TemporalCache;
+
+    let output = Path::new("tests/data/test_temporal_streaming.copc.laz");
+    run_converter_with_args(
+        Path::new("tests/data/input.laz"),
+        output,
+        &["--temporal-index"],
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let source = FileSource::open(output.to_str().unwrap()).unwrap();
+        let mut reader = CopcStreamingReader::open(source).await.unwrap();
+
+        // Header should be readable — copy values before mutable borrow
+        let point_format = reader.header().las_header().point_format().to_u8().unwrap();
+        let num_points = reader.header().las_header().number_of_points();
+        let halfsize = reader.header().copc_info().halfsize;
+        let gpstime_min = reader.header().copc_info().gpstime_minimum;
+        let gpstime_max = reader.header().copc_info().gpstime_maximum;
+
+        assert_eq!(point_format, 6);
+        assert!(num_points > 0);
+        assert!(halfsize > 0.0);
+        assert!(gpstime_min <= gpstime_max);
+
+        // Hierarchy should load
+        reader.load_all_hierarchy().await.unwrap();
+        assert!(reader.node_count() > 0, "hierarchy must have nodes");
+
+        let hier_data_nodes = reader.entries().filter(|(_, e)| e.point_count > 0).count();
+        assert!(hier_data_nodes > 0, "must have data nodes");
+
+        // Temporal index should load
+        let temporal = TemporalCache::from_reader(&reader).await.unwrap();
+        let mut temporal = temporal.expect("temporal index must be present");
+
+        let th = temporal.header().unwrap();
+        assert_eq!(th.version, 1);
+        assert_eq!(th.stride, 1000);
+        assert!(th.node_count > 0);
+
+        // Load all temporal pages
+        let source = FileSource::open(output.to_str().unwrap()).unwrap();
+        temporal.load_all_pages(&source).await.unwrap();
+
+        // Every temporal entry should have samples and a valid time range
+        let mut temporal_count = 0;
+        for (_key, entry) in temporal.iter() {
+            temporal_count += 1;
+            assert!(
+                !entry.samples().is_empty(),
+                "node must have at least one sample"
+            );
+            let (t_min, t_max) = entry.time_range();
+            assert!(t_min.0 <= t_max.0, "time_min must be <= time_max");
+            assert!(t_min.0 >= gpstime_min, "sample time must be >= global min");
+            assert!(t_max.0 <= gpstime_max, "sample time must be <= global max");
+        }
+
+        // Temporal entries must match hierarchy data nodes
+        assert_eq!(
+            temporal_count, hier_data_nodes,
+            "temporal entries must match hierarchy data nodes"
+        );
+    });
+
+    let _ = std::fs::remove_file(output);
+}

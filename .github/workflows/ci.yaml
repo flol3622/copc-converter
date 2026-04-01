@@ -40,7 +40,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
       - name: Run cargo clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --features tools -- -D warnings
 
   test:
     name: Run Tests
@@ -57,4 +57,4 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
       - name: Run cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --features tools

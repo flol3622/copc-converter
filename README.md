@@ -55,11 +55,11 @@ copc_converter ./tiles/ merged.copc.laz
 | Flag | Description | Default |
 |---|---|---|
 | `--memory-limit` | Max memory budget (`16G`, `4096M`, etc.) | auto-detected |
+| `--threads` | Max parallel threads | all cores |
 | `--temp-dir` | Directory for intermediate files | system temp |
 | `--temporal-index` | Write a temporal index EVLR for time-based queries | off |
 | `--temporal-stride` | Sampling stride for the temporal index (every n-th point) | `1000` |
 | `--progress` | Progress output format: `bar`, `plain`, or `json` | `bar` |
-| `--threads` | Max parallel threads | all cores |
 
 ### Examples
 
@@ -93,17 +93,33 @@ Pipeline::scan(&files, config)?
     .write("output.copc.laz")?;
 ```
 
-## Compare tool
+## Tools
 
-A `compare_copc` binary is available behind the `compare` feature for inspecting and comparing COPC files over HTTP (e.g. from cloud storage):
+Optional analysis tools are available behind the `tools` feature:
 
 ```sh
-cargo build --release --features compare --bin compare_copc
+cargo build --release --features tools
+```
 
+### compare_copc
+
+Side-by-side comparison of two COPC files over HTTP (headers + hierarchy only, no point data):
+
+```sh
 compare_copc <url_a> <url_b>
 ```
 
-This fetches only the headers and hierarchy (not point data) and prints a side-by-side comparison of node counts, point distribution, compressed sizes, and compression ratios per octree level.
+Prints node counts, point distribution, compressed sizes, and compression ratios per octree level.
+
+### inspect_temporal
+
+Inspect the temporal index EVLR of a COPC file:
+
+```sh
+inspect_temporal <url>
+```
+
+Prints GPS time range, per-level temporal coverage, a time histogram showing node overlap across time windows, and sample density stats.
 
 ## How it works
 

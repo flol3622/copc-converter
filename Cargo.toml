@@ -21,10 +21,15 @@ path = "src/main.rs"
 [[bin]]
 name = "compare_copc"
 path = "src/bin/compare_copc.rs"
-required-features = ["compare"]
+required-features = ["tools"]
+
+[[bin]]
+name = "inspect_temporal"
+path = "src/bin/inspect_temporal.rs"
+required-features = ["tools"]
 
 [features]
-compare = ["dep:reqwest", "dep:tokio"]
+tools = ["dep:reqwest", "dep:tokio", "dep:copc-streaming", "dep:copc-temporal", "dep:futures"]
 
 [dependencies]
 las = { version = "0.9", features = ["laz-parallel"] }
@@ -39,6 +44,9 @@ indicatif = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1.10"
+copc-streaming = { git = "https://github.com/360-geo/copc.git", optional = true }
+copc-temporal = { git = "https://github.com/360-geo/copc.git", optional = true }
+futures = { version = "0.3", optional = true }
 reqwest = { version = "0.12", features = ["rustls-tls"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 
