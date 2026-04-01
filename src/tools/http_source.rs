@@ -38,17 +38,23 @@ impl ByteSource for HttpSource {
     }
 
     async fn size(&self) -> Result<Option<u64>, CopcError> {
+        // Use a 1-byte range GET instead of HEAD, since presigned URLs
+        // are method-specific and HEAD often returns 403.
+        // Parse total file size from the Content-Range header:
+        //   Content-Range: bytes 0-0/123456789
         let resp = self
             .client
-            .head(&self.url)
+            .get(&self.url)
+            .header("Range", "bytes=0-0")
             .send()
             .await
             .map_err(|e| CopcError::Io(std::io::Error::other(e)))?;
         Ok(resp
             .headers()
-            .get("content-length")
+            .get("content-range")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok()))
+            .and_then(|v| v.rsplit_once('/'))
+            .and_then(|(_, total)| total.parse().ok()))
     }
 
     async fn read_ranges(&self, ranges: &[(u64, u64)]) -> Result<Vec<Vec<u8>>, CopcError> {
