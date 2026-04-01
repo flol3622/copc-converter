@@ -28,6 +28,9 @@ pub(crate) mod octree;
 pub(crate) mod validate;
 pub(crate) mod writer;
 
+#[cfg(feature = "tools")]
+pub mod tools;
+
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use tracing::info;
