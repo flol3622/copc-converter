@@ -6,8 +6,8 @@
 //!   cargo run --release --features tools --bin inspect_temporal -- <url>
 
 use copc_converter::tools::Source;
-use copc_streaming::CopcStreamingReader;
-use copc_temporal::{GpsTime, TemporalCache};
+use copc_streaming::{ByteSource, CopcStreamingReader};
+use copc_temporal::TemporalCache;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ fn print_histogram(title: &str, buckets: &[(String, u64)], max_width: usize) {
             0
         };
         let bar: String = "#".repeat(bar_len);
-        println!("  {label:>20} | {bar:<max_width$} {val}");
+        println!("  {label:>20} | {bar}");
     }
     println!();
 }
@@ -90,9 +90,63 @@ async fn main() -> anyhow::Result<()> {
     println!("  Page count: {}", header.page_count);
     println!();
 
-    eprintln!("Loading all temporal pages...");
+    // Fetch the entire EVLR region in one request and parse from memory.
+    // The temporal pages live between evlr_offset and the end of the file.
+    // We fetch from evlr_offset to EOF and use it as an in-memory ByteSource,
+    // which turns all page loads into cheap memcpy operations.
+    let evlr_offset = reader.evlr_offset();
     let source = Source::from_arg(&args[1])?;
-    temporal.load_all_pages(&source).await?;
+    let file_size = source.size().await?.unwrap_or(0);
+    let evlr_region_size = if file_size > evlr_offset {
+        file_size - evlr_offset
+    } else {
+        // Fallback: fetch a generous amount
+        256 * 1024 * 1024
+    };
+    eprintln!(
+        "Fetching EVLR region ({:.2} MB from offset {})...",
+        evlr_region_size as f64 / 1_048_576.0,
+        evlr_offset
+    );
+    let evlr_data = source.read_range(evlr_offset, evlr_region_size).await?;
+
+    // Build an in-memory source that maps absolute file offsets correctly:
+    // offset X in the file → offset (X - evlr_offset) in our buffer.
+    // We use a wrapper that adjusts offsets.
+    struct OffsetSource {
+        data: Vec<u8>,
+        base_offset: u64,
+    }
+    impl ByteSource for OffsetSource {
+        async fn read_range(
+            &self,
+            offset: u64,
+            length: u64,
+        ) -> Result<Vec<u8>, copc_streaming::CopcError> {
+            let start = (offset - self.base_offset) as usize;
+            let end = start + length as usize;
+            if end > self.data.len() {
+                return Err(copc_streaming::CopcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("offset {offset} + len {length} exceeds EVLR buffer"),
+                )));
+            }
+            Ok(self.data[start..end].to_vec())
+        }
+        async fn size(&self) -> Result<Option<u64>, copc_streaming::CopcError> {
+            Ok(Some(self.base_offset + self.data.len() as u64))
+        }
+    }
+    let mem_source = OffsetSource {
+        data: evlr_data,
+        base_offset: evlr_offset,
+    };
+
+    eprintln!("Parsing temporal pages from memory...");
+    temporal
+        .load_all_pages(&mem_source)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load temporal pages: {e}"))?;
 
     eprintln!("Loading hierarchy...");
     reader.load_all_hierarchy().await?;
@@ -131,45 +185,57 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Per-level temporal coverage:");
     println!(
-        "  {:>5}  {:>8}  {:>10}  {:>16}  {:>16}  {:>10}",
-        "Level", "Nodes", "Samples", "Time min", "Time max", "Span"
+        "  {:>5}  {:>8}  {:>10}  {:>12}  {:>12}  {:>10}",
+        "Level", "Nodes", "Samples", "From start", "To", "Span"
     );
-    println!("  {}", "-".repeat(75));
+    println!("  {}", "-".repeat(65));
     for level in &levels {
         let (nodes, t_min, t_max, samples) = level_stats[level];
         println!(
-            "  {:>5}  {:>8}  {:>10}  {:>16}  {:>16}  {:>10}",
+            "  {:>5}  {:>8}  {:>10}  {:>12}  {:>12}  {:>10}",
             level,
             nodes,
             samples,
-            format_gps_time(t_min),
-            format_gps_time(t_max),
+            format_duration(t_min - global_min),
+            format_duration(t_max - global_min),
             format_duration(t_max - t_min),
         );
     }
     println!();
 
-    // Time histogram
+    // Time histogram — bin actual sample timestamps, not node overlap.
+    // This shows when data was actually captured (e.g. reveals gaps at night).
     let num_buckets = 20;
     let range = global_max - global_min;
     if range > 0.0 {
         let bucket_width = range / num_buckets as f64;
-        let mut buckets: Vec<(String, u64)> = Vec::new();
+        let mut counts = vec![0u64; num_buckets];
 
-        for i in 0..num_buckets {
-            let b_start = global_min + i as f64 * bucket_width;
-            let b_end = b_start + bucket_width;
-            let count = temporal
-                .nodes_in_range(GpsTime(b_start), GpsTime(b_end))
-                .len() as u64;
-            buckets.push((
-                format!("{} - {}", format_gps_time(b_start), format_gps_time(b_end),),
-                count,
-            ));
+        for (_key, entry) in temporal.iter() {
+            for sample in entry.samples() {
+                let idx = ((sample.0 - global_min) / bucket_width) as usize;
+                let idx = idx.min(num_buckets - 1);
+                counts[idx] += 1;
+            }
         }
 
+        let buckets: Vec<(String, u64)> = (0..num_buckets)
+            .map(|i| {
+                let rel_start = i as f64 * bucket_width;
+                let rel_end = rel_start + bucket_width;
+                (
+                    format!(
+                        "{} - {}",
+                        format_duration(rel_start),
+                        format_duration(rel_end)
+                    ),
+                    counts[i],
+                )
+            })
+            .collect();
+
         print_histogram(
-            "Node overlap by time bucket (nodes active in each time window):",
+            "Sample distribution over time (when data was captured):",
             &buckets,
             40,
         );
