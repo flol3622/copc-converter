@@ -98,8 +98,16 @@ async fn gather_stats(path: &str, label: &str) -> anyhow::Result<CopcStats> {
 }
 
 fn print_stats(s: &CopcStats) {
+    let total_compressed: u64 = s.nodes_per_level.iter().map(|(_, _, _, c)| *c).sum();
     println!("=== {} ===", s.label);
-    println!("  File size:        {}", human_bytes(s.file_size));
+    if s.file_size > 0 {
+        println!("  File size:        {}", human_bytes(s.file_size));
+    } else {
+        println!(
+            "  Compressed total: {} (point data only)",
+            human_bytes(total_compressed)
+        );
+    }
     println!("  Total points:     {}", s.total_points);
     println!("  Point format:     {}", s.point_format);
     println!("  Point record len: {}", s.point_record_len);
