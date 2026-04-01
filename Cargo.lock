@@ -213,8 +213,9 @@ dependencies = [
 
 [[package]]
 name = "copc-streaming"
-version = "0.0.0-dev"
-source = "git+https://github.com/360-geo/copc.git#551ad17c02ac506c7c36885413d346eb3396cae2"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77dc2d974a4249167c4e42e5af2220d0f3ce907e117cec0f8747bcfe7fb154ac"
 dependencies = [
  "byteorder",
  "las",
@@ -224,8 +225,9 @@ dependencies = [
 
 [[package]]
 name = "copc-temporal"
-version = "0.0.0-dev"
-source = "git+https://github.com/360-geo/copc.git#551ad17c02ac506c7c36885413d346eb3396cae2"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b0f88e98528393e46f8872d2fb2e3a00f2658df73adbc7220e135e253e9791a"
 dependencies = [
  "byteorder",
  "copc-streaming",
