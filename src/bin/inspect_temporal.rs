@@ -90,29 +90,46 @@ async fn main() -> anyhow::Result<()> {
     println!("  Page count: {}", header.page_count);
     println!();
 
-    // Fetch the entire EVLR region in one request and parse from memory.
-    // The temporal pages live between evlr_offset and the end of the file.
-    // We fetch from evlr_offset to EOF and use it as an in-memory ByteSource,
-    // which turns all page loads into cheap memcpy operations.
+    // Per the spec, all temporal pages reside within the temporal EVLR payload.
+    // Scan EVLR headers sequentially to find the temporal one, then fetch its
+    // entire payload in a single request.
     let evlr_offset = reader.evlr_offset();
+    let evlr_count = reader.evlr_count();
     let source = Source::from_arg(&args[1])?;
-    let file_size = source.size().await?.unwrap_or(0);
-    let evlr_region_size = if file_size > evlr_offset {
-        file_size - evlr_offset
-    } else {
-        // Fallback: fetch a generous amount
-        256 * 1024 * 1024
-    };
-    eprintln!(
-        "Fetching EVLR region ({:.2} MB from offset {})...",
-        evlr_region_size as f64 / 1_048_576.0,
-        evlr_offset
-    );
-    let evlr_data = source.read_range(evlr_offset, evlr_region_size).await?;
 
-    // Build an in-memory source that maps absolute file offsets correctly:
-    // offset X in the file → offset (X - evlr_offset) in our buffer.
-    // We use a wrapper that adjusts offsets.
+    let mut temporal_data_offset: Option<u64> = None;
+    let mut temporal_data_length: Option<u64> = None;
+    let mut pos = evlr_offset;
+    for _ in 0..evlr_count {
+        // Fetch just this EVLR's 60-byte header
+        let hdr = source.read_range(pos, 60).await?;
+        let user_id = std::str::from_utf8(&hdr[2..18])
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        let record_id = u16::from_le_bytes([hdr[18], hdr[19]]);
+        let data_length = u64::from_le_bytes(hdr[20..28].try_into().unwrap());
+
+        if user_id == "copc_temporal" && record_id == 1000 {
+            temporal_data_offset = Some(pos + 60);
+            temporal_data_length = Some(data_length);
+            break;
+        }
+        pos += 60 + data_length;
+    }
+
+    let temporal_data_offset =
+        temporal_data_offset.ok_or_else(|| anyhow::anyhow!("Temporal EVLR not found"))?;
+    let temporal_data_length = temporal_data_length.unwrap();
+
+    eprintln!(
+        "Fetching temporal EVLR payload ({:.2} MB)...",
+        temporal_data_length as f64 / 1_048_576.0,
+    );
+    let evlr_payload = source
+        .read_range(temporal_data_offset, temporal_data_length)
+        .await?;
+
+    // Wrap as an in-memory ByteSource with correct absolute file offsets.
     struct OffsetSource {
         data: Vec<u8>,
         base_offset: u64,
@@ -138,8 +155,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let mem_source = OffsetSource {
-        data: evlr_data,
-        base_offset: evlr_offset,
+        data: evlr_payload,
+        base_offset: temporal_data_offset,
     };
 
     eprintln!("Parsing temporal pages from memory...");
