@@ -19,11 +19,223 @@ use crate::copc_types::VoxelKey;
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
+
+// ---------------------------------------------------------------------------
+// Chunked-build constants and helper types
+// ---------------------------------------------------------------------------
+
+/// Maximum number of leaf chunk files kept open simultaneously across all
+/// distribute workers in the chunked path. Divided evenly between workers.
+///
+/// Each entry holds a `BufWriter<File>` (~8 KiB internal buffer) plus an OS
+/// file descriptor. Capping prevents FD exhaustion on hosts with low ulimits
+/// (default 256 on macOS, 1024 on most Linux containers).
+const CHUNKED_OPEN_FILES_CAP: usize = 512;
+
+/// Minimum per-worker LRU capacity for the chunk writer cache.
+const MIN_PER_WORKER_CHUNK_FILES: usize = 32;
+
+/// Bounded LRU cache of append-mode `BufWriter`s for chunk temp files.
+///
+/// Keys are chunk indices (`u32`). On eviction the writer is flushed and
+/// dropped, releasing both its buffer and its file descriptor. Subsequent
+/// writes to the same chunk index reopen the file in append mode.
+///
+/// This is the chunk-keyed analog of the per-leaf path's writer cache: the
+/// design is identical, only the key type changes.
+struct ChunkWriterCache {
+    writers: HashMap<u32, BufWriter<File>>,
+    /// Insertion / access order. Front = least recently used.
+    order: VecDeque<u32>,
+    capacity: usize,
+}
+
+impl ChunkWriterCache {
+    fn new(capacity: usize) -> Self {
+        ChunkWriterCache {
+            writers: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    /// Append the given points to the temp file for `chunk_idx`, opening (and
+    /// possibly evicting another entry) as needed.
+    fn append(&mut self, chunk_idx: u32, shard_dir: &Path, points: &[RawPoint]) -> Result<()> {
+        if points.is_empty() {
+            return Ok(());
+        }
+
+        if self.writers.contains_key(&chunk_idx) {
+            // Move to back (most-recently-used).
+            if let Some(pos) = self.order.iter().position(|k| *k == chunk_idx) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(chunk_idx);
+        } else {
+            // Evict if at capacity.
+            while self.writers.len() >= self.capacity {
+                if let Some(victim) = self.order.pop_front() {
+                    if let Some(mut w) = self.writers.remove(&victim) {
+                        w.flush().context("flush evicted chunk writer")?;
+                    }
+                } else {
+                    break;
+                }
+            }
+            let path = chunk_shard_path(shard_dir, chunk_idx);
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("Cannot open chunk file {:?}", path))?;
+            self.writers.insert(chunk_idx, BufWriter::new(f));
+            self.order.push_back(chunk_idx);
+        }
+
+        let w = self.writers.get_mut(&chunk_idx).expect("just inserted");
+        RawPoint::write_bulk(points, w)?;
+        Ok(())
+    }
+
+    /// Flush and drop every cached writer.
+    fn flush_all(&mut self) -> Result<()> {
+        for (_, mut w) in self.writers.drain() {
+            w.flush().context("flush chunk writer")?;
+        }
+        self.order.clear();
+        Ok(())
+    }
+}
+
+/// Path for a chunk's per-worker shard file.
+fn chunk_shard_path(shard_dir: &Path, chunk_idx: u32) -> PathBuf {
+    shard_dir.join(format!("chunk_{chunk_idx}"))
+}
+
+/// Path for a chunk's canonical (merged) file under `tmp_dir/chunks/`.
+fn chunk_canonical_path(chunks_dir: &Path, chunk_idx: u32) -> PathBuf {
+    chunks_dir.join(format!("chunk_{chunk_idx}"))
+}
+
+/// Same heuristic as the per-leaf parallel distribute path: ~2/3 of cores,
+/// leaving headroom for the LAZ parallel decoder. Capped by input file count.
+fn chunked_distribute_worker_count(input_file_count: usize) -> usize {
+    let cores = rayon::current_num_threads();
+    let target = ((cores * 2) / 3).max(2);
+    target.min(input_file_count).max(1)
+}
+
+/// Build the cell → chunk_index lookup table from a chunk plan.
+///
+/// The grid has `grid_size³` fine cells; for each chunk we fill in every
+/// fine cell it covers. A chunk at level L covers a `2^(grid_depth - L)`
+/// cube per axis, since the grid corresponds to octree cells at `grid_depth`.
+///
+/// Returns a flat `Vec<u32>` indexed by `gx + gy*G + gz*G²`. Each entry
+/// holds the chunk index this cell belongs to. Cells not covered by any
+/// chunk (which should not happen for a well-formed plan) get `u32::MAX`
+/// as a sentinel; we treat any point landing in such a cell as a bug.
+fn build_chunk_lut(plan: &crate::chunking::ChunkPlan) -> Vec<u32> {
+    let g = plan.grid_size as usize;
+    let n_cells = g * g * g;
+    let mut lut = vec![u32::MAX; n_cells];
+
+    for (chunk_idx, chunk) in plan.chunks.iter().enumerate() {
+        // The chunk lives at chunk.level. The fine grid is at plan.grid_depth.
+        // Each chunk cell covers a stride of 2^(grid_depth - chunk.level)
+        // along each axis in the fine grid.
+        let level_diff = plan.grid_depth as i32 - chunk.level as i32;
+        debug_assert!(
+            level_diff >= 0,
+            "chunk level {} above grid depth {}",
+            chunk.level,
+            plan.grid_depth
+        );
+        let stride: usize = 1usize << level_diff as u32;
+
+        // Top-left corner of this chunk in fine-grid coordinates, clamped
+        // defensively against malformed chunks. (Should never trigger for
+        // a plan produced by `merge_sparse_cells`.)
+        let base_x = (chunk.gx as usize * stride).min(g);
+        let base_y = (chunk.gy as usize * stride).min(g);
+        let base_z = (chunk.gz as usize * stride).min(g);
+        let end_x = (base_x + stride).min(g);
+        let end_y = (base_y + stride).min(g);
+        let end_z = (base_z + stride).min(g);
+
+        for z in base_z..end_z {
+            for y in base_y..end_y {
+                let row_start = base_x + y * g + z * g * g;
+                let row_end = end_x + y * g + z * g * g;
+                for cell in &mut lut[row_start..row_end] {
+                    *cell = chunk_idx as u32;
+                }
+            }
+        }
+    }
+
+    lut
+}
+
+/// Concatenate per-worker shard files into the canonical
+/// `tmp_dir/chunks/chunk_N` location. Runs in parallel over chunk indices.
+///
+/// After this returns successfully, the `shards/` subdirectory is removed
+/// and only the canonical chunk files remain under `chunks/`.
+fn merge_chunk_shards(shards_root: &Path, chunks_root: &Path, n_chunks: u32) -> Result<()> {
+    let num_workers = match std::fs::read_dir(shards_root) {
+        Ok(it) => it
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .count(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e.into()),
+    };
+    debug!(
+        "Merging {} chunks across {} worker shards",
+        n_chunks, num_workers
+    );
+
+    (0..n_chunks)
+        .into_par_iter()
+        .try_for_each(|chunk_idx| -> Result<()> {
+            let canonical = chunk_canonical_path(chunks_root, chunk_idx);
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&canonical)
+                .with_context(|| format!("opening canonical chunk file {:?}", canonical))?;
+            let mut out = BufWriter::new(f);
+            for w in 0..num_workers {
+                let shard_path = shards_root
+                    .join(w.to_string())
+                    .join(format!("chunk_{chunk_idx}"));
+                match File::open(&shard_path) {
+                    Ok(f) => {
+                        let mut reader = BufReader::new(f);
+                        std::io::copy(&mut reader, &mut out).with_context(|| {
+                            format!("copying shard {:?} into {:?}", shard_path, canonical)
+                        })?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            out.flush().context("flush merged chunk file")?;
+            Ok(())
+        })?;
+
+    std::fs::remove_dir_all(shards_root)
+        .with_context(|| format!("removing shards root {:?}", shards_root))?;
+    Ok(())
+}
 
 /// Task fed into the parallel grid-sampling step: parent key, child keys, and
 /// indexed points (child-index, point).
@@ -1480,14 +1692,177 @@ impl OctreeBuilder {
     // -----------------------------------------------------------------------
 
     /// Chunked distribute. Computes the chunk plan via the counting-sort
-    /// analyzer, then writes each input point into its assigned chunk file.
+    /// analyzer, builds a fast cell→chunk lookup table, then streams each
+    /// input file in parallel and appends each point to its chunk's temp
+    /// file via a bounded LRU writer cache.
+    ///
+    /// See `docs/phase-2b-chunked-build.md` §4.1-4.2 for the design.
     fn distribute_chunked(
         &mut self,
-        _input_files: &[PathBuf],
-        _config: &PipelineConfig,
+        input_files: &[PathBuf],
+        config: &PipelineConfig,
     ) -> Result<()> {
-        // Implemented incrementally — see docs/phase-2b-chunked-build.md §4.1-4.2.
-        anyhow::bail!("chunked distribute not yet implemented")
+        // 1. Compute the chunk plan (counting + merge-sparse-cells).
+        let plan = crate::chunking::compute_chunk_plan(self, input_files, config, None)?;
+        info!(
+            "Chunked distribute: {} chunks, target {} points each, grid {}³",
+            plan.chunks.len(),
+            plan.chunk_target,
+            plan.grid_size
+        );
+
+        // 2. Build the cell → chunk_index lookup table. The grid has
+        //    grid_size³ fine cells; for each chunk we fill in every fine cell
+        //    it covers (a 2^(grid_depth - chunk.level) cube per axis).
+        let lut = build_chunk_lut(&plan);
+
+        // 3. Set up shard subdirectories under tmp_dir/chunks/shards/{worker}.
+        let chunks_root = self.tmp_dir.join("chunks");
+        if chunks_root.exists() {
+            std::fs::remove_dir_all(&chunks_root)
+                .with_context(|| format!("removing stale chunks dir {:?}", chunks_root))?;
+        }
+        std::fs::create_dir_all(&chunks_root)?;
+        let shards_root = chunks_root.join("shards");
+        std::fs::create_dir_all(&shards_root)?;
+
+        let num_workers = chunked_distribute_worker_count(input_files.len());
+        let shard_dirs: Vec<PathBuf> = (0..num_workers)
+            .map(|w| {
+                let d = shards_root.join(w.to_string());
+                std::fs::create_dir_all(&d)?;
+                Ok(d)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // 4. Compute per-worker resources.
+        let per_worker_cap = (CHUNKED_OPEN_FILES_CAP / num_workers).max(MIN_PER_WORKER_CHUNK_FILES);
+
+        // Per-worker memory budget for the input chunk size. The transient
+        // peak is `Vec<las::Point>` (~120 B/pt) plus the cache's BufWriter
+        // overhead (negligible). Size for 1/8 of the per-worker budget so
+        // there's headroom for the LAZ decoder + grouping overhead.
+        const BYTES_PER_POINT_TRANSIENT: u64 = 120;
+        let per_worker_budget = config.memory_budget / num_workers as u64;
+        let read_chunk_size =
+            ((per_worker_budget / 8) / BYTES_PER_POINT_TRANSIENT).clamp(50_000, 2_000_000) as usize;
+
+        debug!(
+            "Chunked distribute: budget={} MB, workers={}, read_chunk_size={}, open-file cap={} (per worker)",
+            config.memory_budget / 1_048_576,
+            num_workers,
+            read_chunk_size,
+            per_worker_cap
+        );
+
+        // Pre-compute geometry for the inlined grid-cell math (per design
+        // §5: ~3× faster than calling point_to_key with a depth-9 loop).
+        let g = plan.grid_size;
+        let cube_size = self.halfsize * 2.0;
+        let cube_min_x = self.cx - self.halfsize;
+        let cube_min_y = self.cy - self.halfsize;
+        let cube_min_z = self.cz - self.halfsize;
+        let g_per_cube = g as f64 / cube_size;
+        let g_max = g as i64 - 1;
+
+        // Capture the LUT and per-worker file ranges for the parallel block.
+        let files_per_worker = input_files.len().div_ceil(num_workers);
+        let progress = AtomicU64::new(0);
+
+        // 5. Parallel workers stream input files and append points to chunks.
+        shard_dirs
+            .par_iter()
+            .enumerate()
+            .try_for_each(|(worker_id, shard_dir)| -> Result<()> {
+                let start = worker_id * files_per_worker;
+                let end = (start + files_per_worker).min(input_files.len());
+                if start >= end {
+                    return Ok(());
+                }
+
+                let mut cache = ChunkWriterCache::new(per_worker_cap);
+                let mut points: Vec<las::Point> = Vec::with_capacity(read_chunk_size);
+                // Group buffer reused across batches so capacity amortizes.
+                // Drained at the end of each batch so retained Vec capacity
+                // stays bounded by the working set, not by all-time peak.
+                let mut groups: HashMap<u32, Vec<RawPoint>> = HashMap::new();
+
+                for path in &input_files[start..end] {
+                    let mut reader = las::Reader::from_path(path)
+                        .with_context(|| format!("Cannot open {:?}", path))?;
+                    let file_pts = reader.header().number_of_points();
+                    debug!(
+                        "Chunked distribute worker {} file {:?}: {} points",
+                        worker_id,
+                        path.file_name().unwrap_or_default(),
+                        file_pts
+                    );
+
+                    loop {
+                        points.clear();
+                        let n = reader.read_points_into(read_chunk_size as u64, &mut points)?;
+                        if n == 0 {
+                            break;
+                        }
+
+                        // Classify points into chunks via the LUT and group
+                        // them in memory before writing. Grouping batches
+                        // many points per writer call → fewer LRU touches
+                        // and better amortization than per-point appends.
+                        for p in &points {
+                            // Convert via the same RawPoint conversion the
+                            // per-leaf path uses, so the chunked path stores
+                            // the exact same int-coordinate representation.
+                            let raw = self.convert_point(p);
+
+                            // Inline grid-cell computation: ~3× faster than
+                            // point_to_key. Use round-tripped world coords
+                            // (raw.x * scale + offset) so the cell assignment
+                            // matches what the per-chunk build will see when
+                            // it reads RawPoints back from the chunk file.
+                            let wx = raw.x as f64 * self.scale_x + self.offset_x;
+                            let wy = raw.y as f64 * self.scale_y + self.offset_y;
+                            let wz = raw.z as f64 * self.scale_z + self.offset_z;
+
+                            let mut gx = ((wx - cube_min_x) * g_per_cube).floor() as i64;
+                            let mut gy = ((wy - cube_min_y) * g_per_cube).floor() as i64;
+                            let mut gz = ((wz - cube_min_z) * g_per_cube).floor() as i64;
+                            // Defensive clamp for points exactly on the
+                            // upper boundary that round out by one.
+                            gx = gx.clamp(0, g_max);
+                            gy = gy.clamp(0, g_max);
+                            gz = gz.clamp(0, g_max);
+
+                            let cell_idx = gx as usize
+                                + gy as usize * g as usize
+                                + gz as usize * g as usize * g as usize;
+                            let chunk_idx = lut[cell_idx];
+                            groups.entry(chunk_idx).or_default().push(raw);
+                        }
+
+                        // Free the las::Point buffer before flushing groups.
+                        points.clear();
+
+                        // Flush each group to the cache. Drain so vec capacity
+                        // doesn't accumulate across batches.
+                        for (chunk_idx, pts) in groups.drain() {
+                            cache.append(chunk_idx, shard_dir, &pts)?;
+                        }
+
+                        let done = progress.fetch_add(n, Ordering::Relaxed) + n;
+                        config.report(crate::ProgressEvent::StageProgress { done });
+                    }
+                }
+
+                cache.flush_all()
+            })?;
+
+        // 6. Merge per-worker shards into canonical chunk files.
+        merge_chunk_shards(&shards_root, &chunks_root, plan.chunks.len() as u32)?;
+
+        // 7. Stash the chunk plan for the build phase to consume.
+        self.chunked_plan = Some(plan);
+        Ok(())
     }
 
     /// Chunked build. Per-chunk in-memory build, then merge across chunks
@@ -1626,5 +2001,138 @@ mod tests {
         // Has color + NIR → format 8
         assert_eq!(input_to_copc_format(8), 8);
         assert_eq!(input_to_copc_format(10), 8);
+    }
+
+    // ----- Chunked-build helpers -----
+
+    use crate::chunking::{ChunkPlan, PlannedChunk};
+
+    fn make_plan(grid_size: u32, chunks: Vec<PlannedChunk>) -> ChunkPlan {
+        let total_points = chunks.iter().map(|c| c.point_count).sum();
+        ChunkPlan {
+            grid_size,
+            grid_depth: grid_size.trailing_zeros(),
+            chunk_target: 1_000_000,
+            total_points,
+            chunks,
+        }
+    }
+
+    #[test]
+    fn build_chunk_lut_single_root_chunk() {
+        // 4³ grid, one chunk at level 0 (the root) covering everything.
+        let plan = make_plan(
+            4,
+            vec![PlannedChunk {
+                level: 0,
+                gx: 0,
+                gy: 0,
+                gz: 0,
+                point_count: 100,
+            }],
+        );
+        let lut = build_chunk_lut(&plan);
+        assert_eq!(lut.len(), 64);
+        assert!(lut.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn build_chunk_lut_eight_finest_chunks() {
+        // 2³ grid (depth 1). Eight chunks at level 1, one per fine cell.
+        let chunks: Vec<PlannedChunk> = (0i32..8)
+            .map(|i| PlannedChunk {
+                level: 1,
+                gx: i % 2,
+                gy: (i / 2) % 2,
+                gz: i / 4,
+                point_count: 10,
+            })
+            .collect();
+        let plan = make_plan(2, chunks);
+        let lut = build_chunk_lut(&plan);
+        assert_eq!(lut.len(), 8);
+        // Each cell should map to a distinct chunk index 0..8.
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for &c in &lut {
+            assert!(c < 8, "got out-of-range chunk idx {c}");
+            seen.insert(c);
+        }
+        assert_eq!(seen.len(), 8);
+    }
+
+    #[test]
+    fn build_chunk_lut_mixed_levels() {
+        // 4³ grid (depth 2). Two chunks:
+        //   - chunk 0 at level 1, position (0,0,0) — covers the 2³ subcube at the origin (8 cells)
+        //   - chunk 1 at level 2, position (3,3,3) — covers exactly 1 fine cell at (3,3,3)
+        // The remaining 64 - 8 - 1 = 55 cells should be u32::MAX (uncovered).
+        let plan = make_plan(
+            4,
+            vec![
+                PlannedChunk {
+                    level: 1,
+                    gx: 0,
+                    gy: 0,
+                    gz: 0,
+                    point_count: 50,
+                },
+                PlannedChunk {
+                    level: 2,
+                    gx: 3,
+                    gy: 3,
+                    gz: 3,
+                    point_count: 5,
+                },
+            ],
+        );
+        let lut = build_chunk_lut(&plan);
+        assert_eq!(lut.len(), 64);
+
+        // Cells (gx, gy, gz) with all coords in 0..2 should map to chunk 0.
+        for z in 0..2 {
+            for y in 0..2 {
+                for x in 0..2 {
+                    let idx = x + y * 4 + z * 16;
+                    assert_eq!(lut[idx], 0, "cell ({x},{y},{z}) should map to chunk 0");
+                }
+            }
+        }
+
+        // Cell (3, 3, 3) → chunk 1.
+        assert_eq!(lut[3 + 3 * 4 + 3 * 16], 1);
+
+        // Count uncovered cells: should be 64 - 8 - 1 = 55.
+        let uncovered = lut.iter().filter(|&&c| c == u32::MAX).count();
+        assert_eq!(uncovered, 55);
+    }
+
+    #[test]
+    fn build_chunk_lut_chunk_at_corner() {
+        // 8³ grid (depth 3). One chunk at level 2 position (3, 3, 3) — covers
+        // 2³ cells at the far corner of the grid: (6..8, 6..8, 6..8).
+        let plan = make_plan(
+            8,
+            vec![PlannedChunk {
+                level: 2,
+                gx: 3,
+                gy: 3,
+                gz: 3,
+                point_count: 10,
+            }],
+        );
+        let lut = build_chunk_lut(&plan);
+        assert_eq!(lut.len(), 512);
+        let g = 8;
+        for z in 6..8 {
+            for y in 6..8 {
+                for x in 6..8 {
+                    let idx = x + y * g + z * g * g;
+                    assert_eq!(lut[idx], 0, "cell ({x},{y},{z}) should be in the chunk");
+                }
+            }
+        }
+        // No other cell should be in the chunk.
+        let in_chunk = lut.iter().filter(|&&c| c == 0).count();
+        assert_eq!(in_chunk, 8);
     }
 }

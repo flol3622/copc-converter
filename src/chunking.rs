@@ -155,8 +155,8 @@ pub fn select_grid_size(total_points: u64) -> u32 {
     }
 }
 
-/// Top-level entry point: run the counting pass and merge step on the given
-/// inputs and return a chunk plan.
+/// Top-level entry point for the analyze tool: builds an `OctreeBuilder`
+/// from scan results, then delegates to [`compute_chunk_plan`].
 ///
 /// Reuses scan + validate via the existing pipeline machinery so the analyze
 /// tool sees exactly the same bounds, scale, and CRS as a real conversion
@@ -169,10 +169,35 @@ pub fn analyze_chunking(
     config: &PipelineConfig,
     chunk_target_override: Option<u64>,
 ) -> Result<ChunkPlan> {
-    // Borrow the same geometry the converter would use.
     let builder = OctreeBuilder::from_scan(scan_results, validated, config)
         .context("constructing OctreeBuilder for chunk analysis")?;
+    // The standalone analyzer treats counting as its own user-visible stage.
+    // (When called from inside the chunked distribute path, the caller owns
+    // the stage events instead.)
+    config.report(crate::ProgressEvent::StageStart {
+        name: "Counting",
+        total: builder.total_points,
+    });
+    let plan = compute_chunk_plan(&builder, input_files, config, chunk_target_override)?;
+    config.report(crate::ProgressEvent::StageDone);
+    Ok(plan)
+}
 
+/// Run the counting pass and merge step against an existing `OctreeBuilder`.
+///
+/// Used by both the analyze CLI tool and the chunked-build distribute path,
+/// so they share the exact same chunking logic and produce the same plan
+/// for the same inputs.
+///
+/// **Does not emit `StageStart`/`StageDone` events** — the caller owns the
+/// progress reporting boundary so this can be embedded inside another stage
+/// without clobbering its progress bar.
+pub(crate) fn compute_chunk_plan(
+    builder: &OctreeBuilder,
+    input_files: &[PathBuf],
+    config: &PipelineConfig,
+    chunk_target_override: Option<u64>,
+) -> Result<ChunkPlan> {
     let total_points = builder.total_points;
     let grid_size = select_grid_size(total_points);
     let grid_depth = grid_size.trailing_zeros();
@@ -181,17 +206,12 @@ pub fn analyze_chunking(
         .unwrap_or_else(|| compute_chunk_target(config.memory_budget, num_workers, total_points));
 
     info!(
-        "Chunk analysis: total_points={}, grid={}³ (depth {}), chunk_target={}, workers={}",
+        "Chunk plan: total_points={}, grid={}³ (depth {}), chunk_target={}, workers={}",
         total_points, grid_size, grid_depth, chunk_target, num_workers
     );
 
     // ----- Count pass -----
-    config.report(crate::ProgressEvent::StageStart {
-        name: "Counting",
-        total: total_points,
-    });
-    let grid = count_points(&builder, input_files, grid_size, grid_depth, config)?;
-    config.report(crate::ProgressEvent::StageDone);
+    let grid = count_points(builder, input_files, grid_size, grid_depth, config)?;
 
     let cells_touched = grid
         .iter()
