@@ -132,6 +132,34 @@ fn chunked_distribute_worker_count(input_file_count: usize) -> usize {
     target.min(input_file_count).max(1)
 }
 
+/// How many extra octree levels a chunk needs to subdivide internally so its
+/// leaves hold ~`MAX_LEAF_POINTS` on average.
+///
+/// Computes `ceil(log8(point_count / MAX_LEAF_POINTS))`, clamped to a sane
+/// upper bound. Returns 0 for chunks at or below `MAX_LEAF_POINTS` (the
+/// chunk root is the only leaf).
+///
+/// **Uniform subdivision** — dense regions inside the chunk may exceed
+/// `MAX_LEAF_POINTS` per leaf, which is acceptable per the design doc §9.3.
+/// `grid_sample`'s natural cascading handles the imbalance during the
+/// bottom-up build.
+fn chunk_local_extra_levels(point_count: u64) -> u32 {
+    if point_count <= MAX_LEAF_POINTS {
+        return 0;
+    }
+    let mut d = 0u32;
+    while (point_count as f64) / (8u64.pow(d) as f64) > MAX_LEAF_POINTS as f64 {
+        d += 1;
+        // Cap at a generous limit. With 8^9 = 134M, even a 100B-point
+        // chunk would only need d = 9, but we allow a couple more levels
+        // for highly imbalanced chunks before giving up.
+        if d > 12 {
+            break;
+        }
+    }
+    d
+}
+
 /// Build the cell → chunk_index lookup table from a chunk plan.
 ///
 /// The grid has `grid_size³` fine cells; for each chunk we fill in every
@@ -1191,8 +1219,8 @@ impl OctreeBuilder {
 
     /// Bottom-up pass — in-memory fast path.
     ///
-    /// Loads all leaf data into a HashMap, runs grid_sample at every level
-    /// without any intermediate disk I/O, then writes the final node files once.
+    /// Loads all leaf data into a HashMap, then delegates the level loop to
+    /// [`Self::bottom_up_levels`] (used by both per-leaf and chunked paths).
     fn bottom_up_in_memory(
         &self,
         leaf_keys: &[VoxelKey],
@@ -1204,7 +1232,7 @@ impl OctreeBuilder {
             leaf_keys.len()
         );
         // Load all leaf nodes in parallel.
-        let mut nodes: HashMap<VoxelKey, Vec<RawPoint>> = leaf_keys
+        let nodes: HashMap<VoxelKey, Vec<RawPoint>> = leaf_keys
             .par_iter()
             .map(|k| -> Result<(VoxelKey, Vec<RawPoint>)> { Ok((*k, self.read_node(k)?)) })
             .collect::<Result<Vec<_>>>()?
@@ -1220,7 +1248,30 @@ impl OctreeBuilder {
             (total_in_mem * std::mem::size_of::<RawPoint>()) / 1_048_576,
         );
 
-        for d in (0..actual_max_depth).rev() {
+        // Per-leaf path: walk all the way to global root (min_level = 0).
+        self.bottom_up_levels(nodes, actual_max_depth, 0, config)
+    }
+
+    /// Bottom-up grid-sample loop over an in-memory `nodes` HashMap.
+    ///
+    /// Walks levels `(min_level..actual_max_depth)` in reverse, grouping
+    /// children of each parent and running `grid_sample` to produce that
+    /// parent. After the loop completes, every node in the resulting map is
+    /// written to its canonical temp file location.
+    ///
+    /// With `min_level = 0` the loop walks all the way to the global root
+    /// (per-leaf path). With a positive `min_level` the loop stops once it
+    /// has produced parents at `min_level`, leaving any coarser ancestors
+    /// to a later merge step (chunked path: each chunk's bottom-up build
+    /// stops at the chunk's root level).
+    fn bottom_up_levels(
+        &self,
+        mut nodes: HashMap<VoxelKey, Vec<RawPoint>>,
+        actual_max_depth: u32,
+        min_level: u32,
+        config: &crate::PipelineConfig,
+    ) -> Result<Vec<(VoxelKey, usize)>> {
+        for d in (min_level..actual_max_depth).rev() {
             config.report(crate::ProgressEvent::StageProgress {
                 done: (actual_max_depth - d) as u64,
             });
@@ -1865,6 +1916,92 @@ impl OctreeBuilder {
         Ok(())
     }
 
+    /// Read all `RawPoint`s from a chunk file in one shot.
+    #[allow(dead_code)] // wired in by step 5/6 of Phase 2b
+    fn read_chunk_file(&self, chunk_idx: u32) -> Result<Vec<RawPoint>> {
+        let path = chunk_canonical_path(&self.tmp_dir.join("chunks"), chunk_idx);
+        let f = File::open(&path).with_context(|| format!("opening chunk file {:?}", path))?;
+        let file_len = f.metadata()?.len();
+        let count = file_len as usize / RawPoint::BYTE_SIZE;
+        let mut r = BufReader::new(f);
+        let mut pts = Vec::with_capacity(count);
+        for _ in 0..count {
+            pts.push(RawPoint::read(&mut r)?);
+        }
+        Ok(pts)
+    }
+
+    /// Build a single chunk's sub-octree fully in memory and write its node
+    /// files to canonical temp paths.
+    ///
+    /// Returns the list of `(VoxelKey, point_count)` for nodes at levels in
+    /// `[chunk.level, chunk_leaf_depth]` that the chunk produced. The chunk
+    /// root at `chunk.level` is included; coarser ancestors are left to the
+    /// merge step.
+    #[allow(dead_code)] // wired in by step 5/6 of Phase 2b
+    fn build_chunk_in_memory(
+        &self,
+        chunk: &crate::chunking::PlannedChunk,
+        chunk_idx: u32,
+        config: &crate::PipelineConfig,
+    ) -> Result<Vec<(VoxelKey, usize)>> {
+        // Load all points for this chunk into memory.
+        let points = self.read_chunk_file(chunk_idx)?;
+        let n_points = points.len();
+
+        if n_points == 0 {
+            // Empty chunk → no nodes produced. Should not happen for a plan
+            // generated by `merge_sparse_cells`, but handle defensively.
+            debug!(
+                "Chunk {} (L{} {},{},{}) is empty, skipping",
+                chunk_idx, chunk.level, chunk.gx, chunk.gy, chunk.gz
+            );
+            return Ok(Vec::new());
+        }
+
+        // Compute the chunk-local leaf depth so each leaf holds ~MAX_LEAF_POINTS
+        // on average. Slightly larger leaves are acceptable in dense regions.
+        let extra_levels = chunk_local_extra_levels(n_points as u64);
+        let leaf_depth = chunk.level + extra_levels;
+        debug!(
+            "Chunk {} (L{} {},{},{}): {} points → leaf depth {} (extra {})",
+            chunk_idx,
+            chunk.level,
+            chunk.gx,
+            chunk.gy,
+            chunk.gz,
+            n_points,
+            leaf_depth,
+            extra_levels
+        );
+
+        // Classify each point into its leaf voxel at the global leaf depth.
+        // This uses point_to_key on round-tripped world coordinates so the
+        // voxel assignment matches what the per-leaf path would compute.
+        let mut leaves: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
+        for raw in points {
+            let wx = raw.x as f64 * self.scale_x + self.offset_x;
+            let wy = raw.y as f64 * self.scale_y + self.offset_y;
+            let wz = raw.z as f64 * self.scale_z + self.offset_z;
+            let key = point_to_key(
+                wx,
+                wy,
+                wz,
+                self.cx,
+                self.cy,
+                self.cz,
+                self.halfsize,
+                leaf_depth,
+            );
+            leaves.entry(key).or_default().push(raw);
+        }
+
+        // Run the bottom-up grid-sample loop, stopping at chunk.level.
+        // bottom_up_levels writes every produced node to its canonical temp
+        // file path, so the chunk's sub-octree is on disk after this returns.
+        self.bottom_up_levels(leaves, leaf_depth, chunk.level, config)
+    }
+
     /// Chunked build. Per-chunk in-memory build, then merge across chunks
     /// at coarse levels up to the global root.
     fn build_node_map_chunked(
@@ -2104,6 +2241,28 @@ mod tests {
         // Count uncovered cells: should be 64 - 8 - 1 = 55.
         let uncovered = lut.iter().filter(|&&c| c == u32::MAX).count();
         assert_eq!(uncovered, 55);
+    }
+
+    #[test]
+    fn chunk_local_extra_levels_basic() {
+        // ≤ MAX_LEAF_POINTS → no subdivision needed
+        assert_eq!(chunk_local_extra_levels(0), 0);
+        assert_eq!(chunk_local_extra_levels(1), 0);
+        assert_eq!(chunk_local_extra_levels(MAX_LEAF_POINTS), 0);
+
+        // Just above MAX_LEAF_POINTS → 1 extra level (8 leaves)
+        assert_eq!(chunk_local_extra_levels(MAX_LEAF_POINTS + 1), 1);
+        assert_eq!(chunk_local_extra_levels(8 * MAX_LEAF_POINTS), 1);
+
+        // 8x leaf budget → still 1 extra level (avg = MAX_LEAF_POINTS)
+        // 8x + 1 → needs 2 extra levels
+        assert_eq!(chunk_local_extra_levels(8 * MAX_LEAF_POINTS + 1), 2);
+
+        // 36M points (~ Phase 2a chunk target) → ceil(log8(360)) = 3
+        assert_eq!(chunk_local_extra_levels(36_000_000), 3);
+
+        // 100M points → ceil(log8(1000)) = 4
+        assert_eq!(chunk_local_extra_levels(100_000_000), 4);
     }
 
     #[test]
