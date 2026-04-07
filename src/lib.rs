@@ -28,6 +28,16 @@ pub(crate) mod octree;
 pub(crate) mod validate;
 pub(crate) mod writer;
 
+/// Hierarchical counting-sort chunk planner (Schütz et al. 2020).
+///
+/// This is a measurement / planning tool used by the `analyze` CLI
+/// subcommand to evaluate the chunked-build approach against real datasets.
+/// Not yet wired into the main conversion pipeline.
+pub(crate) mod chunking;
+
+/// Re-exported chunk plan types so the binary can build a report from them.
+pub use chunking::{ChunkPlan, PlannedChunk, compute_chunk_target, select_grid_size};
+
 #[cfg(feature = "tools")]
 pub mod tools;
 
@@ -224,6 +234,29 @@ impl Pipeline<Scanned> {
 }
 
 impl Pipeline<Validated> {
+    /// Run the hierarchical counting-sort chunk planner without proceeding
+    /// through `distribute`/`build`/`write`.
+    ///
+    /// This is a measurement tool: it returns the chunk plan that the
+    /// chunked-build path **would** produce for the given inputs, without
+    /// actually generating any chunks. Useful for evaluating the chunking
+    /// algorithm against real datasets before committing to the full
+    /// chunked-build rewrite.
+    ///
+    /// Pass `chunk_target_override = None` to use the dynamically-derived
+    /// target (recommended), or `Some(n)` to do what-if analysis with a
+    /// fixed target size.
+    pub fn analyze_chunking(&self, chunk_target_override: Option<u64>) -> Result<ChunkPlan> {
+        let validated = self.inner.validated.as_ref().expect("validated");
+        Ok(chunking::analyze_chunking(
+            &self.inner.input_files,
+            &self.inner.scan_results,
+            validated,
+            &self.inner.config,
+            chunk_target_override,
+        )?)
+    }
+
     /// Distribute all points to leaf voxels on disk.
     pub fn distribute(mut self) -> Result<Pipeline<Distributed>> {
         let validated = self.inner.validated.as_ref().unwrap();

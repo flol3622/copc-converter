@@ -1542,7 +1542,7 @@ mod tests {
         p.write(&mut single_buf).unwrap();
 
         let mut bulk_buf = Vec::new();
-        RawPoint::write_bulk(&[p.clone()], &mut bulk_buf).unwrap();
+        RawPoint::write_bulk(std::slice::from_ref(&p), &mut bulk_buf).unwrap();
 
         assert_eq!(
             single_buf, bulk_buf,
