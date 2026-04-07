@@ -610,7 +610,6 @@ pub struct OctreeBuilder {
     pub point_format: u8,
     /// Chunk plan computed by `distribute_chunked` and consumed by
     /// `build_node_map_chunked`. `None` for the per-leaf path.
-    #[allow(dead_code)] // populated and read in incremental Phase 2b commits
     pub(crate) chunked_plan: Option<crate::chunking::ChunkPlan>,
 }
 
@@ -1249,7 +1248,9 @@ impl OctreeBuilder {
         );
 
         // Per-leaf path: walk all the way to global root (min_level = 0).
-        self.bottom_up_levels(nodes, actual_max_depth, 0, config)
+        // Emit per-level progress so the existing per-leaf progress bar
+        // (one tick per level) keeps working unchanged.
+        self.bottom_up_levels(nodes, actual_max_depth, 0, true, config)
     }
 
     /// Bottom-up grid-sample loop over an in-memory `nodes` HashMap.
@@ -1264,17 +1265,25 @@ impl OctreeBuilder {
     /// has produced parents at `min_level`, leaving any coarser ancestors
     /// to a later merge step (chunked path: each chunk's bottom-up build
     /// stops at the chunk's root level).
+    ///
+    /// `report_progress` controls whether per-level `StageProgress` events
+    /// are emitted. The per-leaf path passes `true` (the level loop is the
+    /// main unit of progress). The chunked path passes `false` because its
+    /// outer stage tracks chunks-done, not levels-done.
     fn bottom_up_levels(
         &self,
         mut nodes: HashMap<VoxelKey, Vec<RawPoint>>,
         actual_max_depth: u32,
         min_level: u32,
+        report_progress: bool,
         config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
         for d in (min_level..actual_max_depth).rev() {
-            config.report(crate::ProgressEvent::StageProgress {
-                done: (actual_max_depth - d) as u64,
-            });
+            if report_progress {
+                config.report(crate::ProgressEvent::StageProgress {
+                    done: (actual_max_depth - d) as u64,
+                });
+            }
             let level_points: usize = nodes
                 .iter()
                 .filter(|(k, _)| k.level as u32 == d + 1)
@@ -1917,7 +1926,6 @@ impl OctreeBuilder {
     }
 
     /// Read all `RawPoint`s from a chunk file in one shot.
-    #[allow(dead_code)] // wired in by step 5/6 of Phase 2b
     fn read_chunk_file(&self, chunk_idx: u32) -> Result<Vec<RawPoint>> {
         let path = chunk_canonical_path(&self.tmp_dir.join("chunks"), chunk_idx);
         let f = File::open(&path).with_context(|| format!("opening chunk file {:?}", path))?;
@@ -1938,7 +1946,6 @@ impl OctreeBuilder {
     /// `[chunk.level, chunk_leaf_depth]` that the chunk produced. The chunk
     /// root at `chunk.level` is included; coarser ancestors are left to the
     /// merge step.
-    #[allow(dead_code)] // wired in by step 5/6 of Phase 2b
     fn build_chunk_in_memory(
         &self,
         chunk: &crate::chunking::PlannedChunk,
@@ -1999,17 +2006,382 @@ impl OctreeBuilder {
         // Run the bottom-up grid-sample loop, stopping at chunk.level.
         // bottom_up_levels writes every produced node to its canonical temp
         // file path, so the chunk's sub-octree is on disk after this returns.
-        self.bottom_up_levels(leaves, leaf_depth, chunk.level, config)
+        // Suppress per-level progress events: the chunked-build outer stage
+        // tracks chunks-done, not levels.
+        self.bottom_up_levels(leaves, leaf_depth, chunk.level, false, config)
+    }
+
+    /// Merge chunk roots upward from `max_chunk_level` to the global root.
+    ///
+    /// This is the chunked-build equivalent of the per-leaf path's coarse
+    /// `bottom_up_on_disk` levels. Starting from a set of "chunk root" keys
+    /// (one per chunk, at varying levels), we walk levels in reverse and at
+    /// each level group nodes by their parent and run `grid_sample` to
+    /// produce the parent.
+    ///
+    /// **Variable-level chunks are handled naturally**: when level `d`'s
+    /// children are processed, the set may include both chunk roots that
+    /// happened to be at level `d+1` AND parents that the merge produced
+    /// from level `d+2`. They're treated identically — they're all just
+    /// "nodes at level `d+1`, ready to be grouped by their level-`d` parent".
+    ///
+    /// Modifies node files on disk: when a parent is produced from its
+    /// children, the children's files are rewritten with the points that
+    /// did NOT get promoted to the parent (`grid_sample` returns this
+    /// "remaining" set per child).
+    ///
+    /// `chunk_root_keys` lists every chunk root produced by the per-chunk
+    /// build phase. Returns the merge-produced parent keys at every level
+    /// from 0 up to `max_chunk_level - 1`.
+    fn merge_chunk_tops(
+        &self,
+        chunk_root_keys: &[VoxelKey],
+        config: &crate::PipelineConfig,
+    ) -> Result<Vec<VoxelKey>> {
+        if chunk_root_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Organise chunk roots by level. Like bottom_up_on_disk, we use a
+        // HashSet per level so we never get duplicate keys (which can happen
+        // if two chunks somehow share the same root key — should not occur
+        // for a well-formed plan, but defensive).
+        let mut keys_by_level: HashMap<i32, HashSet<VoxelKey>> = HashMap::new();
+        for k in chunk_root_keys {
+            keys_by_level.entry(k.level).or_default().insert(*k);
+        }
+
+        let max_chunk_level: i32 = keys_by_level.keys().copied().max().unwrap_or(0);
+        debug!(
+            "Merge chunk tops: {} chunk roots, max_chunk_level={}",
+            chunk_root_keys.len(),
+            max_chunk_level
+        );
+
+        // Reuse the same per-point cost estimate as bottom_up_on_disk's
+        // small-parent batching: input vec + per-child remaining.
+        const MEM_PER_POINT: u64 =
+            (std::mem::size_of::<(usize, RawPoint)>() + std::mem::size_of::<RawPoint>()) as u64;
+
+        let mut all_new_parents: Vec<VoxelKey> = Vec::new();
+
+        // Walk from the deepest chunk level down to level 0. d is the parent
+        // level we're producing in this iteration.
+        for d in (0..max_chunk_level).rev() {
+            let child_level = d + 1;
+            let child_keys: Vec<VoxelKey> = match keys_by_level.get(&child_level) {
+                Some(v) => v.iter().copied().collect(),
+                None => continue,
+            };
+            if child_keys.is_empty() {
+                continue;
+            }
+
+            // Group children at level d+1 by their parent at level d.
+            let mut parent_children: HashMap<VoxelKey, Vec<VoxelKey>> = HashMap::new();
+            for ck in &child_keys {
+                if let Some(parent) = ck.parent() {
+                    parent_children.entry(parent).or_default().push(*ck);
+                }
+            }
+            if parent_children.is_empty() {
+                continue;
+            }
+
+            // Estimate per-parent memory cost from the children's file sizes
+            // and split into "small" (fit in budget) vs "large" (don't).
+            // For chunked merge, large parents shouldn't happen because
+            // chunks are sized to fit, but be defensive.
+            let mut small_parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = Vec::new();
+            let mut large_parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = Vec::new();
+
+            for (parent, children) in parent_children {
+                let child_bytes: u64 = children
+                    .iter()
+                    .map(|ck| self.node_path(ck).metadata().map_or(0, |m| m.len()))
+                    .sum();
+                let est_points = child_bytes / RawPoint::BYTE_SIZE as u64;
+                let est_mem = est_points * MEM_PER_POINT;
+                if est_mem > config.memory_budget {
+                    large_parents.push((parent, children, est_mem));
+                } else {
+                    small_parents.push((parent, children, est_mem));
+                }
+            }
+
+            debug!(
+                "Merge level {}→{}: {} parents ({} small, {} large), budget={} MB",
+                child_level,
+                d,
+                small_parents.len() + large_parents.len(),
+                small_parents.len(),
+                large_parents.len(),
+                config.memory_budget / 1_048_576,
+            );
+
+            if !large_parents.is_empty() {
+                // Should not happen with a well-formed chunk plan, but if it
+                // does, fall back to grid_sample_streaming which is bounded
+                // (one child at a time, ~80 MB per parent for the grid set
+                // and accumulator).
+                for (parent, children, est_mem) in &large_parents {
+                    debug!(
+                        "  STREAMING merge parent {:?}: {} children, est {} MB",
+                        parent,
+                        children.len(),
+                        est_mem / 1_048_576
+                    );
+                    self.grid_sample_streaming(parent, children)?;
+                    all_new_parents.push(*parent);
+                    keys_by_level.entry(d).or_default().insert(*parent);
+                }
+            }
+
+            // Sort small parents by descending estimated memory so the
+            // batching greedy stays balanced.
+            small_parents.sort_by(|a, b| b.2.cmp(&a.2));
+
+            let mut batch_start = 0;
+            while batch_start < small_parents.len() {
+                let mut batch_mem: u64 = 0;
+                let mut batch_end = batch_start;
+                while batch_end < small_parents.len() {
+                    if batch_end > batch_start
+                        && batch_mem + small_parents[batch_end].2 > config.memory_budget
+                    {
+                        break;
+                    }
+                    batch_mem += small_parents[batch_end].2;
+                    batch_end += 1;
+                }
+
+                let batch = &small_parents[batch_start..batch_end];
+                debug!(
+                    "  Merge batch: {} parents, est {} MB",
+                    batch.len(),
+                    batch_mem / 1_048_576,
+                );
+                batch
+                    .par_iter()
+                    .map(|(parent, children, _)| -> Result<()> {
+                        let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
+                        for (ci, ck) in children.iter().enumerate() {
+                            for p in self.read_node(ck)? {
+                                all_pts.push((ci, p));
+                            }
+                        }
+                        if all_pts.is_empty() {
+                            return Ok(());
+                        }
+                        let (parent_pts, per_child) =
+                            self.grid_sample(parent, all_pts, children.len());
+                        // Rewrite each child with its remaining points.
+                        for (ci, ck) in children.iter().enumerate() {
+                            self.write_node_to_temp(ck, &per_child[ci])?;
+                        }
+                        if !parent_pts.is_empty() {
+                            self.write_node_to_temp(parent, &parent_pts)?;
+                        }
+                        Ok(())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                for (parent, _, _) in &small_parents[batch_start..batch_end] {
+                    all_new_parents.push(*parent);
+                    keys_by_level.entry(d).or_default().insert(*parent);
+                }
+                batch_start = batch_end;
+            }
+
+            // Report progress: one tick per merged level (the caller knows
+            // the total via max_chunk_level).
+            config.report(crate::ProgressEvent::StageProgress {
+                done: (max_chunk_level - d) as u64,
+            });
+        }
+
+        Ok(all_new_parents)
     }
 
     /// Chunked build. Per-chunk in-memory build, then merge across chunks
     /// at coarse levels up to the global root.
+    ///
+    /// See `docs/phase-2b-chunked-build.md` §4.3-4.4 for the design.
     fn build_node_map_chunked(
         &self,
-        _config: &crate::PipelineConfig,
+        config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
-        // Implemented incrementally — see docs/phase-2b-chunked-build.md §4.3-4.4.
-        anyhow::bail!("chunked build not yet implemented")
+        let plan = self
+            .chunked_plan
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("build_node_map_chunked called without a chunk plan"))?;
+
+        let n_chunks = plan.chunks.len();
+        if n_chunks == 0 {
+            info!("Chunked build: no chunks (empty input?)");
+            return Ok(Vec::new());
+        }
+
+        info!(
+            "Chunked build: {} chunks, max_chunk_level={}",
+            n_chunks,
+            plan.chunks.iter().map(|c| c.level).max().unwrap_or(0)
+        );
+
+        // ---- Phase 1: per-chunk in-memory build ----
+        //
+        // Process chunks in batches sized by memory budget. Within each batch,
+        // chunks run fully in parallel via rayon. Per-chunk peak working set
+        // estimate: ~200 B/pt (input vec + leaves HashMap + grid_sample
+        // input/output + scratch). Conservative; matches design §9.4.
+        const PER_CHUNK_BYTES_PER_POINT: u64 = 200;
+
+        // Sort chunks by descending point count so the greedy batching stays
+        // balanced (largest chunks first, smaller ones fill the gaps).
+        let mut chunks_indexed: Vec<(u32, &crate::chunking::PlannedChunk)> = plan
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i as u32, c))
+            .collect();
+        chunks_indexed.sort_by(|a, b| b.1.point_count.cmp(&a.1.point_count));
+
+        config.report(crate::ProgressEvent::StageStart {
+            name: "Building",
+            total: n_chunks as u64,
+        });
+
+        let chunks_done = AtomicU64::new(0);
+        let mut all_chunk_node_keys: Vec<VoxelKey> = Vec::new();
+        let mut chunk_root_keys: Vec<VoxelKey> = Vec::new();
+
+        let mut batch_start = 0;
+        while batch_start < chunks_indexed.len() {
+            let mut batch_mem: u64 = 0;
+            let mut batch_end = batch_start;
+            while batch_end < chunks_indexed.len() {
+                let est_mem = chunks_indexed[batch_end].1.point_count * PER_CHUNK_BYTES_PER_POINT;
+                // Always include at least one chunk per batch, even if it
+                // exceeds the budget on its own (better to OOM honestly than
+                // to hang forever in an empty batch).
+                if batch_end > batch_start && batch_mem + est_mem > config.memory_budget {
+                    break;
+                }
+                batch_mem += est_mem;
+                batch_end += 1;
+            }
+
+            let batch = &chunks_indexed[batch_start..batch_end];
+            debug!(
+                "Chunked build batch: {} chunks, est {} MB",
+                batch.len(),
+                batch_mem / 1_048_576
+            );
+
+            // Process this batch in parallel.
+            let batch_results: Vec<Vec<(VoxelKey, usize)>> = batch
+                .par_iter()
+                .map(|(chunk_idx, chunk)| -> Result<Vec<(VoxelKey, usize)>> {
+                    let nodes = self.build_chunk_in_memory(chunk, *chunk_idx, config)?;
+                    let done = chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    config.report(crate::ProgressEvent::StageProgress { done });
+                    Ok(nodes)
+                })
+                .collect::<Result<_>>()?;
+
+            // Collect node keys produced by this batch.
+            for ((_chunk_idx, chunk), nodes) in batch.iter().zip(batch_results.into_iter()) {
+                let chunk_level_i32 = chunk.level as i32;
+                for (k, _) in &nodes {
+                    all_chunk_node_keys.push(*k);
+                    if k.level == chunk_level_i32 {
+                        chunk_root_keys.push(*k);
+                    }
+                }
+            }
+
+            batch_start = batch_end;
+        }
+
+        debug!(
+            "Per-chunk build done: {} chunk nodes, {} chunk roots",
+            all_chunk_node_keys.len(),
+            chunk_root_keys.len()
+        );
+
+        // ---- Phase 2: merge chunk tops up to global root ----
+        let merge_parents = self.merge_chunk_tops(&chunk_root_keys, config)?;
+        debug!("Merge step produced {} parent nodes", merge_parents.len());
+
+        config.report(crate::ProgressEvent::StageDone);
+
+        // ---- Phase 3: assemble the result list ----
+        //
+        // The result is the union of per-chunk nodes + merge parents.
+        // After the merge step, chunk root files have been rewritten with
+        // their post-merge point counts (the points that did NOT get
+        // promoted), so we re-read counts from disk for *every* node to
+        // ensure we report the post-merge state, not the per-chunk-build
+        // intermediate state.
+        let mut all_keys: Vec<VoxelKey> = all_chunk_node_keys;
+        all_keys.extend(merge_parents);
+        // Deduplicate (a chunk root that's also at level 0 would be counted
+        // twice — should not occur in practice but defensive).
+        all_keys.sort_unstable_by_key(|k| (k.level, k.x, k.y, k.z));
+        all_keys.dedup();
+
+        let mut result: Vec<(VoxelKey, usize)> = all_keys
+            .par_iter()
+            .map(|k| -> Result<(VoxelKey, usize)> {
+                let n = self
+                    .node_path(k)
+                    .metadata()
+                    .map_or(0, |m| m.len() as usize / RawPoint::BYTE_SIZE);
+                Ok((*k, n))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Drop empty nodes (e.g. chunk roots whose points were all promoted
+        // by the merge and never had any remaining points written back).
+        result.retain(|(_, count)| *count > 0);
+
+        let total_pts: usize = result.iter().map(|(_, c)| *c).sum();
+        info!(
+            "Chunked build: {} nodes, {} total points (input: {})",
+            result.len(),
+            total_pts,
+            self.total_points
+        );
+        if total_pts as u64 != self.total_points {
+            debug!(
+                "COPC contains {} points vs {} from input headers (diff {}). \
+                 Input LAZ headers sometimes report inaccurate point counts.",
+                total_pts,
+                self.total_points,
+                self.total_points as i64 - total_pts as i64
+            );
+        }
+
+        // Ensure every ancestor of every data node is present (the writer
+        // requires zero-point ancestors so validators can traverse top-down).
+        // Same logic as the per-leaf path.
+        let mut present: HashSet<VoxelKey> = result.iter().map(|(k, _)| *k).collect();
+        let mut extra: Vec<VoxelKey> = Vec::new();
+        for (key, _) in &result {
+            let mut k = *key;
+            while let Some(parent) = k.parent() {
+                if present.insert(parent) {
+                    extra.push(parent);
+                }
+                k = parent;
+            }
+        }
+        for k in extra {
+            result.push((k, 0));
+        }
+        result.sort_by_key(|(k, _)| k.level);
+
+        Ok(result)
     }
 }
 
