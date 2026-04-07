@@ -928,3 +928,205 @@ fn temporal_index_readable_by_streaming_crate() {
 
     let _ = std::fs::remove_file(output);
 }
+
+// ---------------------------------------------------------------------------
+// Chunked build strategy tests (Phase 2b)
+//
+// The chunked path produces equivalent COPC output (same point set, same
+// hierarchy shape) to the per-leaf path but is NOT bit-identical because
+// grid_sample tie-breaking depends on point ordering at the leaf level. We
+// verify the chunked path produces a valid, point-conserving COPC file
+// rather than comparing against a fixed reference byte-for-byte.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn chunked_strategy_produces_valid_copc() {
+    let output = Path::new("tests/data/test_chunked_basic.copc.laz");
+    run_converter_with_args(
+        Path::new("tests/data/input.laz"),
+        output,
+        &["--build-strategy", "chunked"],
+    );
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let reference = read_file(Path::new("tests/data/untwine_reference.copc.laz"));
+    let ref_header = read_las_header(&reference);
+
+    // Same point format and total point count as the reference.
+    assert_eq!(header.point_format, ref_header.point_format, "point format");
+    assert_eq!(
+        header.total_points, ref_header.total_points,
+        "total points must match reference"
+    );
+
+    // Same scale and offset (both derived from input file).
+    assert_eq!(header.scale_x, ref_header.scale_x, "scale_x");
+    assert_eq!(header.scale_y, ref_header.scale_y, "scale_y");
+    assert_eq!(header.scale_z, ref_header.scale_z, "scale_z");
+    assert_eq!(header.offset_x, ref_header.offset_x, "offset_x");
+    assert_eq!(header.offset_y, ref_header.offset_y, "offset_y");
+    assert_eq!(header.offset_z, ref_header.offset_z, "offset_z");
+
+    // Bounds should be within tolerance of the reference.
+    let tol = 0.01;
+    assert!((header.min_x - ref_header.min_x).abs() < tol, "min_x");
+    assert!((header.max_x - ref_header.max_x).abs() < tol, "max_x");
+
+    // Must have at least one EVLR (the COPC hierarchy).
+    assert!(header.num_evlrs >= 1, "must have at least 1 EVLR");
+
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
+fn chunked_strategy_preserves_all_points() {
+    let output = Path::new("tests/data/test_chunked_conservation.copc.laz");
+    run_converter_with_args(
+        Path::new("tests/data/input.laz"),
+        output,
+        &["--build-strategy", "chunked"],
+    );
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let hier = read_hierarchy(&data);
+
+    // Hierarchy must contain a root node at (0, 0, 0, 0).
+    let root = VoxelKey {
+        level: 0,
+        x: 0,
+        y: 0,
+        z: 0,
+    };
+    assert!(
+        hier.iter().any(|e| e.key == root),
+        "chunked hierarchy must have root node"
+    );
+
+    // Sum of point counts across all data nodes must equal the header total.
+    let hier_total: i64 = hier
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as i64)
+        .sum();
+    assert_eq!(
+        hier_total, header.total_points as i64,
+        "chunked hierarchy point sum must match header"
+    );
+
+    // Every data node must have a valid offset and byte_size.
+    for entry in &hier {
+        if entry.point_count > 0 {
+            assert!(
+                entry.offset > 0,
+                "chunked node {:?} must have offset",
+                entry.key
+            );
+            assert!(
+                entry.byte_size > 0,
+                "chunked node {:?} must have byte_size",
+                entry.key
+            );
+        }
+    }
+
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
+fn chunked_strategy_deterministic_within_strategy() {
+    // Two runs of the chunked path on the same input must produce the same
+    // hierarchy shape and point counts. Cross-strategy bit-identical is NOT
+    // required (and isn't expected, since per-leaf and chunked use different
+    // intermediate representations); but within-strategy determinism IS
+    // required for reproducible builds.
+    let output1 = Path::new("tests/data/test_chunked_det_1.copc.laz");
+    let output2 = Path::new("tests/data/test_chunked_det_2.copc.laz");
+    let input = Path::new("tests/data/input.laz");
+
+    run_converter_with_args(input, output1, &["--build-strategy", "chunked"]);
+    run_converter_with_args(input, output2, &["--build-strategy", "chunked"]);
+
+    let data1 = read_file(output1);
+    let data2 = read_file(output2);
+
+    let h1 = read_las_header(&data1);
+    let h2 = read_las_header(&data2);
+
+    assert_eq!(h1.total_points, h2.total_points, "point count");
+    assert_eq!(h1.point_format, h2.point_format, "point format");
+
+    // Hierarchy node count and per-key point counts must match.
+    let hier1 = read_hierarchy(&data1);
+    let hier2 = read_hierarchy(&data2);
+    assert_eq!(hier1.len(), hier2.len(), "hierarchy node count");
+
+    let map1: HashMap<_, _> = hier1
+        .iter()
+        .map(|e| (e.key.clone(), e.point_count))
+        .collect();
+    for e in &hier2 {
+        let count1 = map1.get(&e.key).expect("node missing in run 1");
+        assert_eq!(
+            *count1, e.point_count,
+            "node {:?} point count mismatch",
+            e.key
+        );
+    }
+
+    let _ = std::fs::remove_file(output1);
+    let _ = std::fs::remove_file(output2);
+}
+
+#[test]
+fn chunked_and_perleaf_have_same_point_count() {
+    // Cross-strategy comparison: the chunked and per-leaf paths produce
+    // *different but equivalent* COPC files. They should NOT be byte-identical
+    // (per the design doc) but they MUST contain the same set of points,
+    // verified here by checking total point count equality.
+    let output_chunked = Path::new("tests/data/test_xstrategy_chunked.copc.laz");
+    let output_perleaf = Path::new("tests/data/test_xstrategy_perleaf.copc.laz");
+    let input = Path::new("tests/data/input.laz");
+
+    run_converter_with_args(input, output_chunked, &["--build-strategy", "chunked"]);
+    run_converter_with_args(input, output_perleaf, &["--build-strategy", "per-leaf"]);
+
+    let data_c = read_file(output_chunked);
+    let data_p = read_file(output_perleaf);
+
+    let h_c = read_las_header(&data_c);
+    let h_p = read_las_header(&data_p);
+
+    assert_eq!(
+        h_c.total_points, h_p.total_points,
+        "total point count must agree across strategies"
+    );
+
+    // Same scale, offset, point format.
+    assert_eq!(h_c.point_format, h_p.point_format, "point format");
+    assert_eq!(h_c.scale_x, h_p.scale_x, "scale_x");
+    assert_eq!(h_c.scale_y, h_p.scale_y, "scale_y");
+    assert_eq!(h_c.scale_z, h_p.scale_z, "scale_z");
+
+    // Hierarchy point sums must agree.
+    let hier_c = read_hierarchy(&data_c);
+    let hier_p = read_hierarchy(&data_p);
+    let total_c: i64 = hier_c
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as i64)
+        .sum();
+    let total_p: i64 = hier_p
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as i64)
+        .sum();
+    assert_eq!(
+        total_c, total_p,
+        "hierarchy point sums must agree across strategies"
+    );
+
+    let _ = std::fs::remove_file(output_chunked);
+    let _ = std::fs::remove_file(output_perleaf);
+}
