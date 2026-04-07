@@ -5,7 +5,7 @@
 //! The conversion pipeline is enforced at compile time via typestate:
 //!
 //! ```no_run
-//! use copc_converter::{Pipeline, PipelineConfig};
+//! use copc_converter::{BuildStrategy, Pipeline, PipelineConfig};
 //!
 //! let config = PipelineConfig {
 //!     memory_budget: 12_884_901_888,
@@ -13,6 +13,7 @@
 //!     temporal_index: false,
 //!     temporal_stride: 1000,
 //!     progress: None,
+//!     build_strategy: BuildStrategy::PerLeaf,
 //! };
 //! let files = copc_converter::collect_input_files("input.laz".into()).unwrap();
 //!
@@ -154,6 +155,31 @@ pub trait ProgressObserver: Send + Sync {
 // PipelineConfig
 // ---------------------------------------------------------------------------
 
+/// Strategy for the distribute + build phases.
+///
+/// The two strategies produce *equivalent* COPC output (same point set,
+/// same hierarchy shape) but use very different intermediate representations
+/// and I/O patterns. Cross-strategy output may not be byte-identical because
+/// `grid_sample` tie-breaking depends on point ordering at the leaf level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BuildStrategy {
+    /// Original per-leaf-temp-file build with multi-pass disk I/O.
+    ///
+    /// Lower per-chunk memory pressure, but writes hundreds of thousands of
+    /// tiny temp files and reads them back multiple times during build.
+    /// Catastrophic on network filesystems (EFS / NFS).
+    #[default]
+    PerLeaf,
+    /// Chunked build (Schütz et al. 2020): counting-sort into ~thousands of
+    /// medium chunks, independent per-chunk in-memory build, merge at coarse
+    /// levels.
+    ///
+    /// Faster overall, dramatically faster on network filesystems because the
+    /// temp directory contains only ~thousands of files (one per chunk),
+    /// each written once sequentially and read once.
+    Chunked,
+}
+
 /// Configuration for the conversion pipeline.
 pub struct PipelineConfig {
     /// Effective memory budget in bytes.
@@ -166,6 +192,10 @@ pub struct PipelineConfig {
     pub temporal_stride: u32,
     /// Optional progress observer for reporting pipeline progress.
     pub progress: Option<std::sync::Arc<dyn ProgressObserver>>,
+    /// Strategy for the distribute + build phases. Defaults to
+    /// [`BuildStrategy::PerLeaf`] for backward compatibility; the chunked
+    /// path is opt-in until it has been validated against production datasets.
+    pub build_strategy: BuildStrategy,
 }
 
 impl PipelineConfig {
@@ -260,7 +290,7 @@ impl Pipeline<Validated> {
     /// Distribute all points to leaf voxels on disk.
     pub fn distribute(mut self) -> Result<Pipeline<Distributed>> {
         let validated = self.inner.validated.as_ref().unwrap();
-        let builder =
+        let mut builder =
             OctreeBuilder::from_scan(&self.inner.scan_results, validated, &self.inner.config)?;
 
         let total_points: u64 = self.inner.scan_results.iter().map(|r| r.point_count).sum();

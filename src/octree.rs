@@ -368,6 +368,10 @@ pub struct OctreeBuilder {
     pub wkt_crs: Option<Vec<u8>>,
     /// COPC output point format (6, 7, or 8), derived from input files.
     pub point_format: u8,
+    /// Chunk plan computed by `distribute_chunked` and consumed by
+    /// `build_node_map_chunked`. `None` for the per-leaf path.
+    #[allow(dead_code)] // populated and read in incremental Phase 2b commits
+    pub(crate) chunked_plan: Option<crate::chunking::ChunkPlan>,
 }
 
 impl OctreeBuilder {
@@ -469,6 +473,7 @@ impl OctreeBuilder {
             tmp_dir,
             wkt_crs: validated.wkt_crs.clone(),
             point_format: validated.point_format,
+            chunked_plan: None,
         })
     }
 
@@ -550,12 +555,25 @@ impl OctreeBuilder {
         Ok(())
     }
 
-    /// Pass 2: assign all points to leaf temp files.
+    /// Pass 2: dispatch to the configured build strategy.
+    ///
+    /// Per-leaf assigns each point to a leaf voxel temp file and runs a
+    /// multi-pass disk-backed bottom-up build later. Chunked partitions
+    /// points into medium chunks via counting sort and runs a per-chunk
+    /// in-memory build later. See `BuildStrategy`.
+    pub fn distribute(&mut self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
+        match config.build_strategy {
+            crate::BuildStrategy::PerLeaf => self.distribute_per_leaf(input_files, config),
+            crate::BuildStrategy::Chunked => self.distribute_chunked(input_files, config),
+        }
+    }
+
+    /// Per-leaf distribute: assign all points to leaf temp files.
     ///
     /// Uses `read_all_points_into` (fast parallel decompression) when the file
     /// fits within half the memory budget; otherwise falls back to batched reads.
     /// Key assignment and coordinate conversion are always parallelized via rayon.
-    pub fn distribute(&self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
+    fn distribute_per_leaf(&self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
         let flush_every =
             ((config.memory_budget / 4) as usize / RawPoint::BYTE_SIZE).clamp(10_000, 500_000);
         debug!(
@@ -852,7 +870,17 @@ impl OctreeBuilder {
         Ok(())
     }
 
-    /// Build the full node hierarchy.
+    /// Build the full node hierarchy. Dispatches to the configured strategy.
+    ///
+    /// Returns (VoxelKey, point_count) for every node in the hierarchy.
+    pub fn build_node_map(&self, config: &crate::PipelineConfig) -> Result<Vec<(VoxelKey, usize)>> {
+        match config.build_strategy {
+            crate::BuildStrategy::PerLeaf => self.build_node_map_per_leaf(config),
+            crate::BuildStrategy::Chunked => self.build_node_map_chunked(config),
+        }
+    }
+
+    /// Per-leaf build: normalize leaves, then bottom-up ancestor building.
     ///
     /// Phase 0: normalize leaves in parallel.
     /// Phase 1: determine actual max depth.
@@ -861,9 +889,10 @@ impl OctreeBuilder {
     ///                processed in RAM (one disk read + one disk write total).
     ///   Slow path  – level-by-level with disk I/O, but without redundant directory
     ///                scans (keys are tracked in a per-level map).
-    ///
-    /// Returns (VoxelKey, point_count) for every node in the hierarchy.
-    pub fn build_node_map(&self, config: &crate::PipelineConfig) -> Result<Vec<(VoxelKey, usize)>> {
+    fn build_node_map_per_leaf(
+        &self,
+        config: &crate::PipelineConfig,
+    ) -> Result<Vec<(VoxelKey, usize)>> {
         // Phase 0
         self.normalize_leaves(config.memory_budget, config)?;
 
@@ -1440,6 +1469,35 @@ impl OctreeBuilder {
 
         let parent_pts = parent_pts.into_iter().map(|(_, p)| p).collect();
         (parent_pts, remaining)
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunked-build path (Schütz et al. 2020).
+    //
+    // See docs/phase-2b-chunked-build.md for the full design. The chunked
+    // path replaces both `distribute_per_leaf` and `build_node_map_per_leaf`,
+    // routing intermediate state via `self.chunked_plan`.
+    // -----------------------------------------------------------------------
+
+    /// Chunked distribute. Computes the chunk plan via the counting-sort
+    /// analyzer, then writes each input point into its assigned chunk file.
+    fn distribute_chunked(
+        &mut self,
+        _input_files: &[PathBuf],
+        _config: &PipelineConfig,
+    ) -> Result<()> {
+        // Implemented incrementally — see docs/phase-2b-chunked-build.md §4.1-4.2.
+        anyhow::bail!("chunked distribute not yet implemented")
+    }
+
+    /// Chunked build. Per-chunk in-memory build, then merge across chunks
+    /// at coarse levels up to the global root.
+    fn build_node_map_chunked(
+        &self,
+        _config: &crate::PipelineConfig,
+    ) -> Result<Vec<(VoxelKey, usize)>> {
+        // Implemented incrementally — see docs/phase-2b-chunked-build.md §4.3-4.4.
+        anyhow::bail!("chunked build not yet implemented")
     }
 }
 

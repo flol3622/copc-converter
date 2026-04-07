@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use copc_converter::{
-    Pipeline, PipelineConfig, ProgressEvent, ProgressObserver, collect_input_files,
+    BuildStrategy, Pipeline, PipelineConfig, ProgressEvent, ProgressObserver, collect_input_files,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
@@ -44,6 +44,32 @@ struct Args {
     /// Maximum number of parallel threads. Default: all available cores
     #[arg(long)]
     threads: Option<usize>,
+
+    /// Build strategy. "per-leaf" (default, stable) writes one temp file per
+    /// leaf voxel and builds the octree level-by-level on disk. "chunked"
+    /// uses the Schütz et al. 2020 hierarchical counting-sort approach,
+    /// writing thousands of medium chunk files and building each chunk's
+    /// sub-octree in memory in parallel. "chunked" is faster overall and
+    /// dramatically faster on network filesystems (EFS, NFS).
+    #[arg(long, value_enum, default_value_t = BuildStrategyArg::PerLeaf)]
+    build_strategy: BuildStrategyArg,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BuildStrategyArg {
+    /// Original per-leaf-temp-file build (stable, default).
+    PerLeaf,
+    /// Chunked build using counting-sort (Schütz et al. 2020).
+    Chunked,
+}
+
+impl From<BuildStrategyArg> for BuildStrategy {
+    fn from(a: BuildStrategyArg) -> Self {
+        match a {
+            BuildStrategyArg::PerLeaf => BuildStrategy::PerLeaf,
+            BuildStrategyArg::Chunked => BuildStrategy::Chunked,
+        }
+    }
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -473,6 +499,7 @@ fn main() -> Result<()> {
         temporal_index: args.temporal_index,
         temporal_stride: args.temporal_stride,
         progress: Some(progress),
+        build_strategy: args.build_strategy.into(),
     };
 
     Pipeline::scan(&input_files, config)?
