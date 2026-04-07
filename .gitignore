@@ -15,6 +15,10 @@ tests/data/test_*.copc.laz
 # Claude Code local settings
 .claude/settings.local.json
 
+# Local k8s pod manifests for ad-hoc testing (contain PVC names, namespaces)
+pod.yaml
+pod*.yaml
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
