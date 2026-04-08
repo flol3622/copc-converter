@@ -85,6 +85,7 @@ let config = PipelineConfig {
     temporal_stride: 1000,
     progress: None, // or Some(Arc::new(your_observer))
     build_strategy: BuildStrategy::PerLeaf,
+    chunk_target_override: None,
 };
 
 Pipeline::scan(&files, config)?

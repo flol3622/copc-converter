@@ -53,6 +53,12 @@ struct Args {
     /// dramatically faster on network filesystems (EFS, NFS).
     #[arg(long, value_enum, default_value_t = BuildStrategyArg::PerLeaf)]
     build_strategy: BuildStrategyArg,
+
+    /// Hidden: override the chunked-build chunk target size in points.
+    /// Bypasses the dynamic memory-budget-based calculation. Primarily for
+    /// testing — force multiple chunks on a small input to exercise merge.
+    #[arg(long, hide = true)]
+    chunk_target: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -519,6 +525,7 @@ fn main() -> Result<()> {
         temporal_stride: args.temporal_stride,
         progress: Some(progress),
         build_strategy: args.build_strategy.into(),
+        chunk_target_override: args.chunk_target,
     };
 
     Pipeline::scan(&input_files, config)?

@@ -306,10 +306,24 @@ fn count_points(
                         break;
                     }
                     for p in &points {
+                        // Classify using the same round-tripped coordinates
+                        // the distribute phase will use, so the grid cell
+                        // counted here is exactly the cell the LUT will look
+                        // up for the same point at distribute time. Raw `p.x`
+                        // and `raw.x*scale+offset` can differ by up to half a
+                        // scale step due to LAS scale/offset rounding, which
+                        // would put boundary points in different cells and
+                        // cause point loss during build.
+                        let ix = ((p.x - builder.offset_x) / builder.scale_x).round() as i32;
+                        let iy = ((p.y - builder.offset_y) / builder.scale_y).round() as i32;
+                        let iz = ((p.z - builder.offset_z) / builder.scale_z).round() as i32;
+                        let wx = ix as f64 * builder.scale_x + builder.offset_x;
+                        let wy = iy as f64 * builder.scale_y + builder.offset_y;
+                        let wz = iz as f64 * builder.scale_z + builder.offset_z;
                         let key = point_to_key(
-                            p.x,
-                            p.y,
-                            p.z,
+                            wx,
+                            wy,
+                            wz,
                             builder.cx,
                             builder.cy,
                             builder.cz,

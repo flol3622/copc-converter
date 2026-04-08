@@ -14,6 +14,7 @@
 //!     temporal_stride: 1000,
 //!     progress: None,
 //!     build_strategy: BuildStrategy::PerLeaf,
+//!     chunk_target_override: None,
 //! };
 //! let files = copc_converter::collect_input_files("input.laz".into()).unwrap();
 //!
@@ -196,6 +197,11 @@ pub struct PipelineConfig {
     /// [`BuildStrategy::PerLeaf`] for backward compatibility; the chunked
     /// path is opt-in until it has been validated against production datasets.
     pub build_strategy: BuildStrategy,
+    /// Optional override for the chunked-build chunk target size (in points).
+    /// `None` uses the dynamic target derived from memory budget. Primarily
+    /// for testing — e.g. forcing multiple chunks on a small input to
+    /// exercise the merge step.
+    pub chunk_target_override: Option<u64>,
 }
 
 impl PipelineConfig {

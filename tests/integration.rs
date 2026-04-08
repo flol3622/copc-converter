@@ -1130,3 +1130,74 @@ fn chunked_and_perleaf_have_same_point_count() {
     let _ = std::fs::remove_file(output_chunked);
     let _ = std::fs::remove_file(output_perleaf);
 }
+
+/// Regression test for the Phase 2b point-loss bug.
+///
+/// The initial chunked distribute used inlined floor-based grid-cell math
+/// for speed, while `build_chunk_in_memory` used `point_to_key` for leaf
+/// classification. Floating-point precision at cell boundaries made the two
+/// disagree on a tiny fraction of points, which then landed in the wrong
+/// chunk and were silently lost (~0.13% in the first 42.8B-point production
+/// run).
+///
+/// This test forces a multi-chunk plan on the small 830K-point test input
+/// by passing `--chunk-target 100000` (hidden dev flag). That produces ~20
+/// chunks at varying levels, which exercises the merge step AND the
+/// classification boundary between chunks. With Fix 1 applied, total point
+/// count must be conserved exactly.
+#[test]
+fn chunked_multi_chunk_preserves_all_points() {
+    let output = Path::new("tests/data/test_chunked_multichunk.copc.laz");
+    let input = Path::new("tests/data/input.laz");
+
+    run_converter_with_args(
+        input,
+        output,
+        // --chunk-target 100000 forces ~8-21 chunks on the 830K-point input
+        // (well below the dynamic 1M minimum). This exercises the merge step
+        // and the cross-chunk classification boundary — the exact conditions
+        // that triggered the 0.13% point loss in the first production run.
+        &["--build-strategy", "chunked", "--chunk-target", "100000"],
+    );
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let hier = read_hierarchy(&data);
+
+    // Sum of hierarchy point counts must EXACTLY equal the LAS header total
+    // (no tolerance — point loss is always a bug).
+    let hier_total: u64 = hier
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as u64)
+        .sum();
+    assert_eq!(
+        hier_total, header.total_points,
+        "chunked hierarchy point sum ({}) must equal header total ({})",
+        hier_total, header.total_points
+    );
+
+    // The header total must also match the reference input's total point
+    // count. The untwine reference file is what we validate against.
+    let reference = read_file(Path::new("tests/data/untwine_reference.copc.laz"));
+    let ref_header = read_las_header(&reference);
+    assert_eq!(
+        header.total_points, ref_header.total_points,
+        "chunked total points ({}) must match reference input ({})",
+        header.total_points, ref_header.total_points
+    );
+
+    // Sanity: this test only means anything if we actually got multiple
+    // chunks. Verify by checking that the hierarchy has nodes at levels
+    // below the max (indicating a multi-level tree formed by the merge step).
+    let max_level = hier.iter().map(|e| e.key.level).max().unwrap_or(0);
+    assert!(
+        max_level >= 3,
+        "chunked_multi_chunk test must produce a multi-level tree \
+         (got max_level={}), otherwise the test isn't exercising what it's \
+         supposed to exercise",
+        max_level
+    );
+
+    let _ = std::fs::remove_file(output);
+}

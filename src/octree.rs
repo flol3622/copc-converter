@@ -1763,7 +1763,14 @@ impl OctreeBuilder {
         config: &PipelineConfig,
     ) -> Result<()> {
         // 1. Compute the chunk plan (counting + merge-sparse-cells).
-        let plan = crate::chunking::compute_chunk_plan(self, input_files, config, None)?;
+        //    `chunk_target_override` lets tests force multi-chunk plans on
+        //    small inputs; None = dynamic derivation from memory_budget.
+        let plan = crate::chunking::compute_chunk_plan(
+            self,
+            input_files,
+            config,
+            config.chunk_target_override,
+        )?;
         info!(
             "Chunked distribute: {} chunks, target {} points each, grid {}³",
             plan.chunks.len(),
@@ -1815,15 +1822,20 @@ impl OctreeBuilder {
             per_worker_cap
         );
 
-        // Pre-compute geometry for the inlined grid-cell math (per design
-        // §5: ~3× faster than calling point_to_key with a depth-9 loop).
+        // Grid geometry for cell index computation. We classify points via
+        // `point_to_key(..., grid_depth)` — the same octree descent that the
+        // per-chunk build uses via `point_to_key(..., leaf_depth)`. This
+        // guarantees bit-for-bit consistency between the LUT classification
+        // and the build-phase classification, so a point's chunk assignment
+        // and its leaf's chunk-root ancestor always agree. An earlier version
+        // used inlined floor-based math for speed (~3× faster), but
+        // floating-point precision at cell boundaries made it disagree with
+        // `point_to_key` on a tiny fraction of points (~0.13%), and those
+        // points ended up written to the wrong chunk where they were silently
+        // lost during build.
         let g = plan.grid_size;
-        let cube_size = self.halfsize * 2.0;
-        let cube_min_x = self.cx - self.halfsize;
-        let cube_min_y = self.cy - self.halfsize;
-        let cube_min_z = self.cz - self.halfsize;
-        let g_per_cube = g as f64 / cube_size;
-        let g_max = g as i64 - 1;
+        let grid_depth = plan.grid_depth;
+        let g_usize = g as usize;
 
         // Capture the LUT and per-worker file ranges for the parallel block.
         let files_per_worker = input_files.len().div_ceil(num_workers);
@@ -1875,27 +1887,34 @@ impl OctreeBuilder {
                             // the exact same int-coordinate representation.
                             let raw = self.convert_point(p);
 
-                            // Inline grid-cell computation: ~3× faster than
-                            // point_to_key. Use round-tripped world coords
-                            // (raw.x * scale + offset) so the cell assignment
-                            // matches what the per-chunk build will see when
-                            // it reads RawPoints back from the chunk file.
+                            // Classify to grid cell via point_to_key at the
+                            // grid depth, using round-tripped world coords.
+                            // This is the same function the per-chunk build
+                            // will call (at leaf_depth, which is chunk.level
+                            // + extra_levels); using it here guarantees the
+                            // chunk-root ancestor of every leaf produced
+                            // during build matches the chunk assignment made
+                            // during distribute — no boundary-point loss.
                             let wx = raw.x as f64 * self.scale_x + self.offset_x;
                             let wy = raw.y as f64 * self.scale_y + self.offset_y;
                             let wz = raw.z as f64 * self.scale_z + self.offset_z;
-
-                            let mut gx = ((wx - cube_min_x) * g_per_cube).floor() as i64;
-                            let mut gy = ((wy - cube_min_y) * g_per_cube).floor() as i64;
-                            let mut gz = ((wz - cube_min_z) * g_per_cube).floor() as i64;
+                            let key = point_to_key(
+                                wx,
+                                wy,
+                                wz,
+                                self.cx,
+                                self.cy,
+                                self.cz,
+                                self.halfsize,
+                                grid_depth,
+                            );
                             // Defensive clamp for points exactly on the
                             // upper boundary that round out by one.
-                            gx = gx.clamp(0, g_max);
-                            gy = gy.clamp(0, g_max);
-                            gz = gz.clamp(0, g_max);
+                            let gx = (key.x as usize).min(g_usize - 1);
+                            let gy = (key.y as usize).min(g_usize - 1);
+                            let gz = (key.z as usize).min(g_usize - 1);
 
-                            let cell_idx = gx as usize
-                                + gy as usize * g as usize
-                                + gz as usize * g as usize * g as usize;
+                            let cell_idx = gx + gy * g_usize + gz * g_usize * g_usize;
                             let chunk_idx = lut[cell_idx];
                             groups.entry(chunk_idx).or_default().push(raw);
                         }
@@ -2000,15 +2019,116 @@ impl OctreeBuilder {
                 self.halfsize,
                 leaf_depth,
             );
+
+            // Debug-only defensive check: the leaf key's ancestor at
+            // chunk.level must equal the chunk root. If it doesn't, the
+            // chunked distribute classified this point into the wrong
+            // chunk (a bug that Phase 2b's first production run hit due to
+            // inconsistent inlined grid-cell math vs. point_to_key — now
+            // fixed by using point_to_key in both places). If this assertion
+            // ever fires, the distribute/build classification has drifted
+            // again and points will be silently lost unless we reject here.
+            #[cfg(debug_assertions)]
+            {
+                let mut ancestor = key;
+                while ancestor.level > chunk.level as i32 {
+                    ancestor = ancestor.parent().expect("leaf above chunk level");
+                }
+                debug_assert!(
+                    ancestor.level == chunk.level as i32
+                        && ancestor.x == chunk.gx
+                        && ancestor.y == chunk.gy
+                        && ancestor.z == chunk.gz,
+                    "leaf {:?} does not belong to chunk root (L{} {},{},{}): ancestor at L{} = ({},{},{})",
+                    key,
+                    chunk.level,
+                    chunk.gx,
+                    chunk.gy,
+                    chunk.gz,
+                    ancestor.level,
+                    ancestor.x,
+                    ancestor.y,
+                    ancestor.z,
+                );
+            }
+
             leaves.entry(key).or_default().push(raw);
         }
+
+        // Adaptive leaf subdivision. The uniform `leaf_depth` computed from
+        // total point count produces leaves that can be 1.4–2× MAX_LEAF_POINTS
+        // in dense regions (the production run hit 140–170K pts/node vs the
+        // 100K target). This step mirrors the per-leaf path's `normalize_leaves`:
+        // repeatedly split any leaf that exceeds MAX_LEAF_POINTS into 8 children
+        // at one level deeper, until no leaf is oversized or a depth cap is hit.
+        //
+        // Collisions are impossible because newly-created children are always
+        // at a deeper level than any existing leaf, so their keys can't clash.
+        const CHUNK_DEPTH_CAP: u32 = 20; // same spirit as from_scan's `d > 16` cap
+        let mut effective_max_depth = leaf_depth;
+        loop {
+            let oversized: Vec<VoxelKey> = leaves
+                .iter()
+                .filter(|(_, pts)| pts.len() as u64 > MAX_LEAF_POINTS)
+                .map(|(k, _)| *k)
+                .collect();
+            if oversized.is_empty() {
+                break;
+            }
+            // Safety cap: if any oversized leaf is already at the depth cap,
+            // give up further subdivision and accept the residual overflow.
+            // In practice this means some leaves in pathologically dense
+            // spots (coincident points, volumetric data) will exceed the
+            // target — an explicit trade-off per design §9.3.
+            let hit_cap = oversized.iter().any(|k| k.level as u32 >= CHUNK_DEPTH_CAP);
+            if hit_cap {
+                debug!(
+                    "Chunk {}: stopping subdivision at depth cap {} \
+                     ({} leaves still oversized)",
+                    chunk_idx,
+                    CHUNK_DEPTH_CAP,
+                    oversized.len()
+                );
+                break;
+            }
+            for key in oversized {
+                let pts = leaves.remove(&key).expect("just listed");
+                let new_level = (key.level as u32) + 1;
+                if new_level > effective_max_depth {
+                    effective_max_depth = new_level;
+                }
+                for raw in pts {
+                    let wx = raw.x as f64 * self.scale_x + self.offset_x;
+                    let wy = raw.y as f64 * self.scale_y + self.offset_y;
+                    let wz = raw.z as f64 * self.scale_z + self.offset_z;
+                    let new_key = point_to_key(
+                        wx,
+                        wy,
+                        wz,
+                        self.cx,
+                        self.cy,
+                        self.cz,
+                        self.halfsize,
+                        new_level,
+                    );
+                    leaves.entry(new_key).or_default().push(raw);
+                }
+            }
+        }
+
+        debug!(
+            "Chunk {}: {} leaves after subdivision, effective depth {}",
+            chunk_idx,
+            leaves.len(),
+            effective_max_depth
+        );
 
         // Run the bottom-up grid-sample loop, stopping at chunk.level.
         // bottom_up_levels writes every produced node to its canonical temp
         // file path, so the chunk's sub-octree is on disk after this returns.
         // Suppress per-level progress events: the chunked-build outer stage
         // tracks chunks-done, not levels.
-        self.bottom_up_levels(leaves, leaf_depth, chunk.level, false, config)
+        self.bottom_up_levels(leaves, effective_max_depth, chunk.level, false, config)
     }
 
     /// Merge chunk roots upward from `max_chunk_level` to the global root.
