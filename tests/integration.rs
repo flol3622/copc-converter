@@ -930,13 +930,12 @@ fn temporal_index_readable_by_streaming_crate() {
 }
 
 // ---------------------------------------------------------------------------
-// Chunked build strategy tests (Phase 2b)
+// Chunked build tests
 //
-// The chunked path produces equivalent COPC output (same point set, same
-// hierarchy shape) to the per-leaf path but is NOT bit-identical because
-// grid_sample tie-breaking depends on point ordering at the leaf level. We
-// verify the chunked path produces a valid, point-conserving COPC file
-// rather than comparing against a fixed reference byte-for-byte.
+// The chunked build produces COPC output that is NOT bit-identical to any
+// fixed reference because grid_sample tie-breaking depends on point ordering
+// at the leaf level. These tests verify that output is valid and
+// point-conserving rather than comparing bytes.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1026,20 +1025,20 @@ fn preserves_all_points() {
     let _ = std::fs::remove_file(output);
 }
 
-/// Regression test for the Phase 2b point-loss bug.
+/// Regression test for a point-loss bug in an earlier revision of the
+/// chunked distribute path.
 ///
-/// The initial chunked distribute used inlined floor-based grid-cell math
-/// for speed, while `build_chunk_in_memory` used `point_to_key` for leaf
-/// classification. Floating-point precision at cell boundaries made the two
-/// disagree on a tiny fraction of points, which then landed in the wrong
-/// chunk and were silently lost (~0.13% in the first 42.8B-point production
-/// run).
+/// An earlier version used inlined floor-based grid-cell math for speed,
+/// while `build_chunk_in_memory` used `point_to_key` for leaf classification.
+/// Floating-point precision at cell boundaries made the two disagree on a
+/// tiny fraction of points, which then landed in the wrong chunk and were
+/// silently lost. Fixed by using `point_to_key` in both places.
 ///
 /// This test forces a multi-chunk plan on the small 830K-point test input
 /// by passing `--chunk-target 100000` (hidden dev flag). That produces ~20
 /// chunks at varying levels, which exercises the merge step AND the
-/// classification boundary between chunks. With Fix 1 applied, total point
-/// count must be conserved exactly.
+/// classification boundary between chunks. Total point count must be
+/// conserved exactly.
 #[test]
 fn chunked_multi_chunk_preserves_all_points() {
     let output = Path::new("tests/data/test_chunked_multichunk.copc.laz");
@@ -1051,7 +1050,7 @@ fn chunked_multi_chunk_preserves_all_points() {
         // --chunk-target 100000 forces ~8-21 chunks on the 830K-point input
         // (well below the dynamic 1M minimum). This exercises the merge step
         // and the cross-chunk classification boundary — the exact conditions
-        // that triggered the 0.13% point loss in the first production run.
+        // that triggered the original point-loss regression.
         &["--chunk-target", "100000"],
     );
 

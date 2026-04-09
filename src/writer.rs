@@ -337,8 +337,8 @@ pub fn write_copc(
     //
     // Fragmentation safety factor (1.3×) accounts for heap fragmentation
     // during heavy Vec allocation churn in long-running Rust processes.
-    // Empirically calibrated from the first production run which overshot
-    // its estimate by ~28% (21 GB observed vs 16.5 GB budgeted).
+    // Empirically calibrated to match observed peak RSS on large runs
+    // (~28% overshoot vs the naive estimate).
     const FRAGMENTATION_FACTOR: u64 = 13; // 1.3× as integer math
     let phase1_bytes_per_point = (point_record_len as u64 * FRAGMENTATION_FACTOR).div_ceil(10);
 

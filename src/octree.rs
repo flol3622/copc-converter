@@ -1219,8 +1219,6 @@ impl OctreeBuilder {
     /// analyzer, builds a fast cell→chunk lookup table, then streams each
     /// input file in parallel and appends each point to its chunk's temp
     /// file via a bounded LRU writer cache.
-    ///
-    /// See `docs/phase-2b-chunked-build.md` §4.1-4.2 for the design.
     pub fn distribute(&mut self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
         // 1. Compute the chunk plan (counting + merge-sparse-cells).
         //    `chunk_target_override` lets tests force multi-chunk plans on
@@ -1476,11 +1474,10 @@ impl OctreeBuilder {
             // Debug-only defensive check: the leaf key's ancestor at
             // chunk.level must equal the chunk root. If it doesn't, the
             // chunked distribute classified this point into the wrong
-            // chunk (a bug that Phase 2b's first production run hit due to
-            // inconsistent inlined grid-cell math vs. point_to_key — now
-            // fixed by using point_to_key in both places). If this assertion
-            // ever fires, the distribute/build classification has drifted
-            // again and points will be silently lost unless we reject here.
+            // chunk. Distribute and build must use the same key derivation
+            // (`point_to_key`) to stay consistent — if this assertion ever
+            // fires, the classification has drifted again and points will
+            // be silently lost unless we reject here.
             #[cfg(debug_assertions)]
             {
                 let mut ancestor = key;
@@ -1510,10 +1507,9 @@ impl OctreeBuilder {
 
         // Adaptive leaf subdivision. The uniform `leaf_depth` computed from
         // total point count produces leaves that can be 1.4–2× MAX_LEAF_POINTS
-        // in dense regions (the production run hit 140–170K pts/node vs the
-        // 100K target). This step mirrors the per-leaf path's `normalize_leaves`:
-        // repeatedly split any leaf that exceeds MAX_LEAF_POINTS into 8 children
-        // at one level deeper, until no leaf is oversized or a depth cap is hit.
+        // in dense regions. Repeatedly split any leaf that exceeds
+        // MAX_LEAF_POINTS into 8 children at one level deeper, until no leaf
+        // is oversized or a depth cap is hit.
         //
         // Collisions are impossible because newly-created children are always
         // at a deeper level than any existing leaf, so their keys can't clash.
@@ -1780,8 +1776,6 @@ impl OctreeBuilder {
 
     /// Chunked build. Per-chunk in-memory build, then merge across chunks
     /// at coarse levels up to the global root.
-    ///
-    /// See `docs/phase-2b-chunked-build.md` §4.3-4.4 for the design.
     pub fn build_node_map(&self, config: &crate::PipelineConfig) -> Result<Vec<(VoxelKey, usize)>> {
         let plan = self
             .chunked_plan
@@ -2199,7 +2193,7 @@ mod tests {
         // 8x + 1 → needs 2 extra levels
         assert_eq!(chunk_local_extra_levels(8 * MAX_LEAF_POINTS + 1), 2);
 
-        // 36M points (~ Phase 2a chunk target) → ceil(log8(360)) = 3
+        // 36M points → ceil(log8(360)) = 3
         assert_eq!(chunk_local_extra_levels(36_000_000), 3);
 
         // 100M points → ceil(log8(1000)) = 4

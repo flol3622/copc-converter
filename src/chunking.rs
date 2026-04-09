@@ -501,17 +501,17 @@ mod tests {
 
     #[test]
     fn chunk_target_scales_with_budget() {
-        // 64 GB budget, 5 workers, 42.8B points
+        // 64 GB budget, 5 workers, large dataset
         let target = compute_chunk_target(64 * 1024 * 1024 * 1024, 5, 42_800_000_000);
         // Raw: (64 GiB * 0.6) / (5 * 170) ≈ 48.5M; below MAX clamp.
         assert!((47_000_000..=50_000_000).contains(&target), "got {target}");
 
-        // 32 GB budget, 10 workers, 42.8B points
+        // 32 GB budget, 10 workers, large dataset
         let target = compute_chunk_target(32 * 1024 * 1024 * 1024, 10, 42_800_000_000);
         // Raw: (32 GiB * 0.6) / (10 * 170) ≈ 12.1M, within bounds
         assert!((11_000_000..=13_000_000).contains(&target), "got {target}");
 
-        // 16 GB budget, 4 workers, 42.8B points
+        // 16 GB budget, 4 workers, large dataset
         let target = compute_chunk_target(16 * 1024 * 1024 * 1024, 4, 42_800_000_000);
         // Raw: (16 GiB * 0.6) / (4 * 170) ≈ 15.1M, within bounds
         assert!((14_000_000..=17_000_000).contains(&target), "got {target}");

@@ -1,9 +1,9 @@
-//! Phase 2a prototype: hierarchical counting-sort chunk planner.
+//! Chunk planner analyzer.
 //!
-//! Runs the chunking analysis from `copc_converter::chunking` against real
-//! input files and prints a statistics report. Does not write any output;
-//! it's a measurement tool used to validate the chunked-build approach
-//! before committing to the full rewrite.
+//! Runs the hierarchical counting-sort chunk analysis from
+//! `copc_converter::chunking` against real input files and prints a
+//! statistics report. Does not write any output — it's a measurement tool
+//! for inspecting how a dataset would be partitioned by the chunked build.
 //!
 //! Usage:
 //!   copc_analyze <input_file_or_dir> [--memory-limit 16G] [--chunk-target 5M]
