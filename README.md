@@ -149,6 +149,12 @@ Prints GPS time range, per-level temporal coverage, a time histogram showing nod
 4. **Build** — constructs the octree bottom-up, thinning points at each level to produce multi-resolution LODs.
 5. **Write** — encodes and compresses nodes in parallel into a single COPC file with a hierarchy EVLR for spatial indexing.
 
+## Acknowledgments
+
+The chunked octree build is based on the counting-sort approach described in:
+
+> Markus Schütz, Stefan Ohrhallinger, and Michael Wimmer. "Fast Out-of-Core Octree Generation for Massive Point Clouds." *Computer Graphics Forum*, 2020. [doi:10.1111/cgf.14134](https://doi.org/10.1111/cgf.14134)
+
 ## License
 
 MIT
