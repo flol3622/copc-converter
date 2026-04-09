@@ -301,19 +301,61 @@ pub fn write_copc(
         .copied()
         .collect();
 
-    // Memory per point in a batch:
-    //   - read_node loads Vec<RawPoint>: ~40 bytes/point (struct with padding)
-    //   - encode produces Vec<u8>:       point_record_len bytes/point (30-38)
-    //   - both live simultaneously in the results vec before compression
-    // We budget using this combined cost so batches don't exceed the limit.
-    let mem_per_point: u64 = RawPoint::BYTE_SIZE as u64 + point_record_len as u64;
+    // Writer memory model:
+    //
+    // The hot loop has two phases inside each outer batch:
+    //
+    //   Phase 1 — parallel read + encode. Each worker loads a node's
+    //     Vec<RawPoint> (38 B/pt), sort-in-place, and produces a Vec<u8>
+    //     of encoded bytes (point_record_len B/pt). The RawPoint buffer
+    //     is dropped at end of closure. Peak: a few concurrent workers
+    //     holding pts + raw_bytes, plus the *entire* rayon result vec
+    //     accumulating raw_bytes from every finished node. Steady-state
+    //     peak ≈ batch_points × point_record_len (since the RawPoint
+    //     buffer's life is bounded by one worker's runtime, not the batch).
+    //
+    //   Phase 2 — compress. laz's ParLasZipCompressor::compress_chunks
+    //     takes the encoded Vec<Vec<u8>>, parallel-compresses each into
+    //     a new Vec<u8>, and collects the compressed outputs into a
+    //     Vec<(usize, Vec<u8>)> before writing any to the output file
+    //     (so chunks stay in input order for the chunk table).
+    //     Peak during this call ≈ uncompressed input + compressed output
+    //     ≈ batch_points × (point_record_len + ~6 B) ≈ batch_points × 42 B.
+    //
+    // Instead of trying to cram both phases into one budget sizing, we:
+    //   1. Size the outer batch to fit Phase 1's peak (the larger of the two
+    //      when everything is batched together). batch_points × point_record_len
+    //      with a fragmentation safety factor.
+    //   2. During Phase 2, break the encoded Vec into mini-batches of
+    //      WRITER_COMPRESS_MINI_BATCH nodes and call compress_chunks on each.
+    //      Freeing each mini-batch after compression means Phase 2 peak is
+    //      bounded by a small constant, not by batch size.
+    //
+    // Net effect: wall time is dominated by Phase 1 which runs as big as the
+    // budget allows (maximum CPU utilization); Phase 2 memory is capped at a
+    // few hundred MB regardless of batch size.
+    //
+    // Fragmentation safety factor (1.3×) accounts for heap fragmentation
+    // during heavy Vec allocation churn in long-running Rust processes.
+    // Empirically calibrated from the first production run which overshot
+    // its estimate by ~28% (21 GB observed vs 16.5 GB budgeted).
+    const FRAGMENTATION_FACTOR: u64 = 13; // 1.3× as integer math
+    let phase1_bytes_per_point = (point_record_len as u64 * FRAGMENTATION_FACTOR).div_ceil(10);
+
+    // Mini-batch size for Phase 2. 32 nodes is enough to keep laz's internal
+    // rayon parallelism saturated on typical 8-16 core machines (each core
+    // gets at least 2-4 nodes per mini-batch, amortizing work-stealing
+    // overhead) while keeping per-mini-batch memory at ~32 × avg_node_bytes.
+    const WRITER_COMPRESS_MINI_BATCH: usize = 32;
 
     debug!(
-        "Encoding {} data nodes ({} empty ancestors) in batches (budget {} MiB, {} bytes/point)",
+        "Encoding {} data nodes ({} empty ancestors), budget {} MiB, \
+         phase1 {} B/pt incl. fragmentation, compress mini-batch {}",
         data_keys.len(),
         ordered_keys.len() - data_keys.len(),
         memory_budget / 1_048_576,
-        mem_per_point,
+        phase1_bytes_per_point,
+        WRITER_COMPRESS_MINI_BATCH,
     );
 
     let mut return_counts = [0u64; 15];
@@ -325,11 +367,13 @@ pub fn write_copc(
 
     let mut batch_start = 0;
     while batch_start < data_keys.len() {
+        // Greedy-pack nodes into the batch up to phase 1's memory bound.
         let mut batch_bytes: u64 = 0;
         let mut batch_end = batch_start;
         while batch_end < data_keys.len() {
             let key = &data_keys[batch_end];
-            let node_bytes = (point_counts.get(key).copied().unwrap_or(0) as u64) * mem_per_point;
+            let node_bytes =
+                (point_counts.get(key).copied().unwrap_or(0) as u64) * phase1_bytes_per_point;
             // Always include at least one node per batch to avoid stalling.
             if batch_end > batch_start && batch_bytes + node_bytes > memory_budget {
                 break;
@@ -344,13 +388,17 @@ pub fn write_copc(
             .map(|k| point_counts.get(k).copied().unwrap_or(0) as u64)
             .sum();
         debug!(
-            "Write batch {}: {} nodes, {} points, est {} MB (budget {} MB)",
+            "Write batch {}: {} nodes, {} points, phase1 est {} MB (budget {} MB)",
             batch_start,
             batch.len(),
             batch_points,
             batch_bytes / 1_048_576,
             memory_budget / 1_048_576,
         );
+
+        // Phase 1: encode every node in the batch in parallel. The RawPoint
+        // buffers are dropped inside each closure, so the memory that
+        // survives into `results` is only the encoded Vec<u8> per node.
         type NodeResult = (Vec<u8>, [u64; 15], f64, f64, Vec<f64>);
         let results: Vec<NodeResult> = batch
             .par_iter()
@@ -392,34 +440,61 @@ pub fn write_copc(
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let encoded: Vec<Vec<u8>> = results
-            .into_iter()
-            .enumerate()
-            .map(
-                |(i, (bytes, local_returns, local_min, local_max, samples))| {
-                    for j in 0..15 {
-                        return_counts[j] += local_returns[j];
-                    }
-                    if local_min < gpstime_min {
-                        gpstime_min = local_min;
-                    }
-                    if local_max > gpstime_max {
-                        gpstime_max = local_max;
-                    }
-                    if temporal_index {
-                        temporal_entries.push(TemporalIndexEntry {
-                            key: batch[i],
-                            samples,
-                        });
-                    }
-                    bytes
-                },
-            )
-            .collect();
+        // Drain per-node stats into the running aggregates, and split the
+        // encoded bytes out into a separate Vec so we can drop it in
+        // mini-batch chunks without holding onto the NodeResult tuples.
+        let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(results.len());
+        let mut actual_encoded_bytes: u64 = 0;
+        for (i, (bytes, local_returns, local_min, local_max, samples)) in
+            results.into_iter().enumerate()
+        {
+            for j in 0..15 {
+                return_counts[j] += local_returns[j];
+            }
+            if local_min < gpstime_min {
+                gpstime_min = local_min;
+            }
+            if local_max > gpstime_max {
+                gpstime_max = local_max;
+            }
+            if temporal_index {
+                temporal_entries.push(TemporalIndexEntry {
+                    key: batch[i],
+                    samples,
+                });
+            }
+            actual_encoded_bytes += bytes.len() as u64;
+            encoded.push(bytes);
+        }
+        debug!(
+            "Write batch {}: phase1 actual encoded {} MB (est {} MB, delta {:+})",
+            batch_start,
+            actual_encoded_bytes / 1_048_576,
+            batch_bytes / 1_048_576,
+            (actual_encoded_bytes as i64 - batch_bytes as i64) / 1_048_576,
+        );
 
-        compressor
-            .compress_chunks(encoded)
-            .context("compress_chunks")?;
+        // Phase 2: compress in mini-batches, freeing each mini-batch's
+        // encoded bytes before the next is built. This caps Phase 2's
+        // peak at `WRITER_COMPRESS_MINI_BATCH × avg_node_bytes ×
+        // (1 + 1/compression_ratio)` ≈ a few hundred MB regardless of the
+        // outer batch size.
+        //
+        // We process the mini-batches in order via drain(..end) so the
+        // already-compressed prefix is freed as we go (drain leaves the
+        // remaining suffix in `encoded` with its allocation intact).
+        while !encoded.is_empty() {
+            let take = WRITER_COMPRESS_MINI_BATCH.min(encoded.len());
+            // drain(..take) yields the first `take` elements, shifting the
+            // remainder to the front. The yielded Vec<Vec<u8>> is collected
+            // (so its inner buffers move into the new vec) and consumed by
+            // compress_chunks, then dropped — at which point all encoded
+            // bytes in the mini-batch are freed.
+            let mini: Vec<Vec<u8>> = encoded.drain(..take).collect();
+            compressor
+                .compress_chunks(mini)
+                .context("compress_chunks")?;
+        }
 
         config.report(crate::ProgressEvent::StageProgress {
             done: batch_end as u64,
