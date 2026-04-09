@@ -60,6 +60,21 @@ copc_converter ./tiles/ merged.copc.laz
 | `--temporal-index` | Write a temporal index EVLR for time-based queries | off |
 | `--temporal-stride` | Sampling stride for the temporal index (every n-th point) | `1000` |
 | `--progress` | Progress output format: `bar`, `plain`, or `json` | `bar` |
+| `--temp-compression` | Compress scratch temp files: `none` or `lz4` | `none` |
+
+#### Temp file compression
+
+Chunked-build scratch files hold `RawPoint` records (38 bytes each) and are
+highly compressible. On a large run (tens of billions of points) the temp
+directory can approach the full raw-point footprint, which becomes the
+limiting resource on space-constrained workers.
+
+`--temp-compression=lz4` wraps each temp-file write in a self-contained LZ4
+frame. Expect roughly a 3-4× reduction in scratch-disk usage at a modest CPU
+cost (LZ4 compresses at >1 GB/s per core). On fast local NVMe this trades CPU
+for disk without a clear wall-time win; on network filesystems (EFS/NFS) it
+typically also reduces wall time because the bottleneck shifts from I/O to
+compute.
 
 ### Examples
 

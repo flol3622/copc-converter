@@ -1096,3 +1096,79 @@ fn chunked_multi_chunk_preserves_all_points() {
 
     let _ = std::fs::remove_file(output);
 }
+
+/// Run with `--temp-compression=lz4` and verify the pipeline still conserves
+/// every point. Exercises `write_temp_batch` + `read_temp_batches` under LZ4.
+#[test]
+fn temp_compression_lz4_preserves_all_points() {
+    let output = Path::new("tests/data/test_lz4_conservation.copc.laz");
+    run_converter_with_args(
+        Path::new("tests/data/input.laz"),
+        output,
+        &["--temp-compression", "lz4"],
+    );
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let hier = read_hierarchy(&data);
+
+    // Sum of point counts across all data nodes must equal the header total.
+    let hier_total: i64 = hier
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as i64)
+        .sum();
+    assert_eq!(
+        hier_total, header.total_points as i64,
+        "lz4 hierarchy point sum must match header"
+    );
+
+    // Must match the reference input's total point count.
+    let reference = read_file(Path::new("tests/data/untwine_reference.copc.laz"));
+    let ref_header = read_las_header(&reference);
+    assert_eq!(
+        header.total_points, ref_header.total_points,
+        "lz4 total points must match reference input"
+    );
+
+    let _ = std::fs::remove_file(output);
+}
+
+/// Run multi-chunk merge under LZ4. Exercises multi-frame append: each
+/// `ChunkWriterCache::append` call writes a self-contained LZ4 frame into
+/// the shard file, and the reader must walk multiple concatenated frames
+/// to recover every point.
+#[test]
+fn temp_compression_lz4_multi_chunk_preserves_all_points() {
+    let output = Path::new("tests/data/test_lz4_multichunk.copc.laz");
+    run_converter_with_args(
+        Path::new("tests/data/input.laz"),
+        output,
+        &["--temp-compression", "lz4", "--chunk-target", "100000"],
+    );
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let hier = read_hierarchy(&data);
+
+    let hier_total: u64 = hier
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as u64)
+        .sum();
+    assert_eq!(
+        hier_total, header.total_points,
+        "lz4 multi-chunk hierarchy point sum ({}) must equal header total ({})",
+        hier_total, header.total_points
+    );
+
+    // Sanity: verify we actually got a multi-level tree from the merge step.
+    let max_level = hier.iter().map(|e| e.key.level).max().unwrap_or(0);
+    assert!(
+        max_level >= 3,
+        "lz4 multi-chunk test must produce a multi-level tree (got max_level={})",
+        max_level
+    );
+
+    let _ = std::fs::remove_file(output);
+}
