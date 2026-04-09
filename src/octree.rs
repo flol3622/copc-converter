@@ -100,7 +100,7 @@ impl ChunkWriterCache {
         }
 
         let w = self.writers.get_mut(&chunk_idx).expect("just inserted");
-        RawPoint::write_bulk(points, w)?;
+        write_temp_frame(w, points)?;
         Ok(())
     }
 
@@ -403,6 +403,76 @@ impl RawPoint {
         w.write_all(&buf)?;
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Temp-file frame format
+// ---------------------------------------------------------------------------
+//
+// Every scratch file on disk (per-node files and per-chunk shard/canonical
+// files) is a sequence of zero or more frames. A frame is:
+//
+//     u32 LE point_count      (4 bytes)
+//     point_count × RawPoint  (38 bytes per point)
+//
+// Per-node files (`write_node_to_temp`) always contain exactly one frame
+// including zero-point frames. Per-chunk shard files contain one frame per
+// `ChunkWriterCache::append` call, because an LZ4 frame encoder cannot be
+// resumed across re-opens once compression is plumbed in (Phase 3). The
+// merged canonical chunk files inherit the multi-frame layout via
+// `merge_chunk_shards`'s byte-level concatenation.
+//
+// Readers stream frames until EOF. Writers append one frame per call.
+// Point counts are derived by summing frame headers, never from file length.
+
+/// Write a single frame: a 4-byte little-endian point count followed by
+/// `points.len() × RawPoint::BYTE_SIZE` payload bytes.
+fn write_temp_frame<W: Write>(w: &mut W, points: &[RawPoint]) -> Result<()> {
+    w.write_u32::<LittleEndian>(points.len() as u32)?;
+    RawPoint::write_bulk(points, w)?;
+    Ok(())
+}
+
+/// Read every frame in a reader to EOF, concatenating their points.
+/// An empty reader produces an empty Vec.
+fn read_temp_frames<R: std::io::Read>(r: &mut R) -> Result<Vec<RawPoint>> {
+    let mut out: Vec<RawPoint> = Vec::new();
+    loop {
+        let count = match r.read_u32::<LittleEndian>() {
+            Ok(n) => n as usize,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        };
+        out.reserve(count);
+        for _ in 0..count {
+            out.push(RawPoint::read(r)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Count the points in a temp file by walking frame headers and seeking past
+/// each payload. Avoids decoding any point data. Returns 0 if the file does
+/// not exist.
+fn count_temp_file_points(path: &Path) -> Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let mut total: u64 = 0;
+    loop {
+        let count = match f.read_u32::<LittleEndian>() {
+            Ok(n) => n as u64,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        };
+        total += count;
+        let payload = count * RawPoint::BYTE_SIZE as u64;
+        f.seek(SeekFrom::Current(payload as i64))?;
+    }
+    Ok(total)
 }
 
 // ---------------------------------------------------------------------------
@@ -751,23 +821,17 @@ impl OctreeBuilder {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => return Err(e.into()),
         };
-        let file_len = f.metadata()?.len();
-        let count = file_len as usize / RawPoint::BYTE_SIZE;
         let mut r = BufReader::new(f);
-        let mut pts = Vec::with_capacity(count);
-        for _ in 0..count {
-            pts.push(RawPoint::read(&mut r)?);
-        }
-        Ok(pts)
+        read_temp_frames(&mut r)
     }
 
-    /// Write points to a temp file for the given node key (overwrites if exists).
+    /// Write points to a temp file for the given node key (overwrites if
+    /// exists). Always writes exactly one frame, even for an empty slice.
     pub fn write_node_to_temp(&self, key: &VoxelKey, points: &[RawPoint]) -> Result<()> {
-        use std::io::Write;
         let path = self.node_path(key);
         let f = File::create(&path)?;
         let mut w = BufWriter::new(f);
-        RawPoint::write_bulk(points, &mut w)?;
+        write_temp_frame(&mut w, points)?;
         w.flush().context("flush node temp file")?;
         Ok(())
     }
@@ -976,8 +1040,8 @@ impl OctreeBuilder {
             if !child_donated[ci] {
                 // Check if this child originally had points (file might now be
                 // empty because all were promoted).
-                let file_len = self.node_path(ck).metadata().map_or(0, |m| m.len());
-                if file_len == 0 && !parent_pts.is_empty() {
+                let n = count_temp_file_points(&self.node_path(ck)).unwrap_or(0);
+                if n == 0 && !parent_pts.is_empty() {
                     // Return one point from the parent back to this child.
                     // Find the last parent point that came from any child — we
                     // can't track origin in the streaming path, so just pop the last.
@@ -1280,13 +1344,8 @@ impl OctreeBuilder {
     fn read_chunk_file(&self, chunk_idx: u32) -> Result<Vec<RawPoint>> {
         let path = chunk_canonical_path(&self.tmp_dir.join("chunks"), chunk_idx);
         let f = File::open(&path).with_context(|| format!("opening chunk file {:?}", path))?;
-        let file_len = f.metadata()?.len();
-        let count = file_len as usize / RawPoint::BYTE_SIZE;
         let mut r = BufReader::new(f);
-        let mut pts = Vec::with_capacity(count);
-        for _ in 0..count {
-            pts.push(RawPoint::read(&mut r)?);
-        }
+        let pts = read_temp_frames(&mut r)?;
         Ok(pts)
     }
 
@@ -1548,11 +1607,10 @@ impl OctreeBuilder {
             let mut large_parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = Vec::new();
 
             for (parent, children) in parent_children {
-                let child_bytes: u64 = children
+                let est_points: u64 = children
                     .iter()
-                    .map(|ck| self.node_path(ck).metadata().map_or(0, |m| m.len()))
+                    .map(|ck| count_temp_file_points(&self.node_path(ck)).unwrap_or(0))
                     .sum();
-                let est_points = child_bytes / RawPoint::BYTE_SIZE as u64;
                 let est_mem = est_points * MEM_PER_POINT;
                 if est_mem > config.memory_budget {
                     large_parents.push((parent, children, est_mem));
@@ -1782,10 +1840,7 @@ impl OctreeBuilder {
         let mut result: Vec<(VoxelKey, usize)> = all_keys
             .par_iter()
             .map(|k| -> Result<(VoxelKey, usize)> {
-                let n = self
-                    .node_path(k)
-                    .metadata()
-                    .map_or(0, |m| m.len() as usize / RawPoint::BYTE_SIZE);
+                let n = count_temp_file_points(&self.node_path(k))? as usize;
                 Ok((*k, n))
             })
             .collect::<Result<Vec<_>>>()?;
