@@ -784,14 +784,14 @@ fn temporal_index_custom_stride() {
 // Low-memory / streaming path tests
 // ---------------------------------------------------------------------------
 
-/// Run with a tiny memory limit to force the streaming grid_sample path
-/// (and smaller write batches). Verify the output is a valid COPC file
-/// with the correct total point count.
+/// Run with a tiny memory limit to exercise the chunked path under tight
+/// memory pressure. Verify the output is a valid COPC file with the correct
+/// total point count.
 #[test]
 fn low_memory_produces_valid_output() {
     let output = Path::new("tests/data/test_low_mem.copc.laz");
-    // 1 MB budget forces the out-of-core build path and streaming grid_sample
-    // for parents whose children exceed this tiny limit.
+    // 1 MB budget forces the chunked path to produce many small chunks,
+    // exercising the merge step under tight memory pressure.
     run_converter_with_args(
         Path::new("tests/data/input.laz"),
         output,
@@ -940,13 +940,9 @@ fn temporal_index_readable_by_streaming_crate() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn chunked_strategy_produces_valid_copc() {
+fn produces_valid_copc() {
     let output = Path::new("tests/data/test_chunked_basic.copc.laz");
-    run_converter_with_args(
-        Path::new("tests/data/input.laz"),
-        output,
-        &["--build-strategy", "chunked"],
-    );
+    run_converter(Path::new("tests/data/input.laz"), output);
 
     let data = read_file(output);
     let header = read_las_header(&data);
@@ -980,13 +976,9 @@ fn chunked_strategy_produces_valid_copc() {
 }
 
 #[test]
-fn chunked_strategy_preserves_all_points() {
+fn preserves_all_points() {
     let output = Path::new("tests/data/test_chunked_conservation.copc.laz");
-    run_converter_with_args(
-        Path::new("tests/data/input.laz"),
-        output,
-        &["--build-strategy", "chunked"],
-    );
+    run_converter(Path::new("tests/data/input.laz"), output);
 
     let data = read_file(output);
     let header = read_las_header(&data);
@@ -1034,103 +1026,6 @@ fn chunked_strategy_preserves_all_points() {
     let _ = std::fs::remove_file(output);
 }
 
-#[test]
-fn chunked_strategy_deterministic_within_strategy() {
-    // Two runs of the chunked path on the same input must produce the same
-    // hierarchy shape and point counts. Cross-strategy bit-identical is NOT
-    // required (and isn't expected, since per-leaf and chunked use different
-    // intermediate representations); but within-strategy determinism IS
-    // required for reproducible builds.
-    let output1 = Path::new("tests/data/test_chunked_det_1.copc.laz");
-    let output2 = Path::new("tests/data/test_chunked_det_2.copc.laz");
-    let input = Path::new("tests/data/input.laz");
-
-    run_converter_with_args(input, output1, &["--build-strategy", "chunked"]);
-    run_converter_with_args(input, output2, &["--build-strategy", "chunked"]);
-
-    let data1 = read_file(output1);
-    let data2 = read_file(output2);
-
-    let h1 = read_las_header(&data1);
-    let h2 = read_las_header(&data2);
-
-    assert_eq!(h1.total_points, h2.total_points, "point count");
-    assert_eq!(h1.point_format, h2.point_format, "point format");
-
-    // Hierarchy node count and per-key point counts must match.
-    let hier1 = read_hierarchy(&data1);
-    let hier2 = read_hierarchy(&data2);
-    assert_eq!(hier1.len(), hier2.len(), "hierarchy node count");
-
-    let map1: HashMap<_, _> = hier1
-        .iter()
-        .map(|e| (e.key.clone(), e.point_count))
-        .collect();
-    for e in &hier2 {
-        let count1 = map1.get(&e.key).expect("node missing in run 1");
-        assert_eq!(
-            *count1, e.point_count,
-            "node {:?} point count mismatch",
-            e.key
-        );
-    }
-
-    let _ = std::fs::remove_file(output1);
-    let _ = std::fs::remove_file(output2);
-}
-
-#[test]
-fn chunked_and_perleaf_have_same_point_count() {
-    // Cross-strategy comparison: the chunked and per-leaf paths produce
-    // *different but equivalent* COPC files. They should NOT be byte-identical
-    // (per the design doc) but they MUST contain the same set of points,
-    // verified here by checking total point count equality.
-    let output_chunked = Path::new("tests/data/test_xstrategy_chunked.copc.laz");
-    let output_perleaf = Path::new("tests/data/test_xstrategy_perleaf.copc.laz");
-    let input = Path::new("tests/data/input.laz");
-
-    run_converter_with_args(input, output_chunked, &["--build-strategy", "chunked"]);
-    run_converter_with_args(input, output_perleaf, &["--build-strategy", "per-leaf"]);
-
-    let data_c = read_file(output_chunked);
-    let data_p = read_file(output_perleaf);
-
-    let h_c = read_las_header(&data_c);
-    let h_p = read_las_header(&data_p);
-
-    assert_eq!(
-        h_c.total_points, h_p.total_points,
-        "total point count must agree across strategies"
-    );
-
-    // Same scale, offset, point format.
-    assert_eq!(h_c.point_format, h_p.point_format, "point format");
-    assert_eq!(h_c.scale_x, h_p.scale_x, "scale_x");
-    assert_eq!(h_c.scale_y, h_p.scale_y, "scale_y");
-    assert_eq!(h_c.scale_z, h_p.scale_z, "scale_z");
-
-    // Hierarchy point sums must agree.
-    let hier_c = read_hierarchy(&data_c);
-    let hier_p = read_hierarchy(&data_p);
-    let total_c: i64 = hier_c
-        .iter()
-        .filter(|e| e.point_count > 0)
-        .map(|e| e.point_count as i64)
-        .sum();
-    let total_p: i64 = hier_p
-        .iter()
-        .filter(|e| e.point_count > 0)
-        .map(|e| e.point_count as i64)
-        .sum();
-    assert_eq!(
-        total_c, total_p,
-        "hierarchy point sums must agree across strategies"
-    );
-
-    let _ = std::fs::remove_file(output_chunked);
-    let _ = std::fs::remove_file(output_perleaf);
-}
-
 /// Regression test for the Phase 2b point-loss bug.
 ///
 /// The initial chunked distribute used inlined floor-based grid-cell math
@@ -1157,7 +1052,7 @@ fn chunked_multi_chunk_preserves_all_points() {
         // (well below the dynamic 1M minimum). This exercises the merge step
         // and the cross-chunk classification boundary — the exact conditions
         // that triggered the 0.13% point loss in the first production run.
-        &["--build-strategy", "chunked", "--chunk-target", "100000"],
+        &["--chunk-target", "100000"],
     );
 
     let data = read_file(output);
