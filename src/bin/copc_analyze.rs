@@ -417,6 +417,7 @@ fn main() -> Result<()> {
         // through separately to `validated.analyze_chunking(...)` rather
         // than via the PipelineConfig field used by the convert path.
         chunk_target_override: None,
+        temp_compression: copc_converter::TempCompression::None,
     };
 
     // Run scan + validate via the standard pipeline so the analyzer sees the

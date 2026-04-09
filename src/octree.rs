@@ -21,7 +21,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
@@ -54,14 +54,16 @@ struct ChunkWriterCache {
     /// Insertion / access order. Front = least recently used.
     order: VecDeque<u32>,
     capacity: usize,
+    codec: TempCompression,
 }
 
 impl ChunkWriterCache {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, codec: TempCompression) -> Self {
         ChunkWriterCache {
             writers: HashMap::new(),
             order: VecDeque::new(),
             capacity,
+            codec,
         }
     }
 
@@ -100,7 +102,7 @@ impl ChunkWriterCache {
         }
 
         let w = self.writers.get_mut(&chunk_idx).expect("just inserted");
-        write_temp_frame(w, points)?;
+        write_temp_batch(w, points, self.codec)?;
         Ok(())
     }
 
@@ -410,32 +412,64 @@ impl RawPoint {
 // ---------------------------------------------------------------------------
 //
 // Every scratch file on disk (per-node files and per-chunk shard/canonical
-// files) is a sequence of zero or more frames. A frame is:
+// files) is a sequence of zero or more *batches*. Each batch contains:
 //
 //     u32 LE point_count      (4 bytes)
 //     point_count × RawPoint  (38 bytes per point)
 //
-// Per-node files (`write_node_to_temp`) always contain exactly one frame
-// including zero-point frames. Per-chunk shard files contain one frame per
-// `ChunkWriterCache::append` call, because an LZ4 frame encoder cannot be
-// resumed across re-opens once compression is plumbed in (Phase 3). The
-// merged canonical chunk files inherit the multi-frame layout via
-// `merge_chunk_shards`'s byte-level concatenation.
+// - In `TempCompression::None` mode, batches are laid down directly in the
+//   file, back-to-back.
+// - In `TempCompression::Lz4` mode, each batch is wrapped in its own
+//   self-contained LZ4 frame (frame format). `FrameDecoder` walks multiple
+//   concatenated frames transparently, so the reader logic is identical:
+//   read u32 count + payload, repeat until EOF.
 //
-// Readers stream frames until EOF. Writers append one frame per call.
-// Point counts are derived by summing frame headers, never from file length.
+// Per-node files (`write_node_to_temp`) always contain exactly one batch,
+// including zero-point batches. Per-chunk shard files contain one batch per
+// `ChunkWriterCache::append` call — an LZ4 frame encoder cannot be resumed
+// across re-opens, so each append finalises its own frame. The merged
+// canonical chunk files inherit the multi-batch layout via
+// `merge_chunk_shards`'s byte-level concatenation.
 
-/// Write a single frame: a 4-byte little-endian point count followed by
-/// `points.len() × RawPoint::BYTE_SIZE` payload bytes.
-fn write_temp_frame<W: Write>(w: &mut W, points: &[RawPoint]) -> Result<()> {
-    w.write_u32::<LittleEndian>(points.len() as u32)?;
-    RawPoint::write_bulk(points, w)?;
+use crate::TempCompression;
+
+/// Write a single batch: a 4-byte little-endian point count followed by
+/// `points.len() × RawPoint::BYTE_SIZE` payload bytes. If `codec` is
+/// `Lz4`, the entire batch is encapsulated in a self-contained LZ4 frame.
+fn write_temp_batch<W: Write>(
+    w: &mut W,
+    points: &[RawPoint],
+    codec: TempCompression,
+) -> Result<()> {
+    match codec {
+        TempCompression::None => {
+            w.write_u32::<LittleEndian>(points.len() as u32)?;
+            RawPoint::write_bulk(points, w)?;
+        }
+        TempCompression::Lz4 => {
+            let mut enc = lz4_flex::frame::FrameEncoder::new(w);
+            enc.write_u32::<LittleEndian>(points.len() as u32)?;
+            RawPoint::write_bulk(points, &mut enc)?;
+            enc.finish().context("finishing lz4 frame")?;
+        }
+    }
     Ok(())
 }
 
-/// Read every frame in a reader to EOF, concatenating their points.
-/// An empty reader produces an empty Vec.
-fn read_temp_frames<R: std::io::Read>(r: &mut R) -> Result<Vec<RawPoint>> {
+/// Read every batch in a reader to EOF, concatenating their points.
+/// For `Lz4` the reader is first wrapped in a `FrameDecoder`, which walks
+/// multi-frame streams transparently. An empty reader produces an empty Vec.
+fn read_temp_batches<R: std::io::Read>(r: R, codec: TempCompression) -> Result<Vec<RawPoint>> {
+    match codec {
+        TempCompression::None => read_batches_loop(&mut BufReader::new(r)),
+        TempCompression::Lz4 => {
+            let mut dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(r));
+            read_batches_loop(&mut dec)
+        }
+    }
+}
+
+fn read_batches_loop<R: std::io::Read>(r: &mut R) -> Result<Vec<RawPoint>> {
     let mut out: Vec<RawPoint> = Vec::new();
     loop {
         let count = match r.read_u32::<LittleEndian>() {
@@ -451,28 +485,55 @@ fn read_temp_frames<R: std::io::Read>(r: &mut R) -> Result<Vec<RawPoint>> {
     Ok(out)
 }
 
-/// Count the points in a temp file by walking frame headers and seeking past
-/// each payload. Avoids decoding any point data. Returns 0 if the file does
-/// not exist.
-fn count_temp_file_points(path: &Path) -> Result<u64> {
-    use std::io::{Seek, SeekFrom};
-    let mut f = match File::open(path) {
+/// Count the points in a temp file by walking batch headers. For `None` mode
+/// this seeks past payloads without decoding. For `Lz4` mode there is no
+/// cheap way to skip a compressed payload, so we run the decoder and count
+/// headers (still cheaper than materialising all points — payload bytes are
+/// streamed through a throwaway sink). Returns 0 if the file does not exist.
+fn count_temp_file_points(path: &Path, codec: TempCompression) -> Result<u64> {
+    let f = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e.into()),
     };
-    let mut total: u64 = 0;
-    loop {
-        let count = match f.read_u32::<LittleEndian>() {
-            Ok(n) => n as u64,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        };
-        total += count;
-        let payload = count * RawPoint::BYTE_SIZE as u64;
-        f.seek(SeekFrom::Current(payload as i64))?;
+    match codec {
+        TempCompression::None => {
+            use std::io::{Seek, SeekFrom};
+            let mut f = f;
+            let mut total: u64 = 0;
+            loop {
+                let count = match f.read_u32::<LittleEndian>() {
+                    Ok(n) => n as u64,
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                };
+                total += count;
+                let payload = count * RawPoint::BYTE_SIZE as u64;
+                f.seek(SeekFrom::Current(payload as i64))?;
+            }
+            Ok(total)
+        }
+        TempCompression::Lz4 => {
+            let mut dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(f));
+            let mut total: u64 = 0;
+            let mut sink = [0u8; 4096];
+            loop {
+                let count = match dec.read_u32::<LittleEndian>() {
+                    Ok(n) => n as u64,
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                };
+                total += count;
+                let mut remaining = count * RawPoint::BYTE_SIZE as u64;
+                while remaining > 0 {
+                    let want = remaining.min(sink.len() as u64) as usize;
+                    dec.read_exact(&mut sink[..want])?;
+                    remaining -= want as u64;
+                }
+            }
+            Ok(total)
+        }
     }
-    Ok(total)
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +740,8 @@ pub struct OctreeBuilder {
     /// Chunk plan computed by `distribute_chunked` and consumed by
     /// `build_node_map_chunked`. `None` for the per-leaf path.
     pub(crate) chunked_plan: Option<crate::chunking::ChunkPlan>,
+    /// Compression codec applied to scratch temp files.
+    pub(crate) temp_compression: crate::TempCompression,
 }
 
 impl OctreeBuilder {
@@ -780,6 +843,7 @@ impl OctreeBuilder {
             wkt_crs: validated.wkt_crs.clone(),
             point_format: validated.point_format,
             chunked_plan: None,
+            temp_compression: config.temp_compression,
         })
     }
 
@@ -821,17 +885,16 @@ impl OctreeBuilder {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => return Err(e.into()),
         };
-        let mut r = BufReader::new(f);
-        read_temp_frames(&mut r)
+        read_temp_batches(f, self.temp_compression)
     }
 
     /// Write points to a temp file for the given node key (overwrites if
-    /// exists). Always writes exactly one frame, even for an empty slice.
+    /// exists). Always writes exactly one batch, even for an empty slice.
     pub fn write_node_to_temp(&self, key: &VoxelKey, points: &[RawPoint]) -> Result<()> {
         let path = self.node_path(key);
         let f = File::create(&path)?;
         let mut w = BufWriter::new(f);
-        write_temp_frame(&mut w, points)?;
+        write_temp_batch(&mut w, points, self.temp_compression)?;
         w.flush().context("flush node temp file")?;
         Ok(())
     }
@@ -1040,7 +1103,8 @@ impl OctreeBuilder {
             if !child_donated[ci] {
                 // Check if this child originally had points (file might now be
                 // empty because all were promoted).
-                let n = count_temp_file_points(&self.node_path(ck)).unwrap_or(0);
+                let n =
+                    count_temp_file_points(&self.node_path(ck), self.temp_compression).unwrap_or(0);
                 if n == 0 && !parent_pts.is_empty() {
                     // Return one point from the parent back to this child.
                     // Find the last parent point that came from any child — we
@@ -1248,7 +1312,7 @@ impl OctreeBuilder {
                     return Ok(());
                 }
 
-                let mut cache = ChunkWriterCache::new(per_worker_cap);
+                let mut cache = ChunkWriterCache::new(per_worker_cap, self.temp_compression);
                 let mut points: Vec<las::Point> = Vec::with_capacity(read_chunk_size);
                 // Group buffer reused across batches so capacity amortizes.
                 // Drained at the end of each batch so retained Vec capacity
@@ -1344,9 +1408,7 @@ impl OctreeBuilder {
     fn read_chunk_file(&self, chunk_idx: u32) -> Result<Vec<RawPoint>> {
         let path = chunk_canonical_path(&self.tmp_dir.join("chunks"), chunk_idx);
         let f = File::open(&path).with_context(|| format!("opening chunk file {:?}", path))?;
-        let mut r = BufReader::new(f);
-        let pts = read_temp_frames(&mut r)?;
-        Ok(pts)
+        read_temp_batches(f, self.temp_compression)
     }
 
     /// Build a single chunk's sub-octree fully in memory and write its node
@@ -1609,7 +1671,10 @@ impl OctreeBuilder {
             for (parent, children) in parent_children {
                 let est_points: u64 = children
                     .iter()
-                    .map(|ck| count_temp_file_points(&self.node_path(ck)).unwrap_or(0))
+                    .map(|ck| {
+                        count_temp_file_points(&self.node_path(ck), self.temp_compression)
+                            .unwrap_or(0)
+                    })
                     .sum();
                 let est_mem = est_points * MEM_PER_POINT;
                 if est_mem > config.memory_budget {
@@ -1840,7 +1905,7 @@ impl OctreeBuilder {
         let mut result: Vec<(VoxelKey, usize)> = all_keys
             .par_iter()
             .map(|k| -> Result<(VoxelKey, usize)> {
-                let n = count_temp_file_points(&self.node_path(k))? as usize;
+                let n = count_temp_file_points(&self.node_path(k), self.temp_compression)? as usize;
                 Ok((*k, n))
             })
             .collect::<Result<Vec<_>>>()?;

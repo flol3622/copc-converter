@@ -14,6 +14,7 @@
 //!     temporal_stride: 1000,
 //!     progress: None,
 //!     chunk_target_override: None,
+//!     temp_compression: copc_converter::TempCompression::None,
 //! };
 //! let files = copc_converter::collect_input_files("input.laz".into()).unwrap();
 //!
@@ -155,6 +156,21 @@ pub trait ProgressObserver: Send + Sync {
 // PipelineConfig
 // ---------------------------------------------------------------------------
 
+/// Compression codec for chunked-build scratch files.
+///
+/// Temp files hold `RawPoint` records and are highly compressible. Enabling
+/// compression trades CPU for scratch-disk footprint — most useful on
+/// space-constrained workers and network filesystems (EFS/NFS), and roughly
+/// a wash on fast local NVMe where CPU is the bottleneck.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TempCompression {
+    /// Uncompressed (default). Fastest on local NVMe.
+    #[default]
+    None,
+    /// LZ4 frame format. Roughly 3-4× smaller at >1 GB/s/core.
+    Lz4,
+}
+
 /// Configuration for the conversion pipeline.
 pub struct PipelineConfig {
     /// Effective memory budget in bytes.
@@ -172,6 +188,8 @@ pub struct PipelineConfig {
     /// for testing — e.g. forcing multiple chunks on a small input to
     /// exercise the merge step.
     pub chunk_target_override: Option<u64>,
+    /// Compression codec for scratch temp files.
+    pub temp_compression: TempCompression,
 }
 
 impl PipelineConfig {

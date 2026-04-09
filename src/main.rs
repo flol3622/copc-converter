@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use copc_converter::{
-    Pipeline, PipelineConfig, ProgressEvent, ProgressObserver, collect_input_files,
+    Pipeline, PipelineConfig, ProgressEvent, ProgressObserver, TempCompression, collect_input_files,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
@@ -50,6 +50,29 @@ struct Args {
     /// testing — force multiple chunks on a small input to exercise merge.
     #[arg(long, hide = true)]
     chunk_target: Option<u64>,
+
+    /// Compress chunked-build scratch files to reduce temp-dir footprint.
+    /// "none" (default) is fastest on local NVMe; "lz4" cuts disk usage
+    /// ~3-4× at a small CPU cost, useful on space-constrained workers and
+    /// network filesystems.
+    #[arg(long, value_enum, default_value_t = TempCompressionArg::None)]
+    temp_compression: TempCompressionArg,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum TempCompressionArg {
+    #[default]
+    None,
+    Lz4,
+}
+
+impl From<TempCompressionArg> for TempCompression {
+    fn from(a: TempCompressionArg) -> Self {
+        match a {
+            TempCompressionArg::None => TempCompression::None,
+            TempCompressionArg::Lz4 => TempCompression::Lz4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -490,6 +513,7 @@ fn main() -> Result<()> {
         temporal_stride: args.temporal_stride,
         progress: Some(progress),
         chunk_target_override: args.chunk_target,
+        temp_compression: args.temp_compression.into(),
     };
 
     Pipeline::scan(&input_files, config)?
