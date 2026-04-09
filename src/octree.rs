@@ -890,13 +890,18 @@ impl OctreeBuilder {
 
     /// Streaming grid-sample for a single oversized parent.
     ///
-    /// Processes one child at a time so that only one child's points are ever in
-    /// memory. The grid occupancy set (max 128³ entries ≈ 48 MB) and the parent
-    /// accumulator (max 128³ points ≈ 80 MB) stay resident; everything else is
-    /// streamed from/to disk.
+    /// Used as a fallback by `merge_chunk_tops` when a parent group's combined
+    /// child points exceed the memory budget. Processes one child at a time so
+    /// only one child's points are ever in memory. The grid occupancy set
+    /// (max 128³ entries ≈ 48 MB) and the parent accumulator (max 128³ points
+    /// ≈ 80 MB) stay resident; everything else is streamed from/to disk.
+    ///
+    /// In practice this path is rarely hit for well-formed chunk plans
+    /// (merge-sparse-cells sizes chunks to fit the budget by construction),
+    /// but it's kept as a safety net for degenerate inputs.
     ///
     /// Tradeoff: points are not Morton-sorted across children, so spatial
-    /// coherence of the parent is slightly worse than the in-memory path.
+    /// coherence of the parent is slightly worse than in-memory grid_sample.
     fn grid_sample_streaming(&self, parent: &VoxelKey, children: &[VoxelKey]) -> Result<()> {
         let voxel_size_world = 2.0 * self.halfsize / (1u64 << parent.level) as f64;
         let origin_x = ((self.cx - self.halfsize + parent.x as f64 * voxel_size_world

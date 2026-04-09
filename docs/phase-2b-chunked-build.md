@@ -1,5 +1,7 @@
 # Phase 2b — Chunked Build Design
 
+> **Phase 2b status (as of Phase 2c completion): the per-leaf path referenced throughout this doc has been deleted. Chunked is now the only path. See `phase-2c-per-leaf-removal.md` for the removal commit.**
+
 > Status: **draft for review**, not yet implemented.
 > Author: design pass on `feat/chunked-build` branch, after Phase 2a counting prototype validated chunk distribution on a real 42.8B-point dataset.
 > Reviewers: please scrutinize §5 (the merge step) — it is the only part with real algorithmic risk.
