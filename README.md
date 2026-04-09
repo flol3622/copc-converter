@@ -145,9 +145,10 @@ Prints GPS time range, per-level temporal coverage, a time histogram showing nod
 
 1. **Scan** — reads headers from all input files in parallel to determine bounds, CRS, point format, and point count.
 2. **Validate** — checks that all input files share the same CRS and point format, and selects the appropriate COPC output format (6, 7, or 8).
-3. **Distribute** — reads every point, assigns it to an octree leaf voxel, and writes it to a temporary file on disk.
-4. **Build** — constructs the octree bottom-up, thinning points at each level to produce multi-resolution LODs.
-5. **Write** — encodes and compresses nodes in parallel into a single COPC file with a hierarchy EVLR for spatial indexing.
+3. **Count** — first full pass over the input: populates an occupancy grid used by the chunk planner to carve the dataset into thousands of roughly equal-sized chunks via counting sort.
+4. **Distribute** — second full pass over the input: streams every point into its chunk's scratch file on disk, bounded by the configured memory budget.
+5. **Build** — each chunk's sub-octree is built independently in memory in parallel, then merged at coarse levels up to a single global root, thinning points at each level to produce multi-resolution LODs.
+6. **Write** — encodes and compresses nodes in parallel into a single COPC file with a hierarchy EVLR for spatial indexing.
 
 ## Acknowledgments
 
