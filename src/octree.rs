@@ -1256,15 +1256,22 @@ impl OctreeBuilder {
     /// input file in parallel and appends each point to its chunk's temp
     /// file via a bounded LRU writer cache.
     pub fn distribute(&mut self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
-        // 1. Compute the chunk plan (counting + merge-sparse-cells).
+        // 1. Compute the chunk plan (counting + merge-sparse-cells). This
+        //    runs a full pass over the input to populate an occupancy grid,
+        //    which is its own user-visible stage.
         //    `chunk_target_override` lets tests force multi-chunk plans on
         //    small inputs; None = dynamic derivation from memory_budget.
+        config.report(crate::ProgressEvent::StageStart {
+            name: "Counting",
+            total: self.total_points,
+        });
         let plan = crate::chunking::compute_chunk_plan(
             self,
             input_files,
             config,
             config.chunk_target_override,
         )?;
+        config.report(crate::ProgressEvent::StageDone);
         info!(
             "Chunked distribute: {} chunks, target {} points each, grid {}³",
             plan.chunks.len(),
@@ -1334,6 +1341,14 @@ impl OctreeBuilder {
         // Capture the LUT and per-worker file ranges for the parallel block.
         let files_per_worker = input_files.len().div_ceil(num_workers);
         let progress = AtomicU64::new(0);
+
+        // 5. Partition pass — stream every point into its chunk's shard
+        //    file. This is the second full pass over the input and is
+        //    reported as its own `Distributing` stage.
+        config.report(crate::ProgressEvent::StageStart {
+            name: "Distributing",
+            total: self.total_points,
+        });
 
         // 5. Parallel workers stream input files and append points to chunks.
         shard_dirs
@@ -1432,6 +1447,7 @@ impl OctreeBuilder {
 
         // 6. Merge per-worker shards into canonical chunk files.
         merge_chunk_shards(&shards_root, &chunks_root, plan.chunks.len() as u32)?;
+        config.report(crate::ProgressEvent::StageDone);
 
         // 7. Stash the chunk plan for the build phase to consume.
         self.chunked_plan = Some(plan);

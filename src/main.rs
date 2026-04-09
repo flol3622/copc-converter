@@ -176,8 +176,8 @@ fn parse_memory_limit(s: &str) -> Result<u64> {
     Ok((value * multiplier as f64) as u64)
 }
 
-/// Total pipeline stages: Scanning + Distributing + Building + Writing.
-const TOTAL_STEPS: u32 = 4;
+/// Total pipeline stages: Scanning + Counting + Distributing + Building + Writing.
+const TOTAL_STEPS: u32 = 5;
 
 fn human_count(n: u64) -> String {
     if n >= 1_000_000_000 {

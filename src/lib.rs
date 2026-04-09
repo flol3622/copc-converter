@@ -287,13 +287,12 @@ impl Pipeline<Validated> {
         let mut builder =
             OctreeBuilder::from_scan(&self.inner.scan_results, validated, &self.inner.config)?;
 
-        let total_points: u64 = self.inner.scan_results.iter().map(|r| r.point_count).sum();
-        self.inner.config.report(ProgressEvent::StageStart {
-            name: "Distributing",
-            total: total_points,
-        });
+        // `builder.distribute` runs two full passes over the input — a
+        // counting pass and a partition pass — and emits its own
+        // `Counting` / `Distributing` stage events so the user sees them
+        // as two separate progress steps rather than one bar that fills
+        // twice.
         builder.distribute(&self.inner.input_files, &self.inner.config)?;
-        self.inner.config.report(ProgressEvent::StageDone);
         self.inner.builder = Some(builder);
         Ok(Pipeline {
             inner: self.inner,
