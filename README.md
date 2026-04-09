@@ -75,7 +75,7 @@ copc_converter ./my_survey/ survey.copc.laz --temporal-index
 The crate exposes a typestate pipeline API that enforces correct step ordering at compile time:
 
 ```rust
-use copc_converter::{BuildStrategy, Pipeline, PipelineConfig, collect_input_files};
+use copc_converter::{Pipeline, PipelineConfig, collect_input_files};
 
 let files = collect_input_files("./tiles/".into())?;
 let config = PipelineConfig {
@@ -84,7 +84,6 @@ let config = PipelineConfig {
     temporal_index: false,
     temporal_stride: 1000,
     progress: None, // or Some(Arc::new(your_observer))
-    build_strategy: BuildStrategy::PerLeaf,
     chunk_target_override: None,
 };
 

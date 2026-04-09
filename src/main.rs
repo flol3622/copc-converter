@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use copc_converter::{
-    BuildStrategy, Pipeline, PipelineConfig, ProgressEvent, ProgressObserver, collect_input_files,
+    Pipeline, PipelineConfig, ProgressEvent, ProgressObserver, collect_input_files,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
@@ -45,37 +45,11 @@ struct Args {
     #[arg(long)]
     threads: Option<usize>,
 
-    /// Build strategy. "per-leaf" (default, stable) writes one temp file per
-    /// leaf voxel and builds the octree level-by-level on disk. "chunked"
-    /// uses the Schütz et al. 2020 hierarchical counting-sort approach,
-    /// writing thousands of medium chunk files and building each chunk's
-    /// sub-octree in memory in parallel. "chunked" is faster overall and
-    /// dramatically faster on network filesystems (EFS, NFS).
-    #[arg(long, value_enum, default_value_t = BuildStrategyArg::Chunked)]
-    build_strategy: BuildStrategyArg,
-
     /// Hidden: override the chunked-build chunk target size in points.
     /// Bypasses the dynamic memory-budget-based calculation. Primarily for
     /// testing — force multiple chunks on a small input to exercise merge.
     #[arg(long, hide = true)]
     chunk_target: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum BuildStrategyArg {
-    /// Original per-leaf-temp-file build (stable, default).
-    PerLeaf,
-    /// Chunked build using counting-sort (Schütz et al. 2020).
-    Chunked,
-}
-
-impl From<BuildStrategyArg> for BuildStrategy {
-    fn from(a: BuildStrategyArg) -> Self {
-        match a {
-            BuildStrategyArg::PerLeaf => BuildStrategy::PerLeaf,
-            BuildStrategyArg::Chunked => BuildStrategy::Chunked,
-        }
-    }
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -179,16 +153,8 @@ fn parse_memory_limit(s: &str) -> Result<u64> {
     Ok((value * multiplier as f64) as u64)
 }
 
-/// Total pipeline stages for the chosen build strategy.
-///
-/// Per-leaf has Scanning + Distributing + Normalizing + Building + Writing = 5.
-/// Chunked rolls normalize into the per-chunk build, so it has 4 stages.
-fn total_steps_for(strategy: BuildStrategy) -> u32 {
-    match strategy {
-        BuildStrategy::PerLeaf => 5,
-        BuildStrategy::Chunked => 4,
-    }
-}
+/// Total pipeline stages: Scanning + Distributing + Building + Writing.
+const TOTAL_STEPS: u32 = 4;
 
 fn human_count(n: u64) -> String {
     if n >= 1_000_000_000 {
@@ -511,11 +477,10 @@ fn main() -> Result<()> {
         },
     );
 
-    let total_steps = total_steps_for(args.build_strategy.into());
     let progress: std::sync::Arc<dyn ProgressObserver> = match args.progress {
-        ProgressMode::Bar => std::sync::Arc::new(BarProgress::new(total_steps)),
-        ProgressMode::Plain => std::sync::Arc::new(PlainProgress::new(total_steps)),
-        ProgressMode::Json => std::sync::Arc::new(JsonProgress::new(total_steps)),
+        ProgressMode::Bar => std::sync::Arc::new(BarProgress::new(TOTAL_STEPS)),
+        ProgressMode::Plain => std::sync::Arc::new(PlainProgress::new(TOTAL_STEPS)),
+        ProgressMode::Json => std::sync::Arc::new(JsonProgress::new(TOTAL_STEPS)),
     };
 
     let config = PipelineConfig {
@@ -524,7 +489,6 @@ fn main() -> Result<()> {
         temporal_index: args.temporal_index,
         temporal_stride: args.temporal_stride,
         progress: Some(progress),
-        build_strategy: args.build_strategy.into(),
         chunk_target_override: args.chunk_target,
     };
 

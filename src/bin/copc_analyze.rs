@@ -413,9 +413,6 @@ fn main() -> Result<()> {
         temporal_index: false,
         temporal_stride: 1000,
         progress: Some(progress),
-        // The analyze tool only runs scan + validate + chunking; the build
-        // strategy is irrelevant here. PerLeaf is the safe default.
-        build_strategy: copc_converter::BuildStrategy::PerLeaf,
         // The analyze tool has its own --chunk-target flag; it plumbs it
         // through separately to `validated.analyze_chunking(...)` rather
         // than via the PipelineConfig field used by the convert path.

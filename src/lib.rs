@@ -5,7 +5,7 @@
 //! The conversion pipeline is enforced at compile time via typestate:
 //!
 //! ```no_run
-//! use copc_converter::{BuildStrategy, Pipeline, PipelineConfig};
+//! use copc_converter::{Pipeline, PipelineConfig};
 //!
 //! let config = PipelineConfig {
 //!     memory_budget: 12_884_901_888,
@@ -13,7 +13,6 @@
 //!     temporal_index: false,
 //!     temporal_stride: 1000,
 //!     progress: None,
-//!     build_strategy: BuildStrategy::PerLeaf,
 //!     chunk_target_override: None,
 //! };
 //! let files = copc_converter::collect_input_files("input.laz".into()).unwrap();
@@ -156,31 +155,6 @@ pub trait ProgressObserver: Send + Sync {
 // PipelineConfig
 // ---------------------------------------------------------------------------
 
-/// Strategy for the distribute + build phases.
-///
-/// The two strategies produce *equivalent* COPC output (same point set,
-/// same hierarchy shape) but use very different intermediate representations
-/// and I/O patterns. Cross-strategy output may not be byte-identical because
-/// `grid_sample` tie-breaking depends on point ordering at the leaf level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BuildStrategy {
-    /// Original per-leaf-temp-file build with multi-pass disk I/O.
-    ///
-    /// Lower per-chunk memory pressure, but writes hundreds of thousands of
-    /// tiny temp files and reads them back multiple times during build.
-    /// Catastrophic on network filesystems (EFS / NFS).
-    PerLeaf,
-    /// Chunked build (Schütz et al. 2020): counting-sort into ~thousands of
-    /// medium chunks, independent per-chunk in-memory build, merge at coarse
-    /// levels.
-    ///
-    /// Faster overall, dramatically faster on network filesystems because the
-    /// temp directory contains only ~thousands of files (one per chunk),
-    /// each written once sequentially and read once.
-    #[default]
-    Chunked,
-}
-
 /// Configuration for the conversion pipeline.
 pub struct PipelineConfig {
     /// Effective memory budget in bytes.
@@ -193,10 +167,6 @@ pub struct PipelineConfig {
     pub temporal_stride: u32,
     /// Optional progress observer for reporting pipeline progress.
     pub progress: Option<std::sync::Arc<dyn ProgressObserver>>,
-    /// Strategy for the distribute + build phases. Defaults to
-    /// [`BuildStrategy::PerLeaf`] for backward compatibility; the chunked
-    /// path is opt-in until it has been validated against production datasets.
-    pub build_strategy: BuildStrategy,
     /// Optional override for the chunked-build chunk target size (in points).
     /// `None` uses the dynamic target derived from memory budget. Primarily
     /// for testing — e.g. forcing multiple chunks on a small input to
