@@ -169,7 +169,6 @@ pub enum BuildStrategy {
     /// Lower per-chunk memory pressure, but writes hundreds of thousands of
     /// tiny temp files and reads them back multiple times during build.
     /// Catastrophic on network filesystems (EFS / NFS).
-    #[default]
     PerLeaf,
     /// Chunked build (Schütz et al. 2020): counting-sort into ~thousands of
     /// medium chunks, independent per-chunk in-memory build, merge at coarse
@@ -178,6 +177,7 @@ pub enum BuildStrategy {
     /// Faster overall, dramatically faster on network filesystems because the
     /// temp directory contains only ~thousands of files (one per chunk),
     /// each written once sequentially and read once.
+    #[default]
     Chunked,
 }
 

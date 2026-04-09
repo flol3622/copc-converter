@@ -51,7 +51,7 @@ struct Args {
     /// writing thousands of medium chunk files and building each chunk's
     /// sub-octree in memory in parallel. "chunked" is faster overall and
     /// dramatically faster on network filesystems (EFS, NFS).
-    #[arg(long, value_enum, default_value_t = BuildStrategyArg::PerLeaf)]
+    #[arg(long, value_enum, default_value_t = BuildStrategyArg::Chunked)]
     build_strategy: BuildStrategyArg,
 
     /// Hidden: override the chunked-build chunk target size in points.
