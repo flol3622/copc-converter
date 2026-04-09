@@ -19,11 +19,253 @@ use crate::copc_types::VoxelKey;
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
+
+// ---------------------------------------------------------------------------
+// Chunked-build constants and helper types
+// ---------------------------------------------------------------------------
+
+/// Maximum number of leaf chunk files kept open simultaneously across all
+/// distribute workers in the chunked path. Divided evenly between workers.
+///
+/// Each entry holds a `BufWriter<File>` (~8 KiB internal buffer) plus an OS
+/// file descriptor. Capping prevents FD exhaustion on hosts with low ulimits
+/// (default 256 on macOS, 1024 on most Linux containers).
+const CHUNKED_OPEN_FILES_CAP: usize = 512;
+
+/// Minimum per-worker LRU capacity for the chunk writer cache.
+const MIN_PER_WORKER_CHUNK_FILES: usize = 32;
+
+/// Bounded LRU cache of append-mode `BufWriter`s for chunk temp files.
+///
+/// Keys are chunk indices (`u32`). On eviction the writer is flushed and
+/// dropped, releasing both its buffer and its file descriptor. Subsequent
+/// writes to the same chunk index reopen the file in append mode.
+///
+/// This is the chunk-keyed analog of the per-leaf path's writer cache: the
+/// design is identical, only the key type changes.
+struct ChunkWriterCache {
+    writers: HashMap<u32, BufWriter<File>>,
+    /// Insertion / access order. Front = least recently used.
+    order: VecDeque<u32>,
+    capacity: usize,
+    codec: TempCompression,
+}
+
+impl ChunkWriterCache {
+    fn new(capacity: usize, codec: TempCompression) -> Self {
+        ChunkWriterCache {
+            writers: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+            codec,
+        }
+    }
+
+    /// Append the given points to the temp file for `chunk_idx`, opening (and
+    /// possibly evicting another entry) as needed.
+    fn append(&mut self, chunk_idx: u32, shard_dir: &Path, points: &[RawPoint]) -> Result<()> {
+        if points.is_empty() {
+            return Ok(());
+        }
+
+        if self.writers.contains_key(&chunk_idx) {
+            // Move to back (most-recently-used).
+            if let Some(pos) = self.order.iter().position(|k| *k == chunk_idx) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(chunk_idx);
+        } else {
+            // Evict if at capacity.
+            while self.writers.len() >= self.capacity {
+                if let Some(victim) = self.order.pop_front() {
+                    if let Some(mut w) = self.writers.remove(&victim) {
+                        w.flush().context("flush evicted chunk writer")?;
+                    }
+                } else {
+                    break;
+                }
+            }
+            let path = chunk_shard_path(shard_dir, chunk_idx);
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("Cannot open chunk file {:?}", path))?;
+            self.writers.insert(chunk_idx, BufWriter::new(f));
+            self.order.push_back(chunk_idx);
+        }
+
+        let w = self.writers.get_mut(&chunk_idx).expect("just inserted");
+        write_temp_batch(w, points, self.codec)?;
+        Ok(())
+    }
+
+    /// Flush and drop every cached writer.
+    fn flush_all(&mut self) -> Result<()> {
+        for (_, mut w) in self.writers.drain() {
+            w.flush().context("flush chunk writer")?;
+        }
+        self.order.clear();
+        Ok(())
+    }
+}
+
+/// Path for a chunk's per-worker shard file.
+fn chunk_shard_path(shard_dir: &Path, chunk_idx: u32) -> PathBuf {
+    shard_dir.join(format!("chunk_{chunk_idx}"))
+}
+
+/// Path for a chunk's canonical (merged) file under `tmp_dir/chunks/`.
+fn chunk_canonical_path(chunks_dir: &Path, chunk_idx: u32) -> PathBuf {
+    chunks_dir.join(format!("chunk_{chunk_idx}"))
+}
+
+/// Same heuristic as the per-leaf parallel distribute path: ~2/3 of cores,
+/// leaving headroom for the LAZ parallel decoder. Capped by input file count.
+fn chunked_distribute_worker_count(input_file_count: usize) -> usize {
+    let cores = rayon::current_num_threads();
+    let target = ((cores * 2) / 3).max(2);
+    target.min(input_file_count).max(1)
+}
+
+/// How many extra octree levels a chunk needs to subdivide internally so its
+/// leaves hold ~`MAX_LEAF_POINTS` on average.
+///
+/// Computes `ceil(log8(point_count / MAX_LEAF_POINTS))`, clamped to a sane
+/// upper bound. Returns 0 for chunks at or below `MAX_LEAF_POINTS` (the
+/// chunk root is the only leaf).
+///
+/// **Uniform subdivision** — dense regions inside the chunk may exceed
+/// `MAX_LEAF_POINTS` per leaf, which is acceptable per the design doc §9.3.
+/// `grid_sample`'s natural cascading handles the imbalance during the
+/// bottom-up build.
+fn chunk_local_extra_levels(point_count: u64) -> u32 {
+    if point_count <= MAX_LEAF_POINTS {
+        return 0;
+    }
+    let mut d = 0u32;
+    while (point_count as f64) / (8u64.pow(d) as f64) > MAX_LEAF_POINTS as f64 {
+        d += 1;
+        // Cap at a generous limit. With 8^9 = 134M, even a 100B-point
+        // chunk would only need d = 9, but we allow a couple more levels
+        // for highly imbalanced chunks before giving up.
+        if d > 12 {
+            break;
+        }
+    }
+    d
+}
+
+/// Build the cell → chunk_index lookup table from a chunk plan.
+///
+/// The grid has `grid_size³` fine cells; for each chunk we fill in every
+/// fine cell it covers. A chunk at level L covers a `2^(grid_depth - L)`
+/// cube per axis, since the grid corresponds to octree cells at `grid_depth`.
+///
+/// Returns a flat `Vec<u32>` indexed by `gx + gy*G + gz*G²`. Each entry
+/// holds the chunk index this cell belongs to. Cells not covered by any
+/// chunk (which should not happen for a well-formed plan) get `u32::MAX`
+/// as a sentinel; we treat any point landing in such a cell as a bug.
+fn build_chunk_lut(plan: &crate::chunking::ChunkPlan) -> Vec<u32> {
+    let g = plan.grid_size as usize;
+    let n_cells = g * g * g;
+    let mut lut = vec![u32::MAX; n_cells];
+
+    for (chunk_idx, chunk) in plan.chunks.iter().enumerate() {
+        // The chunk lives at chunk.level. The fine grid is at plan.grid_depth.
+        // Each chunk cell covers a stride of 2^(grid_depth - chunk.level)
+        // along each axis in the fine grid.
+        let level_diff = plan.grid_depth as i32 - chunk.level as i32;
+        debug_assert!(
+            level_diff >= 0,
+            "chunk level {} above grid depth {}",
+            chunk.level,
+            plan.grid_depth
+        );
+        let stride: usize = 1usize << level_diff as u32;
+
+        // Top-left corner of this chunk in fine-grid coordinates, clamped
+        // defensively against malformed chunks. (Should never trigger for
+        // a plan produced by `merge_sparse_cells`.)
+        let base_x = (chunk.gx as usize * stride).min(g);
+        let base_y = (chunk.gy as usize * stride).min(g);
+        let base_z = (chunk.gz as usize * stride).min(g);
+        let end_x = (base_x + stride).min(g);
+        let end_y = (base_y + stride).min(g);
+        let end_z = (base_z + stride).min(g);
+
+        for z in base_z..end_z {
+            for y in base_y..end_y {
+                let row_start = base_x + y * g + z * g * g;
+                let row_end = end_x + y * g + z * g * g;
+                for cell in &mut lut[row_start..row_end] {
+                    *cell = chunk_idx as u32;
+                }
+            }
+        }
+    }
+
+    lut
+}
+
+/// Concatenate per-worker shard files into the canonical
+/// `tmp_dir/chunks/chunk_N` location. Runs in parallel over chunk indices.
+///
+/// After this returns successfully, the `shards/` subdirectory is removed
+/// and only the canonical chunk files remain under `chunks/`.
+fn merge_chunk_shards(shards_root: &Path, chunks_root: &Path, n_chunks: u32) -> Result<()> {
+    let num_workers = match std::fs::read_dir(shards_root) {
+        Ok(it) => it
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .count(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e.into()),
+    };
+    debug!(
+        "Merging {} chunks across {} worker shards",
+        n_chunks, num_workers
+    );
+
+    (0..n_chunks)
+        .into_par_iter()
+        .try_for_each(|chunk_idx| -> Result<()> {
+            let canonical = chunk_canonical_path(chunks_root, chunk_idx);
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&canonical)
+                .with_context(|| format!("opening canonical chunk file {:?}", canonical))?;
+            let mut out = BufWriter::new(f);
+            for w in 0..num_workers {
+                let shard_path = shards_root
+                    .join(w.to_string())
+                    .join(format!("chunk_{chunk_idx}"));
+                match File::open(&shard_path) {
+                    Ok(f) => {
+                        let mut reader = BufReader::new(f);
+                        std::io::copy(&mut reader, &mut out).with_context(|| {
+                            format!("copying shard {:?} into {:?}", shard_path, canonical)
+                        })?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            out.flush().context("flush merged chunk file")?;
+            Ok(())
+        })?;
+
+    std::fs::remove_dir_all(shards_root)
+        .with_context(|| format!("removing shards root {:?}", shards_root))?;
+    Ok(())
+}
 
 /// Task fed into the parallel grid-sampling step: parent key, child keys, and
 /// indexed points (child-index, point).
@@ -162,6 +404,171 @@ impl RawPoint {
         }
         w.write_all(&buf)?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Temp-file frame format
+// ---------------------------------------------------------------------------
+//
+// Every scratch file on disk (per-node files and per-chunk shard/canonical
+// files) is a sequence of zero or more *batches*. Each batch contains:
+//
+//     u32 LE point_count      (4 bytes)
+//     point_count × RawPoint  (38 bytes per point)
+//
+// - In `TempCompression::None` mode, batches are laid down directly in the
+//   file, back-to-back.
+// - In `TempCompression::Lz4` mode, each batch is wrapped in its own
+//   self-contained LZ4 frame (frame format). `FrameDecoder` walks multiple
+//   concatenated frames transparently, so the reader logic is identical:
+//   read u32 count + payload, repeat until EOF.
+//
+// Per-node files (`write_node_to_temp`) always contain exactly one batch,
+// including zero-point batches. Per-chunk shard files contain one batch per
+// `ChunkWriterCache::append` call — an LZ4 frame encoder cannot be resumed
+// across re-opens, so each append finalises its own frame. The merged
+// canonical chunk files inherit the multi-batch layout via
+// `merge_chunk_shards`'s byte-level concatenation.
+
+use crate::TempCompression;
+
+/// Adapter that flattens a sequence of concatenated LZ4 frames into a single
+/// logical stream.
+///
+/// `lz4_flex::frame::FrameDecoder` returns `Ok(0)` at the end of each frame
+/// even when more frames follow. Most `Read` consumers (including
+/// `Read::read_exact` and `byteorder::ReadBytesExt`) treat `Ok(0)` as
+/// end-of-stream, which truncates multi-frame files after the first frame.
+///
+/// This adapter re-probes the underlying reader whenever it sees an
+/// end-of-frame `Ok(0)`: the subsequent `read` call on the decoder will
+/// attempt to parse the next frame's header and yield its first block.
+/// Two consecutive zero-returns — end of frame followed by genuine EOF on
+/// the underlying reader — signal true end of stream.
+struct MultiFrameReader<R: std::io::Read> {
+    inner: R,
+}
+
+impl<R: std::io::Read> std::io::Read for MultiFrameReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        match self.inner.read(buf)? {
+            0 => {
+                // End of current frame. Try once more to see if another
+                // frame follows; a second zero means genuine EOF.
+                self.inner.read(buf)
+            }
+            n => Ok(n),
+        }
+    }
+}
+
+/// Write a single batch: a 4-byte little-endian point count followed by
+/// `points.len() × RawPoint::BYTE_SIZE` payload bytes. If `codec` is
+/// `Lz4`, the entire batch is encapsulated in a self-contained LZ4 frame.
+fn write_temp_batch<W: Write>(
+    w: &mut W,
+    points: &[RawPoint],
+    codec: TempCompression,
+) -> Result<()> {
+    match codec {
+        TempCompression::None => {
+            w.write_u32::<LittleEndian>(points.len() as u32)?;
+            RawPoint::write_bulk(points, w)?;
+        }
+        TempCompression::Lz4 => {
+            let mut enc = lz4_flex::frame::FrameEncoder::new(w);
+            enc.write_u32::<LittleEndian>(points.len() as u32)?;
+            RawPoint::write_bulk(points, &mut enc)?;
+            enc.finish().context("finishing lz4 frame")?;
+        }
+    }
+    Ok(())
+}
+
+/// Read every batch in a reader to EOF, concatenating their points.
+/// For `Lz4` the reader is wrapped in a `FrameDecoder` + `MultiFrameReader`,
+/// which together walk multi-frame streams transparently. An empty reader
+/// produces an empty Vec.
+fn read_temp_batches<R: std::io::Read>(r: R, codec: TempCompression) -> Result<Vec<RawPoint>> {
+    match codec {
+        TempCompression::None => read_batches_loop(&mut BufReader::new(r)),
+        TempCompression::Lz4 => {
+            let dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(r));
+            let mut mf = MultiFrameReader { inner: dec };
+            read_batches_loop(&mut mf)
+        }
+    }
+}
+
+fn read_batches_loop<R: std::io::Read>(r: &mut R) -> Result<Vec<RawPoint>> {
+    let mut out: Vec<RawPoint> = Vec::new();
+    loop {
+        let count = match r.read_u32::<LittleEndian>() {
+            Ok(n) => n as usize,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        };
+        out.reserve(count);
+        for _ in 0..count {
+            out.push(RawPoint::read(r)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Count the points in a temp file by walking batch headers. For `None` mode
+/// this seeks past payloads without decoding. For `Lz4` mode there is no
+/// cheap way to skip a compressed payload, so we run the decoder and count
+/// headers (still cheaper than materialising all points — payload bytes are
+/// streamed through a throwaway sink). Returns 0 if the file does not exist.
+fn count_temp_file_points(path: &Path, codec: TempCompression) -> Result<u64> {
+    let f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    match codec {
+        TempCompression::None => {
+            use std::io::{Seek, SeekFrom};
+            let mut f = f;
+            let mut total: u64 = 0;
+            loop {
+                let count = match f.read_u32::<LittleEndian>() {
+                    Ok(n) => n as u64,
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                };
+                total += count;
+                let payload = count * RawPoint::BYTE_SIZE as u64;
+                f.seek(SeekFrom::Current(payload as i64))?;
+            }
+            Ok(total)
+        }
+        TempCompression::Lz4 => {
+            let dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(f));
+            let mut mf = MultiFrameReader { inner: dec };
+            let mut total: u64 = 0;
+            let mut sink = [0u8; 4096];
+            loop {
+                let count = match mf.read_u32::<LittleEndian>() {
+                    Ok(n) => n as u64,
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                };
+                total += count;
+                let mut remaining = count * RawPoint::BYTE_SIZE as u64;
+                while remaining > 0 {
+                    let want = remaining.min(sink.len() as u64) as usize;
+                    mf.read_exact(&mut sink[..want])?;
+                    remaining -= want as u64;
+                }
+            }
+            Ok(total)
+        }
     }
 }
 
@@ -348,8 +755,6 @@ pub struct OctreeBuilder {
     pub cz: f64,
     /// Half-size of the root voxel.
     pub halfsize: f64,
-    /// Initial octree depth before normalization.
-    pub depth: u32,
     /// X scale factor from the first input file.
     pub scale_x: f64,
     /// Y scale factor.
@@ -368,6 +773,11 @@ pub struct OctreeBuilder {
     pub wkt_crs: Option<Vec<u8>>,
     /// COPC output point format (6, 7, or 8), derived from input files.
     pub point_format: u8,
+    /// Chunk plan computed by `distribute_chunked` and consumed by
+    /// `build_node_map_chunked`. `None` for the per-leaf path.
+    pub(crate) chunked_plan: Option<crate::chunking::ChunkPlan>,
+    /// Compression codec applied to scratch temp files.
+    pub(crate) temp_compression: crate::TempCompression,
 }
 
 impl OctreeBuilder {
@@ -459,7 +869,6 @@ impl OctreeBuilder {
             cy,
             cz,
             halfsize,
-            depth,
             scale_x,
             scale_y,
             scale_z,
@@ -469,6 +878,8 @@ impl OctreeBuilder {
             tmp_dir,
             wkt_crs: validated.wkt_crs.clone(),
             point_format: validated.point_format,
+            chunked_plan: None,
+            temp_compression: config.temp_compression,
         })
     }
 
@@ -502,171 +913,6 @@ impl OctreeBuilder {
         }
     }
 
-    /// Parallel key assignment + coordinate conversion for a batch of points.
-    ///
-    /// Key assignment uses the *reconstructed* world coordinates (integer → world)
-    /// rather than the original floating-point coordinates.  This guarantees that
-    /// what the validator computes from the stored integers always falls inside the
-    /// assigned voxel, even when input files use different scales/offsets.
-    fn classify_points_parallel(&self, points: &[las::Point]) -> Vec<(VoxelKey, RawPoint)> {
-        points
-            .par_iter()
-            .map(|p| {
-                let raw = self.convert_point(p);
-                let rx = raw.x as f64 * self.scale_x + self.offset_x;
-                let ry = raw.y as f64 * self.scale_y + self.offset_y;
-                let rz = raw.z as f64 * self.scale_z + self.offset_z;
-                let key = point_to_key(
-                    rx,
-                    ry,
-                    rz,
-                    self.cx,
-                    self.cy,
-                    self.cz,
-                    self.halfsize,
-                    self.depth,
-                );
-                (key, raw)
-            })
-            .collect()
-    }
-
-    /// Merge classified points into per-key buffers and flush periodically.
-    fn merge_into_buffers(
-        classified: Vec<(VoxelKey, RawPoint)>,
-        buffers: &mut HashMap<VoxelKey, Vec<RawPoint>>,
-        writers: &mut HashMap<VoxelKey, BufWriter<File>>,
-        tmp_dir: &Path,
-        point_idx: &mut u64,
-        flush_every: usize,
-    ) -> Result<()> {
-        for (key, raw) in classified {
-            buffers.entry(key).or_default().push(raw);
-            *point_idx += 1;
-            if (*point_idx).is_multiple_of(flush_every as u64) {
-                Self::flush_buffers(buffers, writers, tmp_dir)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Pass 2: assign all points to leaf temp files.
-    ///
-    /// Uses `read_all_points_into` (fast parallel decompression) when the file
-    /// fits within half the memory budget; otherwise falls back to batched reads.
-    /// Key assignment and coordinate conversion are always parallelized via rayon.
-    pub fn distribute(&self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
-        let flush_every =
-            ((config.memory_budget / 4) as usize / RawPoint::BYTE_SIZE).clamp(10_000, 500_000);
-        debug!(
-            "Distribute: budget={} MB, flush_every={} points",
-            config.memory_budget / 1_048_576,
-            flush_every
-        );
-
-        let mut buffers: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
-        let mut writers: HashMap<VoxelKey, BufWriter<File>> = HashMap::new();
-        let mut point_idx = 0u64;
-
-        let half_budget = config.memory_budget / 2;
-
-        for path in input_files {
-            let mut reader =
-                las::Reader::from_path(path).with_context(|| format!("Cannot open {:?}", path))?;
-
-            let file_point_count = reader.header().number_of_points();
-            // Estimated memory per las::Point (~120 bytes)
-            let estimated_mem = file_point_count * 120;
-
-            debug!(
-                "Distribute file {:?}: {} points, est {} MB, half_budget={} MB → {}",
-                path.file_name().unwrap_or_default(),
-                file_point_count,
-                estimated_mem / 1_048_576,
-                half_budget / 1_048_576,
-                if estimated_mem <= half_budget {
-                    "fast path"
-                } else {
-                    "batched path"
-                }
-            );
-
-            if estimated_mem <= half_budget {
-                // Fast path: load entire file with parallel decompression
-                let mut points: Vec<las::Point> = Vec::new();
-                reader.read_all_points_into(&mut points)?;
-                let classified = self.classify_points_parallel(&points);
-                drop(points);
-                Self::merge_into_buffers(
-                    classified,
-                    &mut buffers,
-                    &mut writers,
-                    &self.tmp_dir,
-                    &mut point_idx,
-                    flush_every,
-                )?;
-                config.report(crate::ProgressEvent::StageProgress { done: point_idx });
-            } else {
-                // Batched path: read in chunks to stay within budget
-                let batch_size = (half_budget / 120).max(10_000) as usize;
-                debug!(
-                    "File too large (~{} MB), using batched reads of {} points",
-                    estimated_mem / (1024 * 1024),
-                    batch_size
-                );
-                let mut points: Vec<las::Point> = Vec::new();
-                loop {
-                    points.clear();
-                    let n = reader.read_points_into(batch_size as u64, &mut points)?;
-                    if n == 0 {
-                        break;
-                    }
-                    let classified = self.classify_points_parallel(&points);
-                    Self::merge_into_buffers(
-                        classified,
-                        &mut buffers,
-                        &mut writers,
-                        &self.tmp_dir,
-                        &mut point_idx,
-                        flush_every,
-                    )?;
-                    config.report(crate::ProgressEvent::StageProgress { done: point_idx });
-                }
-            }
-        }
-
-        Self::flush_buffers(&mut buffers, &mut writers, &self.tmp_dir)?;
-        // Explicitly flush all BufWriters so no data is lost on drop.
-        for (_, w) in writers.iter_mut() {
-            std::io::Write::flush(w).context("flush distribute writer")?;
-        }
-        Ok(())
-    }
-
-    fn flush_buffers(
-        buffers: &mut HashMap<VoxelKey, Vec<RawPoint>>,
-        writers: &mut HashMap<VoxelKey, BufWriter<File>>,
-        tmp_dir: &Path,
-    ) -> Result<()> {
-        for (key, pts) in buffers.iter_mut() {
-            if pts.is_empty() {
-                continue;
-            }
-            let w = writers.entry(*key).or_insert_with(|| {
-                let path = tmp_dir.join(format!("{}_{}_{}_{}", key.level, key.x, key.y, key.z));
-                let f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .expect("Cannot open leaf file");
-                BufWriter::new(f)
-            });
-            RawPoint::write_bulk(pts, w)?;
-            pts.clear();
-        }
-        Ok(())
-    }
-
     /// Read all raw points for a given node key from disk.
     pub fn read_node(&self, key: &VoxelKey) -> Result<Vec<RawPoint>> {
         let path = self.node_path(key);
@@ -675,314 +921,51 @@ impl OctreeBuilder {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => return Err(e.into()),
         };
-        let file_len = f.metadata()?.len();
-        let count = file_len as usize / RawPoint::BYTE_SIZE;
-        let mut r = BufReader::new(f);
-        let mut pts = Vec::with_capacity(count);
-        for _ in 0..count {
-            pts.push(RawPoint::read(&mut r)?);
-        }
-        Ok(pts)
+        read_temp_batches(f, self.temp_compression)
     }
 
-    /// Write points to a temp file for the given node key (overwrites if exists).
+    /// Write points to a temp file for the given node key (overwrites if
+    /// exists). Always writes exactly one batch, even for an empty slice.
     pub fn write_node_to_temp(&self, key: &VoxelKey, points: &[RawPoint]) -> Result<()> {
-        use std::io::Write;
         let path = self.node_path(key);
         let f = File::create(&path)?;
         let mut w = BufWriter::new(f);
-        RawPoint::write_bulk(points, &mut w)?;
+        write_temp_batch(&mut w, points, self.temp_compression)?;
         w.flush().context("flush node temp file")?;
         Ok(())
     }
 
-    /// Enumerate all node keys that have a non-empty temp file.
-    fn all_node_keys(&self) -> Result<Vec<VoxelKey>> {
-        let mut keys = Vec::new();
-        for entry in std::fs::read_dir(&self.tmp_dir)? {
-            let entry = entry?;
-            let name = entry.file_name().into_string().unwrap_or_default();
-            let parts: Vec<&str> = name.split('_').collect();
-            if parts.len() == 4
-                && let (Ok(l), Ok(x), Ok(y), Ok(z)) = (
-                    parts[0].parse::<i32>(),
-                    parts[1].parse::<i32>(),
-                    parts[2].parse::<i32>(),
-                    parts[3].parse::<i32>(),
-                )
-            {
-                keys.push(VoxelKey { level: l, x, y, z });
-            }
-        }
-        Ok(keys)
-    }
-
-    /// Phase 0 of build_node_map: split any leaf file that exceeds MAX_LEAF_POINTS.
+    /// Bottom-up grid-sample loop over an in-memory `nodes` HashMap.
     ///
-    /// All nodes being split in one round occupy disjoint voxels, so their child
-    /// files never conflict — the entire round is processed in parallel via rayon.
-    /// Rounds repeat until no oversized nodes remain.
-    fn normalize_leaves(&self, memory_budget: u64, config: &crate::PipelineConfig) -> Result<()> {
-        let oversized = |k: &VoxelKey| -> bool {
-            self.node_path(k)
-                .metadata()
-                .is_ok_and(|m| m.len() / RawPoint::BYTE_SIZE as u64 > MAX_LEAF_POINTS)
-        };
-
-        let mut to_split: Vec<VoxelKey> = self
-            .all_node_keys()?
-            .into_iter()
-            .filter(|k| oversized(k))
-            .collect();
-
-        if to_split.is_empty() {
-            return Ok(());
-        }
-
-        // Report normalize as its own stage. We don't know the total upfront
-        // (each round can produce new oversized children), so use 0 = spinner.
-        config.report(crate::ProgressEvent::StageStart {
-            name: "Normalizing",
-            total: 0,
-        });
-
-        // Points per chunk when streaming a split. Each rayon thread holds one
-        // chunk (~40 bytes/point) plus a HashMap of classified output (~40 bytes/
-        // point + hash overhead ≈ 1.3x), so peak per thread ≈ 2.5x chunk size.
-        // Divide the budget by (threads × 2.5) to size chunks so all threads
-        // can be active simultaneously without exceeding the budget.
-        let num_threads = rayon::current_num_threads() as u64;
-        let per_thread_budget = memory_budget / num_threads.max(1);
-        // 2.5x overhead → divide by 3 for safety margin
-        let chunk_points = ((per_thread_budget / 3) as usize / RawPoint::BYTE_SIZE).max(100_000);
-
-        let mut round = 0u32;
-        while !to_split.is_empty() {
-            round += 1;
-            let split_count = to_split.len();
-            let total_split_bytes: u64 = to_split
-                .iter()
-                .map(|k| self.node_path(k).metadata().map_or(0, |m| m.len()))
-                .sum();
-            info!(
-                "normalize round {round}: splitting {} nodes ({} MB on disk)",
-                split_count,
-                total_split_bytes / 1_048_576,
-            );
-
-            // All nodes in a round occupy disjoint voxels → their children
-            // are also disjoint → safe to split in parallel. Each node is
-            // streamed in chunks so memory stays bounded regardless of node size.
-            let new_children: Vec<VoxelKey> = to_split
-                .par_iter()
-                .map(|key| -> Result<Vec<VoxelKey>> {
-                    let path = self.node_path(key);
-                    let f = File::open(&path)?;
-                    let file_len = f.metadata()?.len();
-                    let total_count = file_len as usize / RawPoint::BYTE_SIZE;
-                    let mut reader = BufReader::new(f);
-
-                    // Open child writers in append mode so successive chunks
-                    // accumulate into the same files.
-                    let child_level = key.level + 1;
-                    let mut child_writers: HashMap<VoxelKey, BufWriter<File>> = HashMap::new();
-                    let mut child_keys_set: HashSet<VoxelKey> = HashSet::new();
-
-                    let mut read_so_far = 0usize;
-                    while read_so_far < total_count {
-                        let n = chunk_points.min(total_count - read_so_far);
-                        let mut chunk = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            chunk.push(RawPoint::read(&mut reader)?);
-                        }
-                        read_so_far += n;
-
-                        // Classify and append to child files.
-                        let mut per_child: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
-                        for p in chunk {
-                            let wx = p.x as f64 * self.scale_x + self.offset_x;
-                            let wy = p.y as f64 * self.scale_y + self.offset_y;
-                            let wz = p.z as f64 * self.scale_z + self.offset_z;
-                            let ck = point_to_key(
-                                wx,
-                                wy,
-                                wz,
-                                self.cx,
-                                self.cy,
-                                self.cz,
-                                self.halfsize,
-                                child_level as u32,
-                            );
-                            per_child.entry(ck).or_default().push(p);
-                        }
-
-                        for (ck, pts) in per_child {
-                            child_keys_set.insert(ck);
-                            let w = child_writers.entry(ck).or_insert_with(|| {
-                                let child_path = self.node_path(&ck);
-                                let f = OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(&child_path)
-                                    .expect("Cannot open child temp file");
-                                BufWriter::new(f)
-                            });
-                            RawPoint::write_bulk(&pts, w)?;
-                        }
-                    }
-
-                    // Flush all child writers.
-                    for (_, mut w) in child_writers {
-                        std::io::Write::flush(&mut w).context("flush child temp file")?;
-                    }
-
-                    // Remove the parent file now that all data has been written to children.
-                    std::fs::remove_file(&path)?;
-
-                    Ok(child_keys_set.into_iter().collect())
-                })
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect();
-
-            to_split = new_children.into_iter().filter(|k| oversized(k)).collect();
-        }
-        config.report(crate::ProgressEvent::StageDone);
-        Ok(())
-    }
-
-    /// Build the full node hierarchy.
+    /// Walks levels `(min_level..actual_max_depth)` in reverse, grouping
+    /// children of each parent and running `grid_sample` to produce that
+    /// parent. After the loop completes, every node in the resulting map is
+    /// written to its canonical temp file location.
     ///
-    /// Phase 0: normalize leaves in parallel.
-    /// Phase 1: determine actual max depth.
-    /// Phase 2: bottom-up ancestor building.
-    ///   Fast path  – if all leaf data fits in the memory budget, everything is
-    ///                processed in RAM (one disk read + one disk write total).
-    ///   Slow path  – level-by-level with disk I/O, but without redundant directory
-    ///                scans (keys are tracked in a per-level map).
+    /// With `min_level = 0` the loop walks all the way to the global root
+    /// (per-leaf path). With a positive `min_level` the loop stops once it
+    /// has produced parents at `min_level`, leaving any coarser ancestors
+    /// to a later merge step (chunked path: each chunk's bottom-up build
+    /// stops at the chunk's root level).
     ///
-    /// Returns (VoxelKey, point_count) for every node in the hierarchy.
-    pub fn build_node_map(&self, config: &crate::PipelineConfig) -> Result<Vec<(VoxelKey, usize)>> {
-        // Phase 0
-        self.normalize_leaves(config.memory_budget, config)?;
-
-        // Phase 1
-        let leaf_keys = self.all_node_keys()?;
-        let actual_max_depth = leaf_keys.iter().map(|k| k.level as u32).max().unwrap_or(0);
-        info!(
-            "Leaf nodes after normalization: {}, max depth: {actual_max_depth}",
-            leaf_keys.len()
-        );
-
-        // Estimate memory required to hold all leaf data. The in-memory path
-        // keeps all points in a HashMap<VoxelKey, Vec<RawPoint>> and during
-        // grid_sample temporarily holds both input and output, so the peak is
-        // roughly 2x the raw data size.
-        let total_bytes: u64 = leaf_keys
-            .iter()
-            .map(|k| self.node_path(k).metadata().map_or(0, |m| m.len()))
-            .sum();
-        let estimated_peak = total_bytes * 2;
-
-        config.report(crate::ProgressEvent::StageStart {
-            name: "Building",
-            total: actual_max_depth as u64,
-        });
-
-        // Phase 2
-        let result = if estimated_peak <= config.memory_budget {
-            info!(
-                "Build path: IN-MEMORY (leaf data={} MB, est peak={} MB, budget={} MB)",
-                total_bytes / 1_048_576,
-                estimated_peak / 1_048_576,
-                config.memory_budget / 1_048_576,
-            );
-            self.bottom_up_in_memory(&leaf_keys, actual_max_depth, config)?
-        } else {
-            info!(
-                "Build path: OUT-OF-CORE (leaf data={} MB, est peak={} MB > budget={} MB)",
-                total_bytes / 1_048_576,
-                estimated_peak / 1_048_576,
-                config.memory_budget / 1_048_576,
-            );
-            self.bottom_up_on_disk(leaf_keys, actual_max_depth, config.memory_budget, config)?
-        };
-        config.report(crate::ProgressEvent::StageDone);
-
-        let total_pts: usize = result.iter().map(|(_, c)| *c).sum();
-        info!(
-            "Total octree nodes: {}, total points: {} (original: {})",
-            result.len(),
-            total_pts,
-            self.total_points
-        );
-        if total_pts as u64 != self.total_points {
-            debug!(
-                "COPC contains {} points vs {} from input headers (diff {}). \
-                 Input LAZ headers sometimes report inaccurate point counts.",
-                total_pts,
-                self.total_points,
-                self.total_points as i64 - total_pts as i64
-            );
-        }
-
-        // Ensure every ancestor of every data node is present in the hierarchy
-        // (empty ancestors allow validators to traverse the tree top-down).
-        let mut result = result;
-        let mut present: HashSet<VoxelKey> = result.iter().map(|(k, _)| *k).collect();
-        let mut extra: Vec<VoxelKey> = Vec::new();
-        for (key, _) in &result {
-            let mut k = *key;
-            while let Some(parent) = k.parent() {
-                if present.insert(parent) {
-                    extra.push(parent);
-                }
-                k = parent;
-            }
-        }
-        for k in extra {
-            result.push((k, 0));
-        }
-        result.sort_by_key(|(k, _)| k.level);
-        Ok(result)
-    }
-
-    /// Bottom-up pass — in-memory fast path.
-    ///
-    /// Loads all leaf data into a HashMap, runs grid_sample at every level
-    /// without any intermediate disk I/O, then writes the final node files once.
-    fn bottom_up_in_memory(
+    /// `report_progress` controls whether per-level `StageProgress` events
+    /// are emitted. The per-leaf path passes `true` (the level loop is the
+    /// main unit of progress). The chunked path passes `false` because its
+    /// outer stage tracks chunks-done, not levels-done.
+    fn bottom_up_levels(
         &self,
-        leaf_keys: &[VoxelKey],
+        mut nodes: HashMap<VoxelKey, Vec<RawPoint>>,
         actual_max_depth: u32,
+        min_level: u32,
+        report_progress: bool,
         config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
-        debug!(
-            "In-memory build: loading {} leaf nodes in parallel",
-            leaf_keys.len()
-        );
-        // Load all leaf nodes in parallel.
-        let mut nodes: HashMap<VoxelKey, Vec<RawPoint>> = leaf_keys
-            .par_iter()
-            .map(|k| -> Result<(VoxelKey, Vec<RawPoint>)> { Ok((*k, self.read_node(k)?)) })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|(_, pts)| !pts.is_empty())
-            .collect();
-
-        let total_in_mem: usize = nodes.values().map(|v| v.len()).sum();
-        debug!(
-            "In-memory build: loaded {} nodes, {} points ({} MB)",
-            nodes.len(),
-            total_in_mem,
-            (total_in_mem * std::mem::size_of::<RawPoint>()) / 1_048_576,
-        );
-
-        for d in (0..actual_max_depth).rev() {
-            config.report(crate::ProgressEvent::StageProgress {
-                done: (actual_max_depth - d) as u64,
-            });
+        for d in (min_level..actual_max_depth).rev() {
+            if report_progress {
+                config.report(crate::ProgressEvent::StageProgress {
+                    done: (actual_max_depth - d) as u64,
+                });
+            }
             let level_points: usize = nodes
                 .iter()
                 .filter(|(k, _)| k.level as u32 == d + 1)
@@ -1068,195 +1051,20 @@ impl OctreeBuilder {
             .collect())
     }
 
-    /// Bottom-up pass — disk-based slow path.
-    ///
-    /// Processes one level at a time with disk I/O.  Avoids redundant directory
-    /// scans by maintaining a per-level key map updated after each level.
-    /// Parents are batched so that the estimated peak memory of all concurrently
-    /// loaded points stays within the configured memory budget.
-    fn bottom_up_on_disk(
-        &self,
-        leaf_keys: Vec<VoxelKey>,
-        actual_max_depth: u32,
-        memory_budget: u64,
-        config: &crate::PipelineConfig,
-    ) -> Result<Vec<(VoxelKey, usize)>> {
-        // Organise known keys by level — updated as parent nodes are created.
-        // Use a set per level to prevent duplicate keys (a leaf and a parent
-        // created by the bottom-up pass can share the same key when
-        // normalize_leaves produces leaves at mixed depths).
-        let mut keys_by_level: HashMap<i32, HashSet<VoxelKey>> = HashMap::new();
-        for k in leaf_keys {
-            keys_by_level.entry(k.level).or_default().insert(k);
-        }
-
-        // In-memory cost per point during grid_sample: the (usize, RawPoint) input
-        // vec plus the output vecs (parent + per-child remaining) — roughly 2x the
-        // input since points move from input to output.
-        const MEM_PER_POINT: u64 =
-            (std::mem::size_of::<(usize, RawPoint)>() + std::mem::size_of::<RawPoint>()) as u64;
-
-        for d in (0..actual_max_depth).rev() {
-            config.report(crate::ProgressEvent::StageProgress {
-                done: (actual_max_depth - d) as u64,
-            });
-            debug!("Building ancestor level {d}");
-            let child_keys: Vec<VoxelKey> = match keys_by_level.get(&(d as i32 + 1)) {
-                Some(v) => v.iter().copied().collect(),
-                None => continue,
-            };
-
-            let mut parent_children: HashMap<VoxelKey, Vec<VoxelKey>> = HashMap::new();
-            for ck in &child_keys {
-                if let Some(parent) = ck.parent() {
-                    parent_children.entry(parent).or_default().push(*ck);
-                }
-            }
-            if parent_children.is_empty() {
-                continue;
-            }
-
-            // Estimate each parent's memory cost from its children's file sizes,
-            // then batch parents so the total stays within the memory budget.
-            // Parents that exceed the budget on their own use a streaming path.
-            let mut small_parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = Vec::new();
-            let mut large_parents: Vec<(VoxelKey, Vec<VoxelKey>)> = Vec::new();
-
-            for (parent, children) in parent_children {
-                let child_bytes: u64 = children
-                    .iter()
-                    .map(|ck| self.node_path(ck).metadata().map_or(0, |m| m.len()))
-                    .sum();
-                let est_points = child_bytes / RawPoint::BYTE_SIZE as u64;
-                let est_mem = est_points * MEM_PER_POINT;
-                if est_mem > memory_budget {
-                    large_parents.push((parent, children));
-                } else {
-                    small_parents.push((parent, children, est_mem));
-                }
-            }
-
-            debug!(
-                "Level {d}: {} parents ({} small, {} large/streaming), budget={} MB",
-                small_parents.len() + large_parents.len(),
-                small_parents.len(),
-                large_parents.len(),
-                memory_budget / 1_048_576,
-            );
-
-            let mut new_parent_keys: Vec<VoxelKey> = Vec::new();
-
-            // Process oversized parents sequentially with streaming grid_sample.
-            // Only one child is in memory at a time.
-            for (parent, children) in &large_parents {
-                let child_bytes: u64 = children
-                    .iter()
-                    .map(|ck| self.node_path(ck).metadata().map_or(0, |m| m.len()))
-                    .sum();
-                debug!(
-                    "  STREAMING parent {:?}: {} children, {} MB on disk",
-                    parent,
-                    children.len(),
-                    child_bytes / 1_048_576,
-                );
-                self.grid_sample_streaming(parent, children)?;
-                new_parent_keys.push(*parent);
-            }
-
-            // Batch small parents for parallel processing.
-            small_parents.sort_by(|a, b| b.2.cmp(&a.2));
-
-            let mut batch_start = 0;
-            while batch_start < small_parents.len() {
-                let mut batch_mem: u64 = 0;
-                let mut batch_end = batch_start;
-                while batch_end < small_parents.len() {
-                    if batch_end > batch_start
-                        && batch_mem + small_parents[batch_end].2 > memory_budget
-                    {
-                        break;
-                    }
-                    batch_mem += small_parents[batch_end].2;
-                    batch_end += 1;
-                }
-
-                let batch = &small_parents[batch_start..batch_end];
-                debug!(
-                    "  Batch: {} parents, est {} MB",
-                    batch.len(),
-                    batch_mem / 1_048_576,
-                );
-                batch
-                    .par_iter()
-                    .map(|(parent, children, _)| -> Result<()> {
-                        let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
-                        for (ci, ck) in children.iter().enumerate() {
-                            for p in self.read_node(ck)? {
-                                all_pts.push((ci, p));
-                            }
-                        }
-                        if all_pts.is_empty() {
-                            return Ok(());
-                        }
-                        let (parent_pts, per_child) =
-                            self.grid_sample(parent, all_pts, children.len());
-                        for (ci, ck) in children.iter().enumerate() {
-                            self.write_node_to_temp(ck, &per_child[ci])?;
-                        }
-                        if !parent_pts.is_empty() {
-                            self.write_node_to_temp(parent, &parent_pts)?;
-                        }
-                        Ok(())
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                for (parent, _, _) in &small_parents[batch_start..batch_end] {
-                    new_parent_keys.push(*parent);
-                }
-                batch_start = batch_end;
-            }
-
-            keys_by_level
-                .entry(d as i32)
-                .or_default()
-                .extend(new_parent_keys.into_iter());
-        }
-
-        // Enumerate result from the in-memory key map (no directory scan needed).
-        let mut result = Vec::new();
-        for level_keys in keys_by_level.values() {
-            for key in level_keys {
-                let file_len = self.node_path(key).metadata().map_or(0, |m| m.len());
-                let count = file_len as usize / RawPoint::BYTE_SIZE;
-                if count > 0 {
-                    result.push((*key, count));
-                }
-            }
-        }
-
-        // Verify point conservation — flag if total differs from input.
-        let total: u64 = result.iter().map(|(_, c)| *c as u64).sum();
-        if total != self.total_points {
-            info!(
-                "Point conservation check: octree has {} points vs {} input (diff {})",
-                total,
-                self.total_points,
-                total as i64 - self.total_points as i64
-            );
-        }
-
-        Ok(result)
-    }
-
     /// Streaming grid-sample for a single oversized parent.
     ///
-    /// Processes one child at a time so that only one child's points are ever in
-    /// memory. The grid occupancy set (max 128³ entries ≈ 48 MB) and the parent
-    /// accumulator (max 128³ points ≈ 80 MB) stay resident; everything else is
-    /// streamed from/to disk.
+    /// Used as a fallback by `merge_chunk_tops` when a parent group's combined
+    /// child points exceed the memory budget. Processes one child at a time so
+    /// only one child's points are ever in memory. The grid occupancy set
+    /// (max 128³ entries ≈ 48 MB) and the parent accumulator (max 128³ points
+    /// ≈ 80 MB) stay resident; everything else is streamed from/to disk.
+    ///
+    /// In practice this path is rarely hit for well-formed chunk plans
+    /// (merge-sparse-cells sizes chunks to fit the budget by construction),
+    /// but it's kept as a safety net for degenerate inputs.
     ///
     /// Tradeoff: points are not Morton-sorted across children, so spatial
-    /// coherence of the parent is slightly worse than the in-memory path.
+    /// coherence of the parent is slightly worse than in-memory grid_sample.
     fn grid_sample_streaming(&self, parent: &VoxelKey, children: &[VoxelKey]) -> Result<()> {
         let voxel_size_world = 2.0 * self.halfsize / (1u64 << parent.level) as f64;
         let origin_x = ((self.cx - self.halfsize + parent.x as f64 * voxel_size_world
@@ -1331,8 +1139,9 @@ impl OctreeBuilder {
             if !child_donated[ci] {
                 // Check if this child originally had points (file might now be
                 // empty because all were promoted).
-                let file_len = self.node_path(ck).metadata().map_or(0, |m| m.len());
-                if file_len == 0 && !parent_pts.is_empty() {
+                let n =
+                    count_temp_file_points(&self.node_path(ck), self.temp_compression).unwrap_or(0);
+                if n == 0 && !parent_pts.is_empty() {
                     // Return one point from the parent back to this child.
                     // Find the last parent point that came from any child — we
                     // can't track origin in the streaming path, so just pop the last.
@@ -1441,6 +1250,754 @@ impl OctreeBuilder {
         let parent_pts = parent_pts.into_iter().map(|(_, p)| p).collect();
         (parent_pts, remaining)
     }
+
+    /// Chunked distribute. Computes the chunk plan via the counting-sort
+    /// analyzer, builds a fast cell→chunk lookup table, then streams each
+    /// input file in parallel and appends each point to its chunk's temp
+    /// file via a bounded LRU writer cache.
+    pub fn distribute(&mut self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
+        // 1. Compute the chunk plan (counting + merge-sparse-cells). This
+        //    runs a full pass over the input to populate an occupancy grid,
+        //    which is its own user-visible stage.
+        //    `chunk_target_override` lets tests force multi-chunk plans on
+        //    small inputs; None = dynamic derivation from memory_budget.
+        config.report(crate::ProgressEvent::StageStart {
+            name: "Counting",
+            total: self.total_points,
+        });
+        let plan = crate::chunking::compute_chunk_plan(
+            self,
+            input_files,
+            config,
+            config.chunk_target_override,
+        )?;
+        config.report(crate::ProgressEvent::StageDone);
+        info!(
+            "Chunked distribute: {} chunks, target {} points each, grid {}³",
+            plan.chunks.len(),
+            plan.chunk_target,
+            plan.grid_size
+        );
+
+        // 2. Build the cell → chunk_index lookup table. The grid has
+        //    grid_size³ fine cells; for each chunk we fill in every fine cell
+        //    it covers (a 2^(grid_depth - chunk.level) cube per axis).
+        let lut = build_chunk_lut(&plan);
+
+        // 3. Set up shard subdirectories under tmp_dir/chunks/shards/{worker}.
+        let chunks_root = self.tmp_dir.join("chunks");
+        if chunks_root.exists() {
+            std::fs::remove_dir_all(&chunks_root)
+                .with_context(|| format!("removing stale chunks dir {:?}", chunks_root))?;
+        }
+        std::fs::create_dir_all(&chunks_root)?;
+        let shards_root = chunks_root.join("shards");
+        std::fs::create_dir_all(&shards_root)?;
+
+        let num_workers = chunked_distribute_worker_count(input_files.len());
+        let shard_dirs: Vec<PathBuf> = (0..num_workers)
+            .map(|w| {
+                let d = shards_root.join(w.to_string());
+                std::fs::create_dir_all(&d)?;
+                Ok(d)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // 4. Compute per-worker resources.
+        let per_worker_cap = (CHUNKED_OPEN_FILES_CAP / num_workers).max(MIN_PER_WORKER_CHUNK_FILES);
+
+        // Per-worker memory budget for the input chunk size. The transient
+        // peak is `Vec<las::Point>` (~120 B/pt) plus the cache's BufWriter
+        // overhead (negligible). Size for 1/8 of the per-worker budget so
+        // there's headroom for the LAZ decoder + grouping overhead.
+        const BYTES_PER_POINT_TRANSIENT: u64 = 120;
+        let per_worker_budget = config.memory_budget / num_workers as u64;
+        let read_chunk_size =
+            ((per_worker_budget / 8) / BYTES_PER_POINT_TRANSIENT).clamp(50_000, 2_000_000) as usize;
+
+        debug!(
+            "Chunked distribute: budget={} MB, workers={}, read_chunk_size={}, open-file cap={} (per worker)",
+            config.memory_budget / 1_048_576,
+            num_workers,
+            read_chunk_size,
+            per_worker_cap
+        );
+
+        // Grid geometry for cell index computation. We classify points via
+        // `point_to_key(..., grid_depth)` — the same octree descent that the
+        // per-chunk build uses via `point_to_key(..., leaf_depth)`. This
+        // guarantees bit-for-bit consistency between the LUT classification
+        // and the build-phase classification, so a point's chunk assignment
+        // and its leaf's chunk-root ancestor always agree. An earlier version
+        // used inlined floor-based math for speed (~3× faster), but
+        // floating-point precision at cell boundaries made it disagree with
+        // `point_to_key` on a tiny fraction of points (~0.13%), and those
+        // points ended up written to the wrong chunk where they were silently
+        // lost during build.
+        let g = plan.grid_size;
+        let grid_depth = plan.grid_depth;
+        let g_usize = g as usize;
+
+        // Capture the LUT and per-worker file ranges for the parallel block.
+        let files_per_worker = input_files.len().div_ceil(num_workers);
+        let progress = AtomicU64::new(0);
+
+        // 5. Partition pass — stream every point into its chunk's shard
+        //    file. This is the second full pass over the input and is
+        //    reported as its own `Distributing` stage.
+        config.report(crate::ProgressEvent::StageStart {
+            name: "Distributing",
+            total: self.total_points,
+        });
+
+        // 5. Parallel workers stream input files and append points to chunks.
+        shard_dirs
+            .par_iter()
+            .enumerate()
+            .try_for_each(|(worker_id, shard_dir)| -> Result<()> {
+                let start = worker_id * files_per_worker;
+                let end = (start + files_per_worker).min(input_files.len());
+                if start >= end {
+                    return Ok(());
+                }
+
+                let mut cache = ChunkWriterCache::new(per_worker_cap, self.temp_compression);
+                let mut points: Vec<las::Point> = Vec::with_capacity(read_chunk_size);
+                // Group buffer reused across batches so capacity amortizes.
+                // Drained at the end of each batch so retained Vec capacity
+                // stays bounded by the working set, not by all-time peak.
+                let mut groups: HashMap<u32, Vec<RawPoint>> = HashMap::new();
+
+                for path in &input_files[start..end] {
+                    let mut reader = las::Reader::from_path(path)
+                        .with_context(|| format!("Cannot open {:?}", path))?;
+                    let file_pts = reader.header().number_of_points();
+                    debug!(
+                        "Chunked distribute worker {} file {:?}: {} points",
+                        worker_id,
+                        path.file_name().unwrap_or_default(),
+                        file_pts
+                    );
+
+                    loop {
+                        points.clear();
+                        let n = reader.read_points_into(read_chunk_size as u64, &mut points)?;
+                        if n == 0 {
+                            break;
+                        }
+
+                        // Classify points into chunks via the LUT and group
+                        // them in memory before writing. Grouping batches
+                        // many points per writer call → fewer LRU touches
+                        // and better amortization than per-point appends.
+                        for p in &points {
+                            // Convert via the same RawPoint conversion the
+                            // per-leaf path uses, so the chunked path stores
+                            // the exact same int-coordinate representation.
+                            let raw = self.convert_point(p);
+
+                            // Classify to grid cell via point_to_key at the
+                            // grid depth, using round-tripped world coords.
+                            // This is the same function the per-chunk build
+                            // will call (at leaf_depth, which is chunk.level
+                            // + extra_levels); using it here guarantees the
+                            // chunk-root ancestor of every leaf produced
+                            // during build matches the chunk assignment made
+                            // during distribute — no boundary-point loss.
+                            let wx = raw.x as f64 * self.scale_x + self.offset_x;
+                            let wy = raw.y as f64 * self.scale_y + self.offset_y;
+                            let wz = raw.z as f64 * self.scale_z + self.offset_z;
+                            let key = point_to_key(
+                                wx,
+                                wy,
+                                wz,
+                                self.cx,
+                                self.cy,
+                                self.cz,
+                                self.halfsize,
+                                grid_depth,
+                            );
+                            // Defensive clamp for points exactly on the
+                            // upper boundary that round out by one.
+                            let gx = (key.x as usize).min(g_usize - 1);
+                            let gy = (key.y as usize).min(g_usize - 1);
+                            let gz = (key.z as usize).min(g_usize - 1);
+
+                            let cell_idx = gx + gy * g_usize + gz * g_usize * g_usize;
+                            let chunk_idx = lut[cell_idx];
+                            groups.entry(chunk_idx).or_default().push(raw);
+                        }
+
+                        // Free the las::Point buffer before flushing groups.
+                        points.clear();
+
+                        // Flush each group to the cache. Drain so vec capacity
+                        // doesn't accumulate across batches.
+                        for (chunk_idx, pts) in groups.drain() {
+                            cache.append(chunk_idx, shard_dir, &pts)?;
+                        }
+
+                        let done = progress.fetch_add(n, Ordering::Relaxed) + n;
+                        config.report(crate::ProgressEvent::StageProgress { done });
+                    }
+                }
+
+                cache.flush_all()
+            })?;
+
+        // 6. Merge per-worker shards into canonical chunk files.
+        merge_chunk_shards(&shards_root, &chunks_root, plan.chunks.len() as u32)?;
+        config.report(crate::ProgressEvent::StageDone);
+
+        // 7. Stash the chunk plan for the build phase to consume.
+        self.chunked_plan = Some(plan);
+        Ok(())
+    }
+
+    /// Read all `RawPoint`s from a chunk file in one shot.
+    fn read_chunk_file(&self, chunk_idx: u32) -> Result<Vec<RawPoint>> {
+        let path = chunk_canonical_path(&self.tmp_dir.join("chunks"), chunk_idx);
+        let f = File::open(&path).with_context(|| format!("opening chunk file {:?}", path))?;
+        read_temp_batches(f, self.temp_compression)
+    }
+
+    /// Build a single chunk's sub-octree fully in memory and write its node
+    /// files to canonical temp paths.
+    ///
+    /// Returns the list of `(VoxelKey, point_count)` for nodes at levels in
+    /// `[chunk.level, chunk_leaf_depth]` that the chunk produced. The chunk
+    /// root at `chunk.level` is included; coarser ancestors are left to the
+    /// merge step.
+    fn build_chunk_in_memory(
+        &self,
+        chunk: &crate::chunking::PlannedChunk,
+        chunk_idx: u32,
+        config: &crate::PipelineConfig,
+    ) -> Result<Vec<(VoxelKey, usize)>> {
+        // Load all points for this chunk into memory.
+        let points = self.read_chunk_file(chunk_idx)?;
+        let n_points = points.len();
+
+        if n_points == 0 {
+            // Empty chunk → no nodes produced. Should not happen for a plan
+            // generated by `merge_sparse_cells`, but handle defensively.
+            debug!(
+                "Chunk {} (L{} {},{},{}) is empty, skipping",
+                chunk_idx, chunk.level, chunk.gx, chunk.gy, chunk.gz
+            );
+            return Ok(Vec::new());
+        }
+
+        // Compute the chunk-local leaf depth so each leaf holds ~MAX_LEAF_POINTS
+        // on average. Slightly larger leaves are acceptable in dense regions.
+        let extra_levels = chunk_local_extra_levels(n_points as u64);
+        let leaf_depth = chunk.level + extra_levels;
+        debug!(
+            "Chunk {} (L{} {},{},{}): {} points → leaf depth {} (extra {})",
+            chunk_idx,
+            chunk.level,
+            chunk.gx,
+            chunk.gy,
+            chunk.gz,
+            n_points,
+            leaf_depth,
+            extra_levels
+        );
+
+        // Classify each point into its leaf voxel at the global leaf depth.
+        // This uses point_to_key on round-tripped world coordinates so the
+        // voxel assignment matches what the per-leaf path would compute.
+        let mut leaves: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
+        for raw in points {
+            let wx = raw.x as f64 * self.scale_x + self.offset_x;
+            let wy = raw.y as f64 * self.scale_y + self.offset_y;
+            let wz = raw.z as f64 * self.scale_z + self.offset_z;
+            let key = point_to_key(
+                wx,
+                wy,
+                wz,
+                self.cx,
+                self.cy,
+                self.cz,
+                self.halfsize,
+                leaf_depth,
+            );
+
+            // Debug-only defensive check: the leaf key's ancestor at
+            // chunk.level must equal the chunk root. If it doesn't, the
+            // chunked distribute classified this point into the wrong
+            // chunk. Distribute and build must use the same key derivation
+            // (`point_to_key`) to stay consistent — if this assertion ever
+            // fires, the classification has drifted again and points will
+            // be silently lost unless we reject here.
+            #[cfg(debug_assertions)]
+            {
+                let mut ancestor = key;
+                while ancestor.level > chunk.level as i32 {
+                    ancestor = ancestor.parent().expect("leaf above chunk level");
+                }
+                debug_assert!(
+                    ancestor.level == chunk.level as i32
+                        && ancestor.x == chunk.gx
+                        && ancestor.y == chunk.gy
+                        && ancestor.z == chunk.gz,
+                    "leaf {:?} does not belong to chunk root (L{} {},{},{}): ancestor at L{} = ({},{},{})",
+                    key,
+                    chunk.level,
+                    chunk.gx,
+                    chunk.gy,
+                    chunk.gz,
+                    ancestor.level,
+                    ancestor.x,
+                    ancestor.y,
+                    ancestor.z,
+                );
+            }
+
+            leaves.entry(key).or_default().push(raw);
+        }
+
+        // Adaptive leaf subdivision. The uniform `leaf_depth` computed from
+        // total point count produces leaves that can be 1.4–2× MAX_LEAF_POINTS
+        // in dense regions. Repeatedly split any leaf that exceeds
+        // MAX_LEAF_POINTS into 8 children at one level deeper, until no leaf
+        // is oversized or a depth cap is hit.
+        //
+        // Collisions are impossible because newly-created children are always
+        // at a deeper level than any existing leaf, so their keys can't clash.
+        const CHUNK_DEPTH_CAP: u32 = 20; // same spirit as from_scan's `d > 16` cap
+        let mut effective_max_depth = leaf_depth;
+        loop {
+            let oversized: Vec<VoxelKey> = leaves
+                .iter()
+                .filter(|(_, pts)| pts.len() as u64 > MAX_LEAF_POINTS)
+                .map(|(k, _)| *k)
+                .collect();
+            if oversized.is_empty() {
+                break;
+            }
+            // Safety cap: if any oversized leaf is already at the depth cap,
+            // give up further subdivision and accept the residual overflow.
+            // In practice this means some leaves in pathologically dense
+            // spots (coincident points, volumetric data) will exceed the
+            // target — an explicit trade-off per design §9.3.
+            let hit_cap = oversized.iter().any(|k| k.level as u32 >= CHUNK_DEPTH_CAP);
+            if hit_cap {
+                debug!(
+                    "Chunk {}: stopping subdivision at depth cap {} \
+                     ({} leaves still oversized)",
+                    chunk_idx,
+                    CHUNK_DEPTH_CAP,
+                    oversized.len()
+                );
+                break;
+            }
+            for key in oversized {
+                let pts = leaves.remove(&key).expect("just listed");
+                let new_level = (key.level as u32) + 1;
+                if new_level > effective_max_depth {
+                    effective_max_depth = new_level;
+                }
+                for raw in pts {
+                    let wx = raw.x as f64 * self.scale_x + self.offset_x;
+                    let wy = raw.y as f64 * self.scale_y + self.offset_y;
+                    let wz = raw.z as f64 * self.scale_z + self.offset_z;
+                    let new_key = point_to_key(
+                        wx,
+                        wy,
+                        wz,
+                        self.cx,
+                        self.cy,
+                        self.cz,
+                        self.halfsize,
+                        new_level,
+                    );
+                    leaves.entry(new_key).or_default().push(raw);
+                }
+            }
+        }
+
+        debug!(
+            "Chunk {}: {} leaves after subdivision, effective depth {}",
+            chunk_idx,
+            leaves.len(),
+            effective_max_depth
+        );
+
+        // Run the bottom-up grid-sample loop, stopping at chunk.level.
+        // bottom_up_levels writes every produced node to its canonical temp
+        // file path, so the chunk's sub-octree is on disk after this returns.
+        // Suppress per-level progress events: the chunked-build outer stage
+        // tracks chunks-done, not levels.
+        self.bottom_up_levels(leaves, effective_max_depth, chunk.level, false, config)
+    }
+
+    /// Merge chunk roots upward from `max_chunk_level` to the global root.
+    ///
+    /// This is the chunked-build equivalent of the per-leaf path's coarse
+    /// `bottom_up_on_disk` levels. Starting from a set of "chunk root" keys
+    /// (one per chunk, at varying levels), we walk levels in reverse and at
+    /// each level group nodes by their parent and run `grid_sample` to
+    /// produce the parent.
+    ///
+    /// **Variable-level chunks are handled naturally**: when level `d`'s
+    /// children are processed, the set may include both chunk roots that
+    /// happened to be at level `d+1` AND parents that the merge produced
+    /// from level `d+2`. They're treated identically — they're all just
+    /// "nodes at level `d+1`, ready to be grouped by their level-`d` parent".
+    ///
+    /// Modifies node files on disk: when a parent is produced from its
+    /// children, the children's files are rewritten with the points that
+    /// did NOT get promoted to the parent (`grid_sample` returns this
+    /// "remaining" set per child).
+    ///
+    /// `chunk_root_keys` lists every chunk root produced by the per-chunk
+    /// build phase. Returns the merge-produced parent keys at every level
+    /// from 0 up to `max_chunk_level - 1`.
+    fn merge_chunk_tops(
+        &self,
+        chunk_root_keys: &[VoxelKey],
+        config: &crate::PipelineConfig,
+    ) -> Result<Vec<VoxelKey>> {
+        if chunk_root_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Organise chunk roots by level. Like bottom_up_on_disk, we use a
+        // HashSet per level so we never get duplicate keys (which can happen
+        // if two chunks somehow share the same root key — should not occur
+        // for a well-formed plan, but defensive).
+        let mut keys_by_level: HashMap<i32, HashSet<VoxelKey>> = HashMap::new();
+        for k in chunk_root_keys {
+            keys_by_level.entry(k.level).or_default().insert(*k);
+        }
+
+        let max_chunk_level: i32 = keys_by_level.keys().copied().max().unwrap_or(0);
+        debug!(
+            "Merge chunk tops: {} chunk roots, max_chunk_level={}",
+            chunk_root_keys.len(),
+            max_chunk_level
+        );
+
+        // Reuse the same per-point cost estimate as bottom_up_on_disk's
+        // small-parent batching: input vec + per-child remaining.
+        const MEM_PER_POINT: u64 =
+            (std::mem::size_of::<(usize, RawPoint)>() + std::mem::size_of::<RawPoint>()) as u64;
+
+        let mut all_new_parents: Vec<VoxelKey> = Vec::new();
+
+        // Walk from the deepest chunk level down to level 0. d is the parent
+        // level we're producing in this iteration.
+        for d in (0..max_chunk_level).rev() {
+            let child_level = d + 1;
+            let child_keys: Vec<VoxelKey> = match keys_by_level.get(&child_level) {
+                Some(v) => v.iter().copied().collect(),
+                None => continue,
+            };
+            if child_keys.is_empty() {
+                continue;
+            }
+
+            // Group children at level d+1 by their parent at level d.
+            let mut parent_children: HashMap<VoxelKey, Vec<VoxelKey>> = HashMap::new();
+            for ck in &child_keys {
+                if let Some(parent) = ck.parent() {
+                    parent_children.entry(parent).or_default().push(*ck);
+                }
+            }
+            if parent_children.is_empty() {
+                continue;
+            }
+
+            // Estimate per-parent memory cost from the children's file sizes
+            // and split into "small" (fit in budget) vs "large" (don't).
+            // For chunked merge, large parents shouldn't happen because
+            // chunks are sized to fit, but be defensive.
+            let mut small_parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = Vec::new();
+            let mut large_parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = Vec::new();
+
+            for (parent, children) in parent_children {
+                let est_points: u64 = children
+                    .iter()
+                    .map(|ck| {
+                        count_temp_file_points(&self.node_path(ck), self.temp_compression)
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                let est_mem = est_points * MEM_PER_POINT;
+                if est_mem > config.memory_budget {
+                    large_parents.push((parent, children, est_mem));
+                } else {
+                    small_parents.push((parent, children, est_mem));
+                }
+            }
+
+            debug!(
+                "Merge level {}→{}: {} parents ({} small, {} large), budget={} MB",
+                child_level,
+                d,
+                small_parents.len() + large_parents.len(),
+                small_parents.len(),
+                large_parents.len(),
+                config.memory_budget / 1_048_576,
+            );
+
+            if !large_parents.is_empty() {
+                // Should not happen with a well-formed chunk plan, but if it
+                // does, fall back to grid_sample_streaming which is bounded
+                // (one child at a time, ~80 MB per parent for the grid set
+                // and accumulator).
+                for (parent, children, est_mem) in &large_parents {
+                    debug!(
+                        "  STREAMING merge parent {:?}: {} children, est {} MB",
+                        parent,
+                        children.len(),
+                        est_mem / 1_048_576
+                    );
+                    self.grid_sample_streaming(parent, children)?;
+                    all_new_parents.push(*parent);
+                    keys_by_level.entry(d).or_default().insert(*parent);
+                }
+            }
+
+            // Sort small parents by descending estimated memory so the
+            // batching greedy stays balanced.
+            small_parents.sort_by(|a, b| b.2.cmp(&a.2));
+
+            let mut batch_start = 0;
+            while batch_start < small_parents.len() {
+                let mut batch_mem: u64 = 0;
+                let mut batch_end = batch_start;
+                while batch_end < small_parents.len() {
+                    if batch_end > batch_start
+                        && batch_mem + small_parents[batch_end].2 > config.memory_budget
+                    {
+                        break;
+                    }
+                    batch_mem += small_parents[batch_end].2;
+                    batch_end += 1;
+                }
+
+                let batch = &small_parents[batch_start..batch_end];
+                debug!(
+                    "  Merge batch: {} parents, est {} MB",
+                    batch.len(),
+                    batch_mem / 1_048_576,
+                );
+                batch
+                    .par_iter()
+                    .map(|(parent, children, _)| -> Result<()> {
+                        let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
+                        for (ci, ck) in children.iter().enumerate() {
+                            for p in self.read_node(ck)? {
+                                all_pts.push((ci, p));
+                            }
+                        }
+                        if all_pts.is_empty() {
+                            return Ok(());
+                        }
+                        let (parent_pts, per_child) =
+                            self.grid_sample(parent, all_pts, children.len());
+                        // Rewrite each child with its remaining points.
+                        for (ci, ck) in children.iter().enumerate() {
+                            self.write_node_to_temp(ck, &per_child[ci])?;
+                        }
+                        if !parent_pts.is_empty() {
+                            self.write_node_to_temp(parent, &parent_pts)?;
+                        }
+                        Ok(())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                for (parent, _, _) in &small_parents[batch_start..batch_end] {
+                    all_new_parents.push(*parent);
+                    keys_by_level.entry(d).or_default().insert(*parent);
+                }
+                batch_start = batch_end;
+            }
+
+            // Report progress: one tick per merged level (the caller knows
+            // the total via max_chunk_level).
+            config.report(crate::ProgressEvent::StageProgress {
+                done: (max_chunk_level - d) as u64,
+            });
+        }
+
+        Ok(all_new_parents)
+    }
+
+    /// Chunked build. Per-chunk in-memory build, then merge across chunks
+    /// at coarse levels up to the global root.
+    pub fn build_node_map(&self, config: &crate::PipelineConfig) -> Result<Vec<(VoxelKey, usize)>> {
+        let plan = self
+            .chunked_plan
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("build_node_map_chunked called without a chunk plan"))?;
+
+        let n_chunks = plan.chunks.len();
+        if n_chunks == 0 {
+            info!("Chunked build: no chunks (empty input?)");
+            return Ok(Vec::new());
+        }
+
+        info!(
+            "Chunked build: {} chunks, max_chunk_level={}",
+            n_chunks,
+            plan.chunks.iter().map(|c| c.level).max().unwrap_or(0)
+        );
+
+        // ---- Phase 1: per-chunk in-memory build ----
+        //
+        // Process chunks in batches sized by memory budget. Within each batch,
+        // chunks run fully in parallel via rayon. Per-chunk peak working set
+        // estimate: ~200 B/pt (input vec + leaves HashMap + grid_sample
+        // input/output + scratch). Conservative; matches design §9.4.
+        const PER_CHUNK_BYTES_PER_POINT: u64 = 200;
+
+        // Sort chunks by descending point count so the greedy batching stays
+        // balanced (largest chunks first, smaller ones fill the gaps).
+        let mut chunks_indexed: Vec<(u32, &crate::chunking::PlannedChunk)> = plan
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i as u32, c))
+            .collect();
+        chunks_indexed.sort_by(|a, b| b.1.point_count.cmp(&a.1.point_count));
+
+        config.report(crate::ProgressEvent::StageStart {
+            name: "Building",
+            total: n_chunks as u64,
+        });
+
+        let chunks_done = AtomicU64::new(0);
+        let mut all_chunk_node_keys: Vec<VoxelKey> = Vec::new();
+        let mut chunk_root_keys: Vec<VoxelKey> = Vec::new();
+
+        let mut batch_start = 0;
+        while batch_start < chunks_indexed.len() {
+            let mut batch_mem: u64 = 0;
+            let mut batch_end = batch_start;
+            while batch_end < chunks_indexed.len() {
+                let est_mem = chunks_indexed[batch_end].1.point_count * PER_CHUNK_BYTES_PER_POINT;
+                // Always include at least one chunk per batch, even if it
+                // exceeds the budget on its own (better to OOM honestly than
+                // to hang forever in an empty batch).
+                if batch_end > batch_start && batch_mem + est_mem > config.memory_budget {
+                    break;
+                }
+                batch_mem += est_mem;
+                batch_end += 1;
+            }
+
+            let batch = &chunks_indexed[batch_start..batch_end];
+            debug!(
+                "Chunked build batch: {} chunks, est {} MB",
+                batch.len(),
+                batch_mem / 1_048_576
+            );
+
+            // Process this batch in parallel.
+            let batch_results: Vec<Vec<(VoxelKey, usize)>> = batch
+                .par_iter()
+                .map(|(chunk_idx, chunk)| -> Result<Vec<(VoxelKey, usize)>> {
+                    let nodes = self.build_chunk_in_memory(chunk, *chunk_idx, config)?;
+                    let done = chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    config.report(crate::ProgressEvent::StageProgress { done });
+                    Ok(nodes)
+                })
+                .collect::<Result<_>>()?;
+
+            // Collect node keys produced by this batch.
+            for ((_chunk_idx, chunk), nodes) in batch.iter().zip(batch_results.into_iter()) {
+                let chunk_level_i32 = chunk.level as i32;
+                for (k, _) in &nodes {
+                    all_chunk_node_keys.push(*k);
+                    if k.level == chunk_level_i32 {
+                        chunk_root_keys.push(*k);
+                    }
+                }
+            }
+
+            batch_start = batch_end;
+        }
+
+        debug!(
+            "Per-chunk build done: {} chunk nodes, {} chunk roots",
+            all_chunk_node_keys.len(),
+            chunk_root_keys.len()
+        );
+
+        // ---- Phase 2: merge chunk tops up to global root ----
+        let merge_parents = self.merge_chunk_tops(&chunk_root_keys, config)?;
+        debug!("Merge step produced {} parent nodes", merge_parents.len());
+
+        config.report(crate::ProgressEvent::StageDone);
+
+        // ---- Phase 3: assemble the result list ----
+        //
+        // The result is the union of per-chunk nodes + merge parents.
+        // After the merge step, chunk root files have been rewritten with
+        // their post-merge point counts (the points that did NOT get
+        // promoted), so we re-read counts from disk for *every* node to
+        // ensure we report the post-merge state, not the per-chunk-build
+        // intermediate state.
+        let mut all_keys: Vec<VoxelKey> = all_chunk_node_keys;
+        all_keys.extend(merge_parents);
+        // Deduplicate (a chunk root that's also at level 0 would be counted
+        // twice — should not occur in practice but defensive).
+        all_keys.sort_unstable_by_key(|k| (k.level, k.x, k.y, k.z));
+        all_keys.dedup();
+
+        let mut result: Vec<(VoxelKey, usize)> = all_keys
+            .par_iter()
+            .map(|k| -> Result<(VoxelKey, usize)> {
+                let n = count_temp_file_points(&self.node_path(k), self.temp_compression)? as usize;
+                Ok((*k, n))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Drop empty nodes (e.g. chunk roots whose points were all promoted
+        // by the merge and never had any remaining points written back).
+        result.retain(|(_, count)| *count > 0);
+
+        let total_pts: usize = result.iter().map(|(_, c)| *c).sum();
+        info!(
+            "Chunked build: {} nodes, {} total points (input: {})",
+            result.len(),
+            total_pts,
+            self.total_points
+        );
+        if total_pts as u64 != self.total_points {
+            debug!(
+                "COPC contains {} points vs {} from input headers (diff {}). \
+                 Input LAZ headers sometimes report inaccurate point counts.",
+                total_pts,
+                self.total_points,
+                self.total_points as i64 - total_pts as i64
+            );
+        }
+
+        // Ensure every ancestor of every data node is present (the writer
+        // requires zero-point ancestors so validators can traverse top-down).
+        // Same logic as the per-leaf path.
+        let mut present: HashSet<VoxelKey> = result.iter().map(|(k, _)| *k).collect();
+        let mut extra: Vec<VoxelKey> = Vec::new();
+        for (key, _) in &result {
+            let mut k = *key;
+            while let Some(parent) = k.parent() {
+                if present.insert(parent) {
+                    extra.push(parent);
+                }
+                k = parent;
+            }
+        }
+        for k in extra {
+            result.push((k, 0));
+        }
+        result.sort_by_key(|(k, _)| k.level);
+
+        Ok(result)
+    }
 }
 
 impl Drop for OctreeBuilder {
@@ -1535,6 +2092,65 @@ mod tests {
         }
     }
 
+    /// Regression test: multi-batch LZ4 files must round-trip every point.
+    ///
+    /// `FrameDecoder` returns `Ok(0)` at each frame boundary, which naïve
+    /// readers mistake for EOF and truncate the stream after the first
+    /// frame. `MultiFrameReader` + `read_temp_batches` must transparently
+    /// walk every concatenated frame.
+    #[test]
+    fn lz4_multi_batch_round_trip() {
+        let codec = crate::TempCompression::Lz4;
+        // Four batches of varying sizes, written as four separate frames
+        // into one buffer — mirrors what `ChunkWriterCache::append` does
+        // under LRU pressure.
+        let batches: Vec<Vec<RawPoint>> = vec![
+            (0..10).map(|_| sample_point()).collect(),
+            (0..1).map(|_| sample_point()).collect(),
+            (0..1000).map(|_| sample_point()).collect(),
+            (0..42).map(|_| sample_point()).collect(),
+        ];
+        let expected: usize = batches.iter().map(|b| b.len()).sum();
+
+        let mut buf: Vec<u8> = Vec::new();
+        for batch in &batches {
+            write_temp_batch(&mut buf, batch, codec).unwrap();
+        }
+
+        let decoded = read_temp_batches(std::io::Cursor::new(&buf[..]), codec).unwrap();
+        assert_eq!(
+            decoded.len(),
+            expected,
+            "multi-frame LZ4 decode must recover every point"
+        );
+    }
+
+    /// Same round-trip at the count helper: `count_temp_file_points` under
+    /// LZ4 must also walk every frame rather than stopping at the first
+    /// boundary.
+    #[test]
+    fn lz4_multi_batch_count_temp_file_points() {
+        let codec = crate::TempCompression::Lz4;
+        let batches: Vec<Vec<RawPoint>> = vec![
+            (0..7).map(|_| sample_point()).collect(),
+            (0..13).map(|_| sample_point()).collect(),
+            (0..21).map(|_| sample_point()).collect(),
+        ];
+        let expected: u64 = batches.iter().map(|b| b.len() as u64).sum();
+
+        let tmp = std::env::temp_dir().join(format!("copc_lz4_mf_count_{}", std::process::id()));
+        {
+            let mut f = BufWriter::new(File::create(&tmp).unwrap());
+            for batch in &batches {
+                write_temp_batch(&mut f, batch, codec).unwrap();
+            }
+            f.flush().unwrap();
+        }
+        let got = count_temp_file_points(&tmp, codec).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(got, expected, "multi-frame count must match total");
+    }
+
     #[test]
     fn rawpoint_bulk_matches_single() {
         let p = sample_point();
@@ -1542,7 +2158,7 @@ mod tests {
         p.write(&mut single_buf).unwrap();
 
         let mut bulk_buf = Vec::new();
-        RawPoint::write_bulk(&[p.clone()], &mut bulk_buf).unwrap();
+        RawPoint::write_bulk(std::slice::from_ref(&p), &mut bulk_buf).unwrap();
 
         assert_eq!(
             single_buf, bulk_buf,
@@ -1568,5 +2184,160 @@ mod tests {
         // Has color + NIR → format 8
         assert_eq!(input_to_copc_format(8), 8);
         assert_eq!(input_to_copc_format(10), 8);
+    }
+
+    // ----- Chunked-build helpers -----
+
+    use crate::chunking::{ChunkPlan, PlannedChunk};
+
+    fn make_plan(grid_size: u32, chunks: Vec<PlannedChunk>) -> ChunkPlan {
+        let total_points = chunks.iter().map(|c| c.point_count).sum();
+        ChunkPlan {
+            grid_size,
+            grid_depth: grid_size.trailing_zeros(),
+            chunk_target: 1_000_000,
+            total_points,
+            chunks,
+        }
+    }
+
+    #[test]
+    fn build_chunk_lut_single_root_chunk() {
+        // 4³ grid, one chunk at level 0 (the root) covering everything.
+        let plan = make_plan(
+            4,
+            vec![PlannedChunk {
+                level: 0,
+                gx: 0,
+                gy: 0,
+                gz: 0,
+                point_count: 100,
+            }],
+        );
+        let lut = build_chunk_lut(&plan);
+        assert_eq!(lut.len(), 64);
+        assert!(lut.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn build_chunk_lut_eight_finest_chunks() {
+        // 2³ grid (depth 1). Eight chunks at level 1, one per fine cell.
+        let chunks: Vec<PlannedChunk> = (0i32..8)
+            .map(|i| PlannedChunk {
+                level: 1,
+                gx: i % 2,
+                gy: (i / 2) % 2,
+                gz: i / 4,
+                point_count: 10,
+            })
+            .collect();
+        let plan = make_plan(2, chunks);
+        let lut = build_chunk_lut(&plan);
+        assert_eq!(lut.len(), 8);
+        // Each cell should map to a distinct chunk index 0..8.
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for &c in &lut {
+            assert!(c < 8, "got out-of-range chunk idx {c}");
+            seen.insert(c);
+        }
+        assert_eq!(seen.len(), 8);
+    }
+
+    #[test]
+    fn build_chunk_lut_mixed_levels() {
+        // 4³ grid (depth 2). Two chunks:
+        //   - chunk 0 at level 1, position (0,0,0) — covers the 2³ subcube at the origin (8 cells)
+        //   - chunk 1 at level 2, position (3,3,3) — covers exactly 1 fine cell at (3,3,3)
+        // The remaining 64 - 8 - 1 = 55 cells should be u32::MAX (uncovered).
+        let plan = make_plan(
+            4,
+            vec![
+                PlannedChunk {
+                    level: 1,
+                    gx: 0,
+                    gy: 0,
+                    gz: 0,
+                    point_count: 50,
+                },
+                PlannedChunk {
+                    level: 2,
+                    gx: 3,
+                    gy: 3,
+                    gz: 3,
+                    point_count: 5,
+                },
+            ],
+        );
+        let lut = build_chunk_lut(&plan);
+        assert_eq!(lut.len(), 64);
+
+        // Cells (gx, gy, gz) with all coords in 0..2 should map to chunk 0.
+        for z in 0..2 {
+            for y in 0..2 {
+                for x in 0..2 {
+                    let idx = x + y * 4 + z * 16;
+                    assert_eq!(lut[idx], 0, "cell ({x},{y},{z}) should map to chunk 0");
+                }
+            }
+        }
+
+        // Cell (3, 3, 3) → chunk 1.
+        assert_eq!(lut[3 + 3 * 4 + 3 * 16], 1);
+
+        // Count uncovered cells: should be 64 - 8 - 1 = 55.
+        let uncovered = lut.iter().filter(|&&c| c == u32::MAX).count();
+        assert_eq!(uncovered, 55);
+    }
+
+    #[test]
+    fn chunk_local_extra_levels_basic() {
+        // ≤ MAX_LEAF_POINTS → no subdivision needed
+        assert_eq!(chunk_local_extra_levels(0), 0);
+        assert_eq!(chunk_local_extra_levels(1), 0);
+        assert_eq!(chunk_local_extra_levels(MAX_LEAF_POINTS), 0);
+
+        // Just above MAX_LEAF_POINTS → 1 extra level (8 leaves)
+        assert_eq!(chunk_local_extra_levels(MAX_LEAF_POINTS + 1), 1);
+        assert_eq!(chunk_local_extra_levels(8 * MAX_LEAF_POINTS), 1);
+
+        // 8x leaf budget → still 1 extra level (avg = MAX_LEAF_POINTS)
+        // 8x + 1 → needs 2 extra levels
+        assert_eq!(chunk_local_extra_levels(8 * MAX_LEAF_POINTS + 1), 2);
+
+        // 36M points → ceil(log8(360)) = 3
+        assert_eq!(chunk_local_extra_levels(36_000_000), 3);
+
+        // 100M points → ceil(log8(1000)) = 4
+        assert_eq!(chunk_local_extra_levels(100_000_000), 4);
+    }
+
+    #[test]
+    fn build_chunk_lut_chunk_at_corner() {
+        // 8³ grid (depth 3). One chunk at level 2 position (3, 3, 3) — covers
+        // 2³ cells at the far corner of the grid: (6..8, 6..8, 6..8).
+        let plan = make_plan(
+            8,
+            vec![PlannedChunk {
+                level: 2,
+                gx: 3,
+                gy: 3,
+                gz: 3,
+                point_count: 10,
+            }],
+        );
+        let lut = build_chunk_lut(&plan);
+        assert_eq!(lut.len(), 512);
+        let g = 8;
+        for z in 6..8 {
+            for y in 6..8 {
+                for x in 6..8 {
+                    let idx = x + y * g + z * g * g;
+                    assert_eq!(lut[idx], 0, "cell ({x},{y},{z}) should be in the chunk");
+                }
+            }
+        }
+        // No other cell should be in the chunk.
+        let in_chunk = lut.iter().filter(|&&c| c == 0).count();
+        assert_eq!(in_chunk, 8);
     }
 }

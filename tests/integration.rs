@@ -784,14 +784,14 @@ fn temporal_index_custom_stride() {
 // Low-memory / streaming path tests
 // ---------------------------------------------------------------------------
 
-/// Run with a tiny memory limit to force the streaming grid_sample path
-/// (and smaller write batches). Verify the output is a valid COPC file
-/// with the correct total point count.
+/// Run with a tiny memory limit to exercise the chunked path under tight
+/// memory pressure. Verify the output is a valid COPC file with the correct
+/// total point count.
 #[test]
 fn low_memory_produces_valid_output() {
     let output = Path::new("tests/data/test_low_mem.copc.laz");
-    // 1 MB budget forces the out-of-core build path and streaming grid_sample
-    // for parents whose children exceed this tiny limit.
+    // 1 MB budget forces the chunked path to produce many small chunks,
+    // exercising the merge step under tight memory pressure.
     run_converter_with_args(
         Path::new("tests/data/input.laz"),
         output,
@@ -925,6 +925,249 @@ fn temporal_index_readable_by_streaming_crate() {
             "temporal entries must match hierarchy data nodes"
         );
     });
+
+    let _ = std::fs::remove_file(output);
+}
+
+// ---------------------------------------------------------------------------
+// Chunked build tests
+//
+// The chunked build produces COPC output that is NOT bit-identical to any
+// fixed reference because grid_sample tie-breaking depends on point ordering
+// at the leaf level. These tests verify that output is valid and
+// point-conserving rather than comparing bytes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn produces_valid_copc() {
+    let output = Path::new("tests/data/test_chunked_basic.copc.laz");
+    run_converter(Path::new("tests/data/input.laz"), output);
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let reference = read_file(Path::new("tests/data/untwine_reference.copc.laz"));
+    let ref_header = read_las_header(&reference);
+
+    // Same point format and total point count as the reference.
+    assert_eq!(header.point_format, ref_header.point_format, "point format");
+    assert_eq!(
+        header.total_points, ref_header.total_points,
+        "total points must match reference"
+    );
+
+    // Same scale and offset (both derived from input file).
+    assert_eq!(header.scale_x, ref_header.scale_x, "scale_x");
+    assert_eq!(header.scale_y, ref_header.scale_y, "scale_y");
+    assert_eq!(header.scale_z, ref_header.scale_z, "scale_z");
+    assert_eq!(header.offset_x, ref_header.offset_x, "offset_x");
+    assert_eq!(header.offset_y, ref_header.offset_y, "offset_y");
+    assert_eq!(header.offset_z, ref_header.offset_z, "offset_z");
+
+    // Bounds should be within tolerance of the reference.
+    let tol = 0.01;
+    assert!((header.min_x - ref_header.min_x).abs() < tol, "min_x");
+    assert!((header.max_x - ref_header.max_x).abs() < tol, "max_x");
+
+    // Must have at least one EVLR (the COPC hierarchy).
+    assert!(header.num_evlrs >= 1, "must have at least 1 EVLR");
+
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
+fn preserves_all_points() {
+    let output = Path::new("tests/data/test_chunked_conservation.copc.laz");
+    run_converter(Path::new("tests/data/input.laz"), output);
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let hier = read_hierarchy(&data);
+
+    // Hierarchy must contain a root node at (0, 0, 0, 0).
+    let root = VoxelKey {
+        level: 0,
+        x: 0,
+        y: 0,
+        z: 0,
+    };
+    assert!(
+        hier.iter().any(|e| e.key == root),
+        "chunked hierarchy must have root node"
+    );
+
+    // Sum of point counts across all data nodes must equal the header total.
+    let hier_total: i64 = hier
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as i64)
+        .sum();
+    assert_eq!(
+        hier_total, header.total_points as i64,
+        "chunked hierarchy point sum must match header"
+    );
+
+    // Every data node must have a valid offset and byte_size.
+    for entry in &hier {
+        if entry.point_count > 0 {
+            assert!(
+                entry.offset > 0,
+                "chunked node {:?} must have offset",
+                entry.key
+            );
+            assert!(
+                entry.byte_size > 0,
+                "chunked node {:?} must have byte_size",
+                entry.key
+            );
+        }
+    }
+
+    let _ = std::fs::remove_file(output);
+}
+
+/// Regression test for a point-loss bug in an earlier revision of the
+/// chunked distribute path.
+///
+/// An earlier version used inlined floor-based grid-cell math for speed,
+/// while `build_chunk_in_memory` used `point_to_key` for leaf classification.
+/// Floating-point precision at cell boundaries made the two disagree on a
+/// tiny fraction of points, which then landed in the wrong chunk and were
+/// silently lost. Fixed by using `point_to_key` in both places.
+///
+/// This test forces a multi-chunk plan on the small 830K-point test input
+/// by passing `--chunk-target 100000` (hidden dev flag). That produces ~20
+/// chunks at varying levels, which exercises the merge step AND the
+/// classification boundary between chunks. Total point count must be
+/// conserved exactly.
+#[test]
+fn chunked_multi_chunk_preserves_all_points() {
+    let output = Path::new("tests/data/test_chunked_multichunk.copc.laz");
+    let input = Path::new("tests/data/input.laz");
+
+    run_converter_with_args(
+        input,
+        output,
+        // --chunk-target 100000 forces ~8-21 chunks on the 830K-point input
+        // (well below the dynamic 1M minimum). This exercises the merge step
+        // and the cross-chunk classification boundary — the exact conditions
+        // that triggered the original point-loss regression.
+        &["--chunk-target", "100000"],
+    );
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let hier = read_hierarchy(&data);
+
+    // Sum of hierarchy point counts must EXACTLY equal the LAS header total
+    // (no tolerance — point loss is always a bug).
+    let hier_total: u64 = hier
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as u64)
+        .sum();
+    assert_eq!(
+        hier_total, header.total_points,
+        "chunked hierarchy point sum ({}) must equal header total ({})",
+        hier_total, header.total_points
+    );
+
+    // The header total must also match the reference input's total point
+    // count. The untwine reference file is what we validate against.
+    let reference = read_file(Path::new("tests/data/untwine_reference.copc.laz"));
+    let ref_header = read_las_header(&reference);
+    assert_eq!(
+        header.total_points, ref_header.total_points,
+        "chunked total points ({}) must match reference input ({})",
+        header.total_points, ref_header.total_points
+    );
+
+    // Sanity: this test only means anything if we actually got multiple
+    // chunks. Verify by checking that the hierarchy has nodes at levels
+    // below the max (indicating a multi-level tree formed by the merge step).
+    let max_level = hier.iter().map(|e| e.key.level).max().unwrap_or(0);
+    assert!(
+        max_level >= 3,
+        "chunked_multi_chunk test must produce a multi-level tree \
+         (got max_level={}), otherwise the test isn't exercising what it's \
+         supposed to exercise",
+        max_level
+    );
+
+    let _ = std::fs::remove_file(output);
+}
+
+/// Run with `--temp-compression=lz4` and verify the pipeline still conserves
+/// every point. Exercises `write_temp_batch` + `read_temp_batches` under LZ4.
+#[test]
+fn temp_compression_lz4_preserves_all_points() {
+    let output = Path::new("tests/data/test_lz4_conservation.copc.laz");
+    run_converter_with_args(
+        Path::new("tests/data/input.laz"),
+        output,
+        &["--temp-compression", "lz4"],
+    );
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let hier = read_hierarchy(&data);
+
+    // Sum of point counts across all data nodes must equal the header total.
+    let hier_total: i64 = hier
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as i64)
+        .sum();
+    assert_eq!(
+        hier_total, header.total_points as i64,
+        "lz4 hierarchy point sum must match header"
+    );
+
+    // Must match the reference input's total point count.
+    let reference = read_file(Path::new("tests/data/untwine_reference.copc.laz"));
+    let ref_header = read_las_header(&reference);
+    assert_eq!(
+        header.total_points, ref_header.total_points,
+        "lz4 total points must match reference input"
+    );
+
+    let _ = std::fs::remove_file(output);
+}
+
+/// Run multi-chunk merge under LZ4. Exercises multi-frame append: each
+/// `ChunkWriterCache::append` call writes a self-contained LZ4 frame into
+/// the shard file, and the reader must walk multiple concatenated frames
+/// to recover every point.
+#[test]
+fn temp_compression_lz4_multi_chunk_preserves_all_points() {
+    let output = Path::new("tests/data/test_lz4_multichunk.copc.laz");
+    run_converter_with_args(
+        Path::new("tests/data/input.laz"),
+        output,
+        &["--temp-compression", "lz4", "--chunk-target", "100000"],
+    );
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let hier = read_hierarchy(&data);
+
+    let hier_total: u64 = hier
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as u64)
+        .sum();
+    assert_eq!(
+        hier_total, header.total_points,
+        "lz4 multi-chunk hierarchy point sum ({}) must equal header total ({})",
+        hier_total, header.total_points
+    );
+
+    // Sanity: verify we actually got a multi-level tree from the merge step.
+    let max_level = hier.iter().map(|e| e.key.level).max().unwrap_or(0);
+    assert!(
+        max_level >= 3,
+        "lz4 multi-chunk test must produce a multi-level tree (got max_level={})",
+        max_level
+    );
 
     let _ = std::fs::remove_file(output);
 }

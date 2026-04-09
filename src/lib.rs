@@ -13,6 +13,8 @@
 //!     temporal_index: false,
 //!     temporal_stride: 1000,
 //!     progress: None,
+//!     chunk_target_override: None,
+//!     temp_compression: copc_converter::TempCompression::None,
 //! };
 //! let files = copc_converter::collect_input_files("input.laz".into()).unwrap();
 //!
@@ -27,6 +29,16 @@ pub(crate) mod copc_types;
 pub(crate) mod octree;
 pub(crate) mod validate;
 pub(crate) mod writer;
+
+/// Hierarchical counting-sort chunk planner (Schütz et al. 2020).
+///
+/// This is a measurement / planning tool used by the `analyze` CLI
+/// subcommand to evaluate the chunked-build approach against real datasets.
+/// Not yet wired into the main conversion pipeline.
+pub(crate) mod chunking;
+
+/// Re-exported chunk plan types so the binary can build a report from them.
+pub use chunking::{ChunkPlan, PlannedChunk, compute_chunk_target, select_grid_size};
 
 #[cfg(feature = "tools")]
 pub mod tools;
@@ -144,6 +156,21 @@ pub trait ProgressObserver: Send + Sync {
 // PipelineConfig
 // ---------------------------------------------------------------------------
 
+/// Compression codec for chunked-build scratch files.
+///
+/// Temp files hold `RawPoint` records and are highly compressible. Enabling
+/// compression trades CPU for scratch-disk footprint — most useful on
+/// space-constrained workers and network filesystems (EFS/NFS), and roughly
+/// a wash on fast local NVMe where CPU is the bottleneck.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TempCompression {
+    /// Uncompressed (default). Fastest on local NVMe.
+    #[default]
+    None,
+    /// LZ4 frame format. Roughly 3-4× smaller at >1 GB/s/core.
+    Lz4,
+}
+
 /// Configuration for the conversion pipeline.
 pub struct PipelineConfig {
     /// Effective memory budget in bytes.
@@ -156,6 +183,13 @@ pub struct PipelineConfig {
     pub temporal_stride: u32,
     /// Optional progress observer for reporting pipeline progress.
     pub progress: Option<std::sync::Arc<dyn ProgressObserver>>,
+    /// Optional override for the chunked-build chunk target size (in points).
+    /// `None` uses the dynamic target derived from memory budget. Primarily
+    /// for testing — e.g. forcing multiple chunks on a small input to
+    /// exercise the merge step.
+    pub chunk_target_override: Option<u64>,
+    /// Compression codec for scratch temp files.
+    pub temp_compression: TempCompression,
 }
 
 impl PipelineConfig {
@@ -224,19 +258,41 @@ impl Pipeline<Scanned> {
 }
 
 impl Pipeline<Validated> {
+    /// Run the hierarchical counting-sort chunk planner without proceeding
+    /// through `distribute`/`build`/`write`.
+    ///
+    /// This is a measurement tool: it returns the chunk plan that the
+    /// chunked-build path **would** produce for the given inputs, without
+    /// actually generating any chunks. Useful for evaluating the chunking
+    /// algorithm against real datasets before committing to the full
+    /// chunked-build rewrite.
+    ///
+    /// Pass `chunk_target_override = None` to use the dynamically-derived
+    /// target (recommended), or `Some(n)` to do what-if analysis with a
+    /// fixed target size.
+    pub fn analyze_chunking(&self, chunk_target_override: Option<u64>) -> Result<ChunkPlan> {
+        let validated = self.inner.validated.as_ref().expect("validated");
+        Ok(chunking::analyze_chunking(
+            &self.inner.input_files,
+            &self.inner.scan_results,
+            validated,
+            &self.inner.config,
+            chunk_target_override,
+        )?)
+    }
+
     /// Distribute all points to leaf voxels on disk.
     pub fn distribute(mut self) -> Result<Pipeline<Distributed>> {
         let validated = self.inner.validated.as_ref().unwrap();
-        let builder =
+        let mut builder =
             OctreeBuilder::from_scan(&self.inner.scan_results, validated, &self.inner.config)?;
 
-        let total_points: u64 = self.inner.scan_results.iter().map(|r| r.point_count).sum();
-        self.inner.config.report(ProgressEvent::StageStart {
-            name: "Distributing",
-            total: total_points,
-        });
+        // `builder.distribute` runs two full passes over the input — a
+        // counting pass and a partition pass — and emits its own
+        // `Counting` / `Distributing` stage events so the user sees them
+        // as two separate progress steps rather than one bar that fills
+        // twice.
         builder.distribute(&self.inner.input_files, &self.inner.config)?;
-        self.inner.config.report(ProgressEvent::StageDone);
         self.inner.builder = Some(builder);
         Ok(Pipeline {
             inner: self.inner,

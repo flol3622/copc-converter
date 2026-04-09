@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use copc_converter::{
-    Pipeline, PipelineConfig, ProgressEvent, ProgressObserver, collect_input_files,
+    Pipeline, PipelineConfig, ProgressEvent, ProgressObserver, TempCompression, collect_input_files,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
@@ -44,6 +44,35 @@ struct Args {
     /// Maximum number of parallel threads. Default: all available cores
     #[arg(long)]
     threads: Option<usize>,
+
+    /// Hidden: override the chunked-build chunk target size in points.
+    /// Bypasses the dynamic memory-budget-based calculation. Primarily for
+    /// testing — force multiple chunks on a small input to exercise merge.
+    #[arg(long, hide = true)]
+    chunk_target: Option<u64>,
+
+    /// Compress chunked-build scratch files to reduce temp-dir footprint.
+    /// "none" (default) is fastest on local NVMe; "lz4" cuts disk usage
+    /// ~3-4× at a small CPU cost, useful on space-constrained workers and
+    /// network filesystems.
+    #[arg(long, value_enum, default_value_t = TempCompressionArg::None)]
+    temp_compression: TempCompressionArg,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum TempCompressionArg {
+    #[default]
+    None,
+    Lz4,
+}
+
+impl From<TempCompressionArg> for TempCompression {
+    fn from(a: TempCompressionArg) -> Self {
+        match a {
+            TempCompressionArg::None => TempCompression::None,
+            TempCompressionArg::Lz4 => TempCompression::Lz4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -147,6 +176,7 @@ fn parse_memory_limit(s: &str) -> Result<u64> {
     Ok((value * multiplier as f64) as u64)
 }
 
+/// Total pipeline stages: Scanning + Counting + Distributing + Building + Writing.
 const TOTAL_STEPS: u32 = 5;
 
 fn human_count(n: u64) -> String {
@@ -170,15 +200,17 @@ struct BarProgress {
     step: std::sync::atomic::AtomicU32,
     stage_prefix: Mutex<String>,
     stage_total: std::sync::atomic::AtomicU64,
+    total_steps: u32,
 }
 
 impl BarProgress {
-    fn new() -> Self {
+    fn new(total_steps: u32) -> Self {
         Self {
             bar: Mutex::new(None),
             step: std::sync::atomic::AtomicU32::new(0),
             stage_prefix: Mutex::new(String::new()),
             stage_total: std::sync::atomic::AtomicU64::new(0),
+            total_steps,
         }
     }
 }
@@ -186,10 +218,11 @@ impl BarProgress {
 impl ProgressObserver for BarProgress {
     fn on_progress(&self, event: ProgressEvent) {
         let mut bar = self.bar.lock().unwrap();
+        let total_steps = self.total_steps;
         match event {
             ProgressEvent::StageStart { name, total } => {
                 let step = self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let prefix = format!("[{step}/{TOTAL_STEPS}] {name}");
+                let prefix = format!("[{step}/{total_steps}] {name}");
                 *self.stage_prefix.lock().unwrap() = prefix.clone();
                 self.stage_total
                     .store(total, std::sync::atomic::Ordering::Relaxed);
@@ -242,15 +275,17 @@ struct PlainProgress {
     stage_name: Mutex<String>,
     stage_total: std::sync::atomic::AtomicU64,
     last_percent: std::sync::atomic::AtomicU32,
+    total_steps: u32,
 }
 
 impl PlainProgress {
-    fn new() -> Self {
+    fn new(total_steps: u32) -> Self {
         Self {
             step: std::sync::atomic::AtomicU32::new(0),
             stage_name: Mutex::new(String::new()),
             stage_total: std::sync::atomic::AtomicU64::new(0),
             last_percent: std::sync::atomic::AtomicU32::new(0),
+            total_steps,
         }
     }
 }
@@ -266,6 +301,7 @@ fn log_line(msg: std::fmt::Arguments) {
 
 impl ProgressObserver for PlainProgress {
     fn on_progress(&self, event: ProgressEvent) {
+        let total_steps = self.total_steps;
         match event {
             ProgressEvent::StageStart { name, total } => {
                 let step = self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -276,11 +312,11 @@ impl ProgressObserver for PlainProgress {
                     .store(0, std::sync::atomic::Ordering::Relaxed);
                 if total > 0 {
                     log_line(format_args!(
-                        "[{step}/{TOTAL_STEPS}] {name} started ({} units)",
+                        "[{step}/{total_steps}] {name} started ({} units)",
                         human_count(total)
                     ));
                 } else {
-                    log_line(format_args!("[{step}/{TOTAL_STEPS}] {name} started"));
+                    log_line(format_args!("[{step}/{total_steps}] {name} started"));
                 }
             }
             ProgressEvent::StageProgress { done } => {
@@ -306,7 +342,7 @@ impl ProgressObserver for PlainProgress {
                     let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
                     let name = self.stage_name.lock().unwrap().clone();
                     log_line(format_args!(
-                        "[{step}/{TOTAL_STEPS}] {name} {bucket}% ({}/{})",
+                        "[{step}/{total_steps}] {name} {bucket}% ({}/{})",
                         human_count(done),
                         human_count(total),
                     ));
@@ -315,7 +351,7 @@ impl ProgressObserver for PlainProgress {
             ProgressEvent::StageDone => {
                 let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
                 let name = self.stage_name.lock().unwrap().clone();
-                log_line(format_args!("[{step}/{TOTAL_STEPS}] {name} done"));
+                log_line(format_args!("[{step}/{total_steps}] {name} done"));
             }
         }
     }
@@ -330,15 +366,17 @@ struct JsonProgress {
     stage_name: Mutex<String>,
     stage_total: std::sync::atomic::AtomicU64,
     last_percent: std::sync::atomic::AtomicU32,
+    total_steps: u32,
 }
 
 impl JsonProgress {
-    fn new() -> Self {
+    fn new(total_steps: u32) -> Self {
         Self {
             step: std::sync::atomic::AtomicU32::new(0),
             stage_name: Mutex::new(String::new()),
             stage_total: std::sync::atomic::AtomicU64::new(0),
             last_percent: std::sync::atomic::AtomicU32::new(0),
+            total_steps,
         }
     }
 
@@ -349,6 +387,7 @@ impl JsonProgress {
 
 impl ProgressObserver for JsonProgress {
     fn on_progress(&self, event: ProgressEvent) {
+        let total_steps = self.total_steps;
         match event {
             ProgressEvent::StageStart { name, total } => {
                 let step = self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -361,7 +400,7 @@ impl ProgressObserver for JsonProgress {
                     "event": "stage_start",
                     "stage": name,
                     "step": step,
-                    "total_steps": TOTAL_STEPS,
+                    "total_steps": total_steps,
                     "total_units": total,
                 }));
             }
@@ -391,7 +430,7 @@ impl ProgressObserver for JsonProgress {
                         "event": "stage_progress",
                         "stage": name,
                         "step": step,
-                        "total_steps": TOTAL_STEPS,
+                        "total_steps": total_steps,
                         "done": done,
                         "total": total,
                         "percent": (percent * 10.0).round() / 10.0,
@@ -405,7 +444,7 @@ impl ProgressObserver for JsonProgress {
                     "event": "stage_done",
                     "stage": name,
                     "step": step,
-                    "total_steps": TOTAL_STEPS,
+                    "total_steps": total_steps,
                 }));
             }
         }
@@ -462,9 +501,9 @@ fn main() -> Result<()> {
     );
 
     let progress: std::sync::Arc<dyn ProgressObserver> = match args.progress {
-        ProgressMode::Bar => std::sync::Arc::new(BarProgress::new()),
-        ProgressMode::Plain => std::sync::Arc::new(PlainProgress::new()),
-        ProgressMode::Json => std::sync::Arc::new(JsonProgress::new()),
+        ProgressMode::Bar => std::sync::Arc::new(BarProgress::new(TOTAL_STEPS)),
+        ProgressMode::Plain => std::sync::Arc::new(PlainProgress::new(TOTAL_STEPS)),
+        ProgressMode::Json => std::sync::Arc::new(JsonProgress::new(TOTAL_STEPS)),
     };
 
     let config = PipelineConfig {
@@ -473,6 +512,8 @@ fn main() -> Result<()> {
         temporal_index: args.temporal_index,
         temporal_stride: args.temporal_stride,
         progress: Some(progress),
+        chunk_target_override: args.chunk_target,
+        temp_compression: args.temp_compression.into(),
     };
 
     Pipeline::scan(&input_files, config)?
