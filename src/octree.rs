@@ -433,6 +433,39 @@ impl RawPoint {
 
 use crate::TempCompression;
 
+/// Adapter that flattens a sequence of concatenated LZ4 frames into a single
+/// logical stream.
+///
+/// `lz4_flex::frame::FrameDecoder` returns `Ok(0)` at the end of each frame
+/// even when more frames follow. Most `Read` consumers (including
+/// `Read::read_exact` and `byteorder::ReadBytesExt`) treat `Ok(0)` as
+/// end-of-stream, which truncates multi-frame files after the first frame.
+///
+/// This adapter re-probes the underlying reader whenever it sees an
+/// end-of-frame `Ok(0)`: the subsequent `read` call on the decoder will
+/// attempt to parse the next frame's header and yield its first block.
+/// Two consecutive zero-returns — end of frame followed by genuine EOF on
+/// the underlying reader — signal true end of stream.
+struct MultiFrameReader<R: std::io::Read> {
+    inner: R,
+}
+
+impl<R: std::io::Read> std::io::Read for MultiFrameReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        match self.inner.read(buf)? {
+            0 => {
+                // End of current frame. Try once more to see if another
+                // frame follows; a second zero means genuine EOF.
+                self.inner.read(buf)
+            }
+            n => Ok(n),
+        }
+    }
+}
+
 /// Write a single batch: a 4-byte little-endian point count followed by
 /// `points.len() × RawPoint::BYTE_SIZE` payload bytes. If `codec` is
 /// `Lz4`, the entire batch is encapsulated in a self-contained LZ4 frame.
@@ -457,14 +490,16 @@ fn write_temp_batch<W: Write>(
 }
 
 /// Read every batch in a reader to EOF, concatenating their points.
-/// For `Lz4` the reader is first wrapped in a `FrameDecoder`, which walks
-/// multi-frame streams transparently. An empty reader produces an empty Vec.
+/// For `Lz4` the reader is wrapped in a `FrameDecoder` + `MultiFrameReader`,
+/// which together walk multi-frame streams transparently. An empty reader
+/// produces an empty Vec.
 fn read_temp_batches<R: std::io::Read>(r: R, codec: TempCompression) -> Result<Vec<RawPoint>> {
     match codec {
         TempCompression::None => read_batches_loop(&mut BufReader::new(r)),
         TempCompression::Lz4 => {
-            let mut dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(r));
-            read_batches_loop(&mut dec)
+            let dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(r));
+            let mut mf = MultiFrameReader { inner: dec };
+            read_batches_loop(&mut mf)
         }
     }
 }
@@ -514,11 +549,12 @@ fn count_temp_file_points(path: &Path, codec: TempCompression) -> Result<u64> {
             Ok(total)
         }
         TempCompression::Lz4 => {
-            let mut dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(f));
+            let dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(f));
+            let mut mf = MultiFrameReader { inner: dec };
             let mut total: u64 = 0;
             let mut sink = [0u8; 4096];
             loop {
-                let count = match dec.read_u32::<LittleEndian>() {
+                let count = match mf.read_u32::<LittleEndian>() {
                     Ok(n) => n as u64,
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                     Err(e) => return Err(e.into()),
@@ -527,7 +563,7 @@ fn count_temp_file_points(path: &Path, codec: TempCompression) -> Result<u64> {
                 let mut remaining = count * RawPoint::BYTE_SIZE as u64;
                 while remaining > 0 {
                     let want = remaining.min(sink.len() as u64) as usize;
-                    dec.read_exact(&mut sink[..want])?;
+                    mf.read_exact(&mut sink[..want])?;
                     remaining -= want as u64;
                 }
             }
@@ -2038,6 +2074,65 @@ mod tests {
             assert_eq!(orig.gps_time, p.gps_time);
             assert_eq!(orig.nir, p.nir);
         }
+    }
+
+    /// Regression test: multi-batch LZ4 files must round-trip every point.
+    ///
+    /// `FrameDecoder` returns `Ok(0)` at each frame boundary, which naïve
+    /// readers mistake for EOF and truncate the stream after the first
+    /// frame. `MultiFrameReader` + `read_temp_batches` must transparently
+    /// walk every concatenated frame.
+    #[test]
+    fn lz4_multi_batch_round_trip() {
+        let codec = crate::TempCompression::Lz4;
+        // Four batches of varying sizes, written as four separate frames
+        // into one buffer — mirrors what `ChunkWriterCache::append` does
+        // under LRU pressure.
+        let batches: Vec<Vec<RawPoint>> = vec![
+            (0..10).map(|_| sample_point()).collect(),
+            (0..1).map(|_| sample_point()).collect(),
+            (0..1000).map(|_| sample_point()).collect(),
+            (0..42).map(|_| sample_point()).collect(),
+        ];
+        let expected: usize = batches.iter().map(|b| b.len()).sum();
+
+        let mut buf: Vec<u8> = Vec::new();
+        for batch in &batches {
+            write_temp_batch(&mut buf, batch, codec).unwrap();
+        }
+
+        let decoded = read_temp_batches(std::io::Cursor::new(&buf[..]), codec).unwrap();
+        assert_eq!(
+            decoded.len(),
+            expected,
+            "multi-frame LZ4 decode must recover every point"
+        );
+    }
+
+    /// Same round-trip at the count helper: `count_temp_file_points` under
+    /// LZ4 must also walk every frame rather than stopping at the first
+    /// boundary.
+    #[test]
+    fn lz4_multi_batch_count_temp_file_points() {
+        let codec = crate::TempCompression::Lz4;
+        let batches: Vec<Vec<RawPoint>> = vec![
+            (0..7).map(|_| sample_point()).collect(),
+            (0..13).map(|_| sample_point()).collect(),
+            (0..21).map(|_| sample_point()).collect(),
+        ];
+        let expected: u64 = batches.iter().map(|b| b.len() as u64).sum();
+
+        let tmp = std::env::temp_dir().join(format!("copc_lz4_mf_count_{}", std::process::id()));
+        {
+            let mut f = BufWriter::new(File::create(&tmp).unwrap());
+            for batch in &batches {
+                write_temp_batch(&mut f, batch, codec).unwrap();
+            }
+            f.flush().unwrap();
+        }
+        let got = count_temp_file_points(&tmp, codec).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(got, expected, "multi-frame count must match total");
     }
 
     #[test]
