@@ -577,6 +577,7 @@ fn count_temp_file_points(path: &Path, codec: TempCompression) -> Result<u64> {
             Ok(total)
         }
         TempCompression::Lz4 => {
+            let file_size = f.metadata()?.len();
             let dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(f));
             let mut mf = MultiFrameReader { inner: dec };
             let mut total: u64 = 0;
@@ -585,13 +586,30 @@ fn count_temp_file_points(path: &Path, codec: TempCompression) -> Result<u64> {
                 let count = match mf.read_u32::<LittleEndian>() {
                     Ok(n) => n as u64,
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e.into()),
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Failed to read batch count from {:?} (file size: {} bytes, counted {} points so far): {}",
+                            path,
+                            file_size,
+                            total,
+                            e
+                        ));
+                    }
                 };
                 total += count;
                 let mut remaining = count * RawPoint::BYTE_SIZE as u64;
                 while remaining > 0 {
                     let want = remaining.min(sink.len() as u64) as usize;
-                    mf.read_exact(&mut sink[..want])?;
+                    if let Err(e) = mf.read_exact(&mut sink[..want]) {
+                        return Err(anyhow::anyhow!(
+                            "Failed to read {} bytes from {:?} at point {} (file size: {} bytes): {}",
+                            want,
+                            path,
+                            total,
+                            file_size,
+                            e
+                        ));
+                    }
                     remaining -= want as u64;
                 }
             }
@@ -1036,7 +1054,12 @@ impl OctreeBuilder {
 
         if index_path.exists() {
             // Read from batched format
-            return self.read_node_batched(key, batch_id);
+            return self.read_node_batched(key, batch_id).with_context(|| {
+                format!(
+                    "Failed to read node (level={}, x={}, y={}, z={}) from batch {}",
+                    key.level, key.x, key.y, key.z, batch_id
+                )
+            });
         }
 
         // Fallback to legacy single-file format
@@ -1046,7 +1069,12 @@ impl OctreeBuilder {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => return Err(e.into()),
         };
-        read_temp_batches(f, self.temp_compression)
+        read_temp_batches(f, self.temp_compression).with_context(|| {
+            format!(
+                "Failed to read node (level={}, x={}, y={}, z={}) from {:?}",
+                key.level, key.x, key.y, key.z, path
+            )
+        })
     }
 
     /// Read a node from the batched temp file format.
@@ -1076,11 +1104,36 @@ impl OctreeBuilder {
             if level == key.level && x == key.x && y == key.y && z == key.z {
                 // Found the entry - read from batch file
                 let batch_path = self.batch_file_path(batch_id);
-                let mut f = File::open(&batch_path)?;
+                let mut f = File::open(&batch_path)
+                    .with_context(|| format!("Failed to open batch file {:?}", batch_path))?;
+
+                // Validate file size before reading
+                let file_size = f.metadata()?.len();
+                if offset + size > file_size {
+                    return Err(anyhow::anyhow!(
+                        "Temp file {:?} is truncated: expected at least {} bytes but file is only {} bytes \
+                         (voxel at level={}, x={}, y={}, z={}, offset={}, size={})",
+                        batch_path,
+                        offset + size,
+                        file_size,
+                        key.level,
+                        key.x,
+                        key.y,
+                        key.z,
+                        offset,
+                        size
+                    ));
+                }
+
                 use std::io::Seek;
                 f.seek(std::io::SeekFrom::Start(offset))?;
                 let mut limited = f.take(size);
-                return read_temp_batches(&mut limited, self.temp_compression);
+                return read_temp_batches(&mut limited, self.temp_compression).with_context(|| {
+                    format!(
+                        "Failed to read {} bytes at offset {} from batch file {:?}",
+                        size, offset, batch_path
+                    )
+                });
             }
         }
 
