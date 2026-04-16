@@ -61,6 +61,7 @@ copc_converter ./tiles/ merged.copc.laz
 | `--temporal-stride` | Sampling stride for the temporal index (every n-th point) | `1000` |
 | `--progress` | Progress output format: `bar`, `plain`, or `json` | `bar` |
 | `--temp-compression` | Compress scratch temp files: `none` or `lz4` | `none` |
+| `--temp-file-batch-size` | Number of voxel nodes per temp file batch | `5000` |
 
 #### Temp file compression
 
@@ -75,6 +76,21 @@ cost (LZ4 compresses at >1 GB/s per core). On fast local NVMe this trades CPU
 for disk without a clear wall-time win; on network filesystems (EFS/NFS) it
 typically also reduces wall time because the bottleneck shifts from I/O to
 compute.
+
+#### Temp file batching
+
+By default, the converter batches multiple voxel nodes into shared temp files
+(default: 5000 nodes per batch file). Each batch file (`batch_NNNNNN`) has a
+corresponding index file (`batch_NNNNNN.idx`) that maps voxel keys to
+offsets and sizes within the batch file.
+
+This dramatically reduces inode usage on filesystems with strict limits,
+particularly on HPC systems. For example, a conversion that would create
+millions of individual temp files now creates only thousands.
+
+Use `--temp-file-batch-size` to adjust the batch size based on your system's
+constraints. Higher values reduce inode usage further but may slightly impact
+random access performance during the build phase.
 
 ### Examples
 
@@ -100,6 +116,7 @@ let config = PipelineConfig {
     temporal_stride: 1000,
     progress: None, // or Some(Arc::new(your_observer))
     chunk_target_override: None,
+    temp_file_batch_size: 5000,
 };
 
 Pipeline::scan(&files, config)?
