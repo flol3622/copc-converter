@@ -365,6 +365,10 @@ pub fn write_copc(
     let temporal_index = config.temporal_index;
     let temporal_stride = config.temporal_stride as usize;
 
+    // Track successfully encoded vs failed nodes
+    let mut nodes_encoded: usize = 0;
+    let mut nodes_failed: usize = 0;
+
     let mut batch_start = 0;
     while batch_start < data_keys.len() {
         // Greedy-pack nodes into the batch up to phase 1's memory bound.
@@ -399,55 +403,67 @@ pub fn write_copc(
         // Phase 1: encode every node in the batch in parallel. The RawPoint
         // buffers are dropped inside each closure, so the memory that
         // survives into `results` is only the encoded Vec<u8> per node.
-        type NodeResult = (Vec<u8>, [u64; 15], f64, f64, Vec<f64>);
+        //
+        // We use filter_map to skip nodes that fail to read (e.g., corrupted
+        // temp files on HPC scratch filesystems). This allows the conversion
+        // to complete with partial data rather than failing entirely.
+        type NodeResult = (VoxelKey, Vec<u8>, [u64; 15], f64, f64, Vec<f64>);
         let results: Vec<NodeResult> = batch
             .par_iter()
-            .map(|key| -> Result<NodeResult> {
-                let mut pts = builder.read_node(key)?;
-                pts.sort_unstable_by(|a, b| {
-                    a.gps_time
-                        .partial_cmp(&b.gps_time)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let mut local_returns = [0u64; 15];
-                let mut local_gps_min = f64::MAX;
-                let mut local_gps_max = f64::MIN;
-                let mut samples = Vec::new();
-                let mut raw_bytes = Vec::with_capacity(point_record_len as usize * pts.len());
-                for (i, rp) in pts.iter().enumerate() {
-                    let rn = rp.return_number as usize;
-                    if (1..=15).contains(&rn) {
-                        local_returns[rn - 1] += 1;
+            .filter_map(|key| match builder.read_node(key) {
+                Ok(mut pts) => {
+                    pts.sort_unstable_by(|a, b| {
+                        a.gps_time
+                            .partial_cmp(&b.gps_time)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let mut local_returns = [0u64; 15];
+                    let mut local_gps_min = f64::MAX;
+                    let mut local_gps_max = f64::MIN;
+                    let mut samples = Vec::new();
+                    let mut raw_bytes = Vec::with_capacity(point_record_len as usize * pts.len());
+                    for (i, rp) in pts.iter().enumerate() {
+                        let rn = rp.return_number as usize;
+                        if (1..=15).contains(&rn) {
+                            local_returns[rn - 1] += 1;
+                        }
+                        if rp.gps_time < local_gps_min {
+                            local_gps_min = rp.gps_time;
+                        }
+                        if rp.gps_time > local_gps_max {
+                            local_gps_max = rp.gps_time;
+                        }
+                        if temporal_index && (i % temporal_stride == 0 || i == pts.len() - 1) {
+                            samples.push(rp.gps_time);
+                        }
+                        encode_point(rp, point_format, &mut raw_bytes);
                     }
-                    if rp.gps_time < local_gps_min {
-                        local_gps_min = rp.gps_time;
-                    }
-                    if rp.gps_time > local_gps_max {
-                        local_gps_max = rp.gps_time;
-                    }
-                    if temporal_index && (i % temporal_stride == 0 || i == pts.len() - 1) {
-                        samples.push(rp.gps_time);
-                    }
-                    encode_point(rp, point_format, &mut raw_bytes);
+                    Some((
+                        *key,
+                        raw_bytes,
+                        local_returns,
+                        local_gps_min,
+                        local_gps_max,
+                        samples,
+                    ))
                 }
-                Ok((
-                    raw_bytes,
-                    local_returns,
-                    local_gps_min,
-                    local_gps_max,
-                    samples,
-                ))
+                Err(e) => {
+                    error!(
+                        "Skipping corrupted node (level={}, x={}, y={}, z={}): {}",
+                        key.level, key.x, key.y, key.z, e
+                    );
+                    None
+                }
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
 
         // Drain per-node stats into the running aggregates, and split the
         // encoded bytes out into a separate Vec so we can drop it in
         // mini-batch chunks without holding onto the NodeResult tuples.
+        let batch_size = batch.len();
         let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(results.len());
         let mut actual_encoded_bytes: u64 = 0;
-        for (i, (bytes, local_returns, local_min, local_max, samples)) in
-            results.into_iter().enumerate()
-        {
+        for (_key, bytes, local_returns, local_min, local_max, samples) in results.into_iter() {
             for j in 0..15 {
                 return_counts[j] += local_returns[j];
             }
@@ -458,13 +474,23 @@ pub fn write_copc(
                 gpstime_max = local_max;
             }
             if temporal_index {
-                temporal_entries.push(TemporalIndexEntry {
-                    key: batch[i],
-                    samples,
-                });
+                temporal_entries.push(TemporalIndexEntry { key: _key, samples });
             }
             actual_encoded_bytes += bytes.len() as u64;
             encoded.push(bytes);
+        }
+
+        // Track success vs failure counts
+        nodes_encoded += encoded.len();
+        nodes_failed += batch_size - encoded.len();
+
+        if encoded.len() < batch_size {
+            debug!(
+                "Write batch {}: {} nodes succeeded, {} failed",
+                batch_start,
+                encoded.len(),
+                batch_size - encoded.len()
+            );
         }
         debug!(
             "Write batch {}: phase1 actual encoded {} MB (est {} MB, delta {:+})",
@@ -641,7 +667,15 @@ pub fn write_copc(
         file.write_all(&count.to_le_bytes())?;
     }
 
-    info!("COPC file written: {:?}", output_path);
+    // Report write statistics
+    if nodes_failed > 0 {
+        info!(
+            "COPC file written: {:?} ({} nodes encoded, {} nodes skipped due to errors)",
+            output_path, nodes_encoded, nodes_failed
+        );
+    } else {
+        info!("COPC file written: {:?}", output_path);
+    }
     Ok(())
 }
 
