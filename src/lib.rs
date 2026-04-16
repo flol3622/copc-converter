@@ -15,6 +15,7 @@
 //!     progress: None,
 //!     chunk_target_override: None,
 //!     temp_compression: copc_converter::TempCompression::None,
+//!     temp_file_batch_size: 5000,
 //! };
 //! let files = copc_converter::collect_input_files("input.laz".into()).unwrap();
 //!
@@ -189,6 +190,11 @@ pub struct PipelineConfig {
     pub chunk_target_override: Option<u64>,
     /// Compression codec for scratch temp files.
     pub temp_compression: TempCompression,
+    /// Number of voxel nodes to batch into a single temp file. Higher values
+    /// reduce inode usage on filesystems with limited inodes (e.g., HPC
+    /// scratch systems), at the cost of slightly more I/O when reading
+    /// specific voxels. Default: 5000 (reasonable balance for most systems).
+    pub temp_file_batch_size: usize,
 }
 
 impl PipelineConfig {

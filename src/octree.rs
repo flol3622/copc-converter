@@ -841,6 +841,8 @@ pub struct OctreeBuilder {
     pub(crate) chunked_plan: Option<crate::chunking::ChunkPlan>,
     /// Compression codec applied to scratch temp files.
     pub(crate) temp_compression: crate::TempCompression,
+    /// Number of voxel nodes to batch into a single temp file.
+    temp_file_batch_size: usize,
 }
 
 impl OctreeBuilder {
@@ -971,10 +973,32 @@ impl OctreeBuilder {
             point_format: validated.point_format,
             chunked_plan: None,
             temp_compression: config.temp_compression,
+            temp_file_batch_size: config.temp_file_batch_size,
         })
     }
 
-    /// Path for a node's temp file.
+    /// Compute the batch ID for a voxel key. Uses a simple hash function
+    /// to distribute voxels across batch files.
+    fn batch_id(&self, key: &VoxelKey) -> usize {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.temp_file_batch_size
+    }
+
+    /// Path for a batch file (multiple voxels stored together).
+    fn batch_file_path(&self, batch_id: usize) -> PathBuf {
+        self.tmp_dir.join(format!("batch_{:06}", batch_id))
+    }
+
+    /// Path for a batch index file (maps voxel keys to offsets within the batch file).
+    fn batch_index_path(&self, batch_id: usize) -> PathBuf {
+        self.tmp_dir.join(format!("batch_{:06}.idx", batch_id))
+    }
+
+    /// Legacy path for a node's temp file (for backward compatibility during migration).
+    /// This will be removed once the batching is fully implemented.
     fn node_path(&self, key: &VoxelKey) -> PathBuf {
         self.tmp_dir
             .join(format!("{}_{}_{}_{}", key.level, key.x, key.y, key.z))
@@ -1006,6 +1030,16 @@ impl OctreeBuilder {
 
     /// Read all raw points for a given node key from disk.
     pub fn read_node(&self, key: &VoxelKey) -> Result<Vec<RawPoint>> {
+        // Try the batched format first
+        let batch_id = self.batch_id(key);
+        let index_path = self.batch_index_path(batch_id);
+
+        if index_path.exists() {
+            // Read from batched format
+            return self.read_node_batched(key, batch_id);
+        }
+
+        // Fallback to legacy single-file format
         let path = self.node_path(key);
         let f = match File::open(&path) {
             Ok(f) => f,
@@ -1015,22 +1049,209 @@ impl OctreeBuilder {
         read_temp_batches(f, self.temp_compression)
     }
 
+    /// Read a node from the batched temp file format.
+    fn read_node_batched(&self, key: &VoxelKey, batch_id: usize) -> Result<Vec<RawPoint>> {
+        let index_path = self.batch_index_path(batch_id);
+        let index_data = match std::fs::read(&index_path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e.into()),
+        };
+
+        // Parse index: each entry is (level:i32, x:i32, y:i32, z:i32, offset:u64, size:u64) = 32 bytes
+        let entry_size = 32;
+        let num_entries = index_data.len() / entry_size;
+
+        use std::io::Cursor;
+        let mut cursor = Cursor::new(&index_data);
+
+        for _ in 0..num_entries {
+            let level = cursor.read_i32::<LittleEndian>()?;
+            let x = cursor.read_i32::<LittleEndian>()?;
+            let y = cursor.read_i32::<LittleEndian>()?;
+            let z = cursor.read_i32::<LittleEndian>()?;
+            let offset = cursor.read_u64::<LittleEndian>()?;
+            let size = cursor.read_u64::<LittleEndian>()?;
+
+            if level == key.level && x == key.x && y == key.y && z == key.z {
+                // Found the entry - read from batch file
+                let batch_path = self.batch_file_path(batch_id);
+                let mut f = File::open(&batch_path)?;
+                use std::io::Seek;
+                f.seek(std::io::SeekFrom::Start(offset))?;
+                let mut limited = f.take(size);
+                return read_temp_batches(&mut limited, self.temp_compression);
+            }
+        }
+
+        // Not found in index
+        Ok(vec![])
+    }
+
     /// Write points to a temp file for the given node key (overwrites if
     /// exists). Always writes exactly one batch, even for an empty slice.
     pub fn write_node_to_temp(&self, key: &VoxelKey, points: &[RawPoint]) -> Result<()> {
-        let path = self.node_path(key);
-        let f = File::create(&path)?;
-        let mut w = BufWriter::new(f);
-        write_temp_batch(&mut w, points, self.temp_compression)?;
-        w.flush().context("flush node temp file")?;
+        let batch_id = self.batch_id(key);
+        self.write_node_batched(key, points, batch_id)
+    }
+
+    /// Write a node to the batched temp file format.
+    /// This implementation handles overwrites by maintaining only the latest write
+    /// for each voxel key in the index.
+    fn write_node_batched(
+        &self,
+        key: &VoxelKey,
+        points: &[RawPoint],
+        batch_id: usize,
+    ) -> Result<()> {
+        let batch_path = self.batch_file_path(batch_id);
+        let index_path = self.batch_index_path(batch_id);
+
+        // Serialize the points to a buffer first
+        let mut point_data = Vec::new();
+        write_temp_batch(&mut point_data, points, self.temp_compression)?;
+
+        // Read existing index to check for overwrites
+        let mut existing_entries: Vec<(i32, i32, i32, i32, u64, u64)> = Vec::new();
+
+        if index_path.exists() {
+            let index_data = std::fs::read(&index_path)?;
+            let entry_size = 32;
+            let num_entries = index_data.len() / entry_size;
+
+            use std::io::Cursor;
+            let mut cursor = Cursor::new(&index_data);
+
+            for _ in 0..num_entries {
+                let level = cursor.read_i32::<LittleEndian>()?;
+                let x = cursor.read_i32::<LittleEndian>()?;
+                let y = cursor.read_i32::<LittleEndian>()?;
+                let z = cursor.read_i32::<LittleEndian>()?;
+                let offset = cursor.read_u64::<LittleEndian>()?;
+                let size = cursor.read_u64::<LittleEndian>()?;
+
+                // Skip this entry if it matches our key (we'll replace it)
+                if level == key.level && x == key.x && y == key.y && z == key.z {
+                    continue;
+                }
+                existing_entries.push((level, x, y, z, offset, size));
+            }
+        }
+
+        // Append data to batch file
+        let mut batch_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&batch_path)
+            .with_context(|| format!("opening batch file {:?}", batch_path))?;
+
+        let offset = batch_file.metadata()?.len();
+        let size = point_data.len() as u64;
+
+        batch_file.write_all(&point_data)?;
+        batch_file.flush()?;
+
+        // Rewrite index with all entries (old + new, skipping the overwritten one)
+        let mut index_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&index_path)
+            .with_context(|| format!("opening index file {:?}", index_path))?;
+
+        // Write all existing entries except the one we're replacing
+        for (level, x, y, z, off, sz) in existing_entries {
+            index_file.write_i32::<LittleEndian>(level)?;
+            index_file.write_i32::<LittleEndian>(x)?;
+            index_file.write_i32::<LittleEndian>(y)?;
+            index_file.write_i32::<LittleEndian>(z)?;
+            index_file.write_u64::<LittleEndian>(off)?;
+            index_file.write_u64::<LittleEndian>(sz)?;
+        }
+
+        // Write the new entry
+        index_file.write_i32::<LittleEndian>(key.level)?;
+        index_file.write_i32::<LittleEndian>(key.x)?;
+        index_file.write_i32::<LittleEndian>(key.y)?;
+        index_file.write_i32::<LittleEndian>(key.z)?;
+        index_file.write_u64::<LittleEndian>(offset)?;
+        index_file.write_u64::<LittleEndian>(size)?;
+        index_file.flush()?;
+
         Ok(())
     }
 
+    /// Count points in a node, handling both batched and legacy formats.
+    fn count_node_points(&self, key: &VoxelKey) -> Result<u64> {
+        let batch_id = self.batch_id(key);
+        let index_path = self.batch_index_path(batch_id);
+
+        if index_path.exists() {
+            // Use batched format
+            return self.count_node_points_batched(key, batch_id);
+        }
+
+        // Fallback to legacy format
+        let path = self.node_path(key);
+        count_temp_file_points(&path, self.temp_compression)
+    }
+
+    /// Count points in a node using the batched format.
+    fn count_node_points_batched(&self, key: &VoxelKey, batch_id: usize) -> Result<u64> {
+        let index_path = self.batch_index_path(batch_id);
+        let index_data = match std::fs::read(&index_path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+
+        // Parse index to find this key's entry
+        let entry_size = 32;
+        let num_entries = index_data.len() / entry_size;
+
+        use std::io::Cursor;
+        let mut cursor = Cursor::new(&index_data);
+
+        for _ in 0..num_entries {
+            let level = cursor.read_i32::<LittleEndian>()?;
+            let x = cursor.read_i32::<LittleEndian>()?;
+            let y = cursor.read_i32::<LittleEndian>()?;
+            let z = cursor.read_i32::<LittleEndian>()?;
+            let offset = cursor.read_u64::<LittleEndian>()?;
+            let size = cursor.read_u64::<LittleEndian>()?;
+
+            if level == key.level && x == key.x && y == key.y && z == key.z {
+                // Found the entry - count points by reading the batch header(s)
+                let batch_path = self.batch_file_path(batch_id);
+                let mut f = File::open(&batch_path)?;
+                use std::io::Seek;
+                f.seek(std::io::SeekFrom::Start(offset))?;
+
+                // Read the batch header to get point count
+                // Each batch starts with a u32 count
+                let mut limited = f.take(size);
+                match self.temp_compression {
+                    crate::TempCompression::None => {
+                        // Just read the first u32 count
+                        let count = limited.read_u32::<LittleEndian>()?;
+                        return Ok(count as u64);
+                    }
+                    crate::TempCompression::Lz4 => {
+                        // Need to decompress and read the count
+                        let dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(limited));
+                        let mut mf = MultiFrameReader { inner: dec };
+                        let count = mf.read_u32::<LittleEndian>()?;
+                        return Ok(count as u64);
+                    }
+                }
+            }
+        }
+
+        // Not found in index
+        Ok(0)
+    }
+
     /// Bottom-up grid-sample loop over an in-memory `nodes` HashMap.
-    ///
-    /// Walks levels `(min_level..actual_max_depth)` in reverse, grouping
-    /// children of each parent and running `grid_sample` to produce that
-    /// parent. After the loop completes, every node in the resulting map is
     /// written to its canonical temp file location.
     ///
     /// With `min_level = 0` the loop walks all the way to the global root.
@@ -1229,8 +1450,7 @@ impl OctreeBuilder {
             if !child_donated[ci] {
                 // Check if this child originally had points (file might now be
                 // empty because all were promoted).
-                let n =
-                    count_temp_file_points(&self.node_path(ck), self.temp_compression).unwrap_or(0);
+                let n = self.count_node_points(ck).unwrap_or(0);
                 if n == 0 && !parent_pts.is_empty() {
                     // Return one point from the parent back to this child.
                     // Find the last parent point that came from any child — we
@@ -1813,10 +2033,7 @@ impl OctreeBuilder {
             for (parent, children) in parent_children {
                 let est_points: u64 = children
                     .iter()
-                    .map(|ck| {
-                        count_temp_file_points(&self.node_path(ck), self.temp_compression)
-                            .unwrap_or(0)
-                    })
+                    .map(|ck| self.count_node_points(ck).unwrap_or(0))
                     .sum();
                 let est_mem = est_points * MEM_PER_POINT;
                 if est_mem > config.memory_budget {
@@ -2047,7 +2264,7 @@ impl OctreeBuilder {
         let mut result: Vec<(VoxelKey, usize)> = all_keys
             .par_iter()
             .map(|k| -> Result<(VoxelKey, usize)> {
-                let n = count_temp_file_points(&self.node_path(k), self.temp_compression)? as usize;
+                let n = self.count_node_points(k)? as usize;
                 Ok((*k, n))
             })
             .collect::<Result<Vec<_>>>()?;
