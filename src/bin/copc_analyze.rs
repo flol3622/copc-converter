@@ -3,7 +3,7 @@
 //! Runs the hierarchical counting-sort chunk analysis from
 //! `copc_converter::chunking` against real input files and prints a
 //! statistics report. Does not write any output — it's a measurement tool
-//! for inspecting how a dataset would be partitioned by the chunked build.
+//! for inspecting how a dataset would be partitioned during the build.
 //!
 //! Usage:
 //!   copc_analyze <input_file_or_dir> [--memory-limit 16G] [--chunk-target 5M]
@@ -25,11 +25,9 @@ const MEMORY_SAFETY_FACTOR: f64 = 0.75;
 #[command(
     author,
     version,
-    about = "Analyze the chunked-build chunking algorithm against a dataset",
+    about = "Analyze the chunking algorithm against a dataset",
     long_about = "Runs the hierarchical counting-sort chunk planner from the chunking \
-                  module on real input files and prints chunk size distribution statistics. \
-                  Used to evaluate whether the chunked-build approach produces sane chunks \
-                  for a given dataset before committing to the full chunked-build rewrite."
+                  module on real input files and prints chunk size distribution statistics."
 )]
 struct Args {
     /// Input LAZ/LAS file, or a directory containing them
@@ -436,7 +434,7 @@ fn main() -> Result<()> {
     // The merge step is fast and difficult to time precisely from outside
     // the module — for an early prototype it's fine to attribute almost all
     // of the elapsed time to counting and a small constant to merging.
-    let pre_existing_grid_size = select_grid_size(plan.total_points);
+    let pre_existing_grid_size = select_grid_size(plan.total_points, memory_budget);
     let approx_merge_secs = match pre_existing_grid_size {
         128 => 0.01,
         256 => 0.05,

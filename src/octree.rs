@@ -27,11 +27,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
 
 // ---------------------------------------------------------------------------
-// Chunked-build constants and helper types
+// Distribute constants and helper types
 // ---------------------------------------------------------------------------
 
 /// Maximum number of leaf chunk files kept open simultaneously across all
-/// distribute workers in the chunked path. Divided evenly between workers.
+/// distribute workers. Divided evenly between workers.
 ///
 /// Each entry holds a `BufWriter<File>` (~8 KiB internal buffer) plus an OS
 /// file descriptor. Capping prevents FD exhaustion on hosts with low ulimits
@@ -46,9 +46,6 @@ const MIN_PER_WORKER_CHUNK_FILES: usize = 32;
 /// Keys are chunk indices (`u32`). On eviction the writer is flushed and
 /// dropped, releasing both its buffer and its file descriptor. Subsequent
 /// writes to the same chunk index reopen the file in append mode.
-///
-/// This is the chunk-keyed analog of the per-leaf path's writer cache: the
-/// design is identical, only the key type changes.
 struct ChunkWriterCache {
     writers: HashMap<u32, BufWriter<File>>,
     /// Insertion / access order. Front = least recently used.
@@ -126,8 +123,8 @@ fn chunk_canonical_path(chunks_dir: &Path, chunk_idx: u32) -> PathBuf {
     chunks_dir.join(format!("chunk_{chunk_idx}"))
 }
 
-/// Same heuristic as the per-leaf parallel distribute path: ~2/3 of cores,
-/// leaving headroom for the LAZ parallel decoder. Capped by input file count.
+/// ~2/3 of cores, leaving headroom for the LAZ parallel decoder. Capped
+/// by input file count.
 fn chunked_distribute_worker_count(input_file_count: usize) -> usize {
     let cores = rayon::current_num_threads();
     let target = ((cores * 2) / 3).max(2);
@@ -142,9 +139,8 @@ fn chunked_distribute_worker_count(input_file_count: usize) -> usize {
 /// chunk root is the only leaf).
 ///
 /// **Uniform subdivision** — dense regions inside the chunk may exceed
-/// `MAX_LEAF_POINTS` per leaf, which is acceptable per the design doc §9.3.
-/// `grid_sample`'s natural cascading handles the imbalance during the
-/// bottom-up build.
+/// `MAX_LEAF_POINTS` per leaf; `grid_sample`'s natural cascading handles
+/// the imbalance during the bottom-up build.
 fn chunk_local_extra_levels(point_count: u64) -> u32 {
     if point_count <= MAX_LEAF_POINTS {
         return 0;
@@ -506,18 +502,50 @@ fn read_temp_batches<R: std::io::Read>(r: R, codec: TempCompression) -> Result<V
 
 fn read_batches_loop<R: std::io::Read>(r: &mut R) -> Result<Vec<RawPoint>> {
     let mut out: Vec<RawPoint> = Vec::new();
+    for_each_point_in_batches(r, |p| {
+        out.push(p);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Stream every point in a batch reader, invoking `f` on each one.
+///
+/// The chunk build path uses this to classify points into their leaf
+/// voxels as they are decoded, avoiding an intermediate `Vec<RawPoint>`
+/// that would hold every point in the chunk resident at once.
+fn for_each_point_in_batches<R: std::io::Read, F: FnMut(RawPoint) -> Result<()>>(
+    r: &mut R,
+    mut f: F,
+) -> Result<()> {
     loop {
         let count = match r.read_u32::<LittleEndian>() {
             Ok(n) => n as usize,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         };
-        out.reserve(count);
         for _ in 0..count {
-            out.push(RawPoint::read(r)?);
+            f(RawPoint::read(r)?)?;
         }
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Streaming counterpart to `read_temp_batches`. Invokes `f` on every
+/// decoded `RawPoint` without ever materialising the full Vec.
+fn stream_temp_batches<R: std::io::Read, F: FnMut(RawPoint) -> Result<()>>(
+    r: R,
+    codec: TempCompression,
+    f: F,
+) -> Result<()> {
+    match codec {
+        TempCompression::None => for_each_point_in_batches(&mut BufReader::new(r), f),
+        TempCompression::Lz4 => {
+            let dec = lz4_flex::frame::FrameDecoder::new(BufReader::new(r));
+            let mut mf = MultiFrameReader { inner: dec };
+            for_each_point_in_batches(&mut mf, f)
+        }
+    }
 }
 
 /// Count the points in a temp file by walking batch headers. For `None` mode
@@ -640,16 +668,26 @@ impl Bounds {
         }
     }
 
-    /// Cube that contains this AABB.
-    pub fn to_cube(&self) -> (f64, f64, f64, f64) {
+    /// Cube that contains this AABB, padded by one scale unit per axis.
+    ///
+    /// The COPC spec reconstructs each node's per-axis cube bound via
+    /// `cx − halfsize + (vx + 1) × (2 × halfsize / 2^depth)`. That float
+    /// multiplication chain loses ~1 ULP at every depth, so a point sitting
+    /// exactly on a cell boundary can land 1 ULP outside the
+    /// spec-reconstructed bound while still being "the same point" at the
+    /// file's stored precision. Padding halfsize by one scale unit gives
+    /// every face slack far larger than any ULP drift.
+    pub fn to_cube(&self, scale_x: f64, scale_y: f64, scale_z: f64) -> (f64, f64, f64, f64) {
         let cx = (self.min_x + self.max_x) / 2.0;
         let cy = (self.min_y + self.max_y) / 2.0;
         let cz = (self.min_z + self.max_z) / 2.0;
+        let scale_pad = scale_x.max(scale_y).max(scale_z);
         let half = ((self.max_x - self.min_x)
             .max(self.max_y - self.min_y)
             .max(self.max_z - self.min_z))
             / 2.0
-            * 1.0001; // tiny epsilon
+            + scale_pad;
+        let half = half * 1.0001; // tiny relative epsilon on top
         (cx, cy, cz, half)
     }
 }
@@ -737,8 +775,34 @@ pub struct ScanResult {
     pub offset_x: f64,
     pub offset_y: f64,
     pub offset_z: f64,
-    pub wkt_crs: Option<Vec<u8>>,
+    /// Hash of the file's WKT CRS VLR (if present). Storing only a hash
+    /// keeps `ScanResult` size constant in the number of files — with
+    /// 100k+ input files and typical ~2 KB WKT strings, storing full
+    /// copies would cost hundreds of MB across the scan pass. The
+    /// canonical WKT bytes are kept separately (see `OctreeBuilder::scan`
+    /// return type) and only one copy lives through validate → write.
+    pub wkt_crs_hash: Option<u64>,
     pub point_format_id: u8,
+}
+
+/// Output of the scan pass: per-file results plus the one canonical WKT
+/// payload from the first file that had one. Downstream stages use this
+/// single copy instead of rehydrating one per file.
+pub struct ScanOutput {
+    pub results: Vec<ScanResult>,
+    pub canonical_wkt: Option<Vec<u8>>,
+}
+
+/// Stable 64-bit hash of a WKT byte payload. SipHash-1-3 with a fixed
+/// seed so the digest is identical across files in the same process.
+/// Collisions would cause a silent CRS mismatch; with 64 bits and
+/// typically <10 distinct WKTs per run the risk is negligible.
+fn wkt_hash(bytes: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+    let mut h = BuildHasherDefault::<DefaultHasher>::default().build_hasher();
+    h.write(bytes);
+    h.finish()
 }
 
 /// Builds a COPC octree from scanned input files.
@@ -773,8 +837,7 @@ pub struct OctreeBuilder {
     pub wkt_crs: Option<Vec<u8>>,
     /// COPC output point format (6, 7, or 8), derived from input files.
     pub point_format: u8,
-    /// Chunk plan computed by `distribute_chunked` and consumed by
-    /// `build_node_map_chunked`. `None` for the per-leaf path.
+    /// Chunk plan computed by `distribute` and consumed by `build_node_map`.
     pub(crate) chunked_plan: Option<crate::chunking::ChunkPlan>,
     /// Compression codec applied to scratch temp files.
     pub(crate) temp_compression: crate::TempCompression,
@@ -782,11 +845,19 @@ pub struct OctreeBuilder {
 
 impl OctreeBuilder {
     /// Pass 1: scan all files in parallel to get bounds and total point count.
-    pub fn scan(input_files: &[PathBuf], config: &PipelineConfig) -> Result<Vec<ScanResult>> {
+    ///
+    /// Each file's WKT CRS bytes are hashed on the fly; only the first
+    /// file's canonical WKT payload is kept in full. Downstream validate
+    /// compares hashes and uses the canonical payload for the output COPC.
+    pub fn scan(input_files: &[PathBuf], config: &PipelineConfig) -> Result<ScanOutput> {
         let done = std::sync::atomic::AtomicU64::new(0);
-        let results: Result<Vec<ScanResult>> = input_files
+        // Per-file result: (ScanResult, Option<Vec<u8>>) — the Option carries
+        // the raw WKT bytes so we can pick the first non-None one after the
+        // parallel scan. Post-aggregation we drop every per-file Vec and
+        // keep only the single canonical copy.
+        let per_file: Result<Vec<(ScanResult, Option<Vec<u8>>)>> = input_files
             .par_iter()
-            .map(|path| -> Result<ScanResult> {
+            .map(|path| -> Result<(ScanResult, Option<Vec<u8>>)> {
                 debug!("Scanning {:?}", path);
                 let reader = las::Reader::from_path(path)
                     .with_context(|| format!("Cannot open {:?}", path))?;
@@ -798,24 +869,44 @@ impl OctreeBuilder {
                 let t = hdr.transforms();
                 let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 config.report(crate::ProgressEvent::StageProgress { done: n });
-                Ok(ScanResult {
-                    bounds,
-                    point_count: hdr.number_of_points(),
-                    scale_x: t.x.scale,
-                    scale_y: t.y.scale,
-                    scale_z: t.z.scale,
-                    offset_x: t.x.offset,
-                    offset_y: t.y.offset,
-                    offset_z: t.z.offset,
-                    wkt_crs: hdr
-                        .all_vlrs()
-                        .find(|v| v.is_wkt_crs())
-                        .map(|v| v.data.clone()),
-                    point_format_id: hdr.point_format().to_u8().unwrap_or(0),
-                })
+                let wkt_bytes: Option<Vec<u8>> = hdr
+                    .all_vlrs()
+                    .find(|v| v.is_wkt_crs())
+                    .map(|v| v.data.clone());
+                let wkt_crs_hash = wkt_bytes.as_deref().map(wkt_hash);
+                Ok((
+                    ScanResult {
+                        bounds,
+                        point_count: hdr.number_of_points(),
+                        scale_x: t.x.scale,
+                        scale_y: t.y.scale,
+                        scale_z: t.z.scale,
+                        offset_x: t.x.offset,
+                        offset_y: t.y.offset,
+                        offset_z: t.z.offset,
+                        wkt_crs_hash,
+                        point_format_id: hdr.point_format().to_u8().unwrap_or(0),
+                    },
+                    wkt_bytes,
+                ))
             })
             .collect();
-        results
+
+        let per_file = per_file?;
+        let mut canonical_wkt: Option<Vec<u8>> = None;
+        let mut results: Vec<ScanResult> = Vec::with_capacity(per_file.len());
+        for (sr, wkt) in per_file {
+            if canonical_wkt.is_none()
+                && let Some(bytes) = wkt
+            {
+                canonical_wkt = Some(bytes);
+            }
+            results.push(sr);
+        }
+        Ok(ScanOutput {
+            results,
+            canonical_wkt,
+        })
     }
 
     /// Build an OctreeBuilder from scan results and validated inputs.
@@ -835,7 +926,7 @@ impl OctreeBuilder {
         let (scale_x, scale_y, scale_z) = (first.scale_x, first.scale_y, first.scale_z);
         let (offset_x, offset_y, offset_z) = (first.offset_x, first.offset_y, first.offset_z);
 
-        let (cx, cy, cz, halfsize) = bounds.to_cube();
+        let (cx, cy, cz, halfsize) = bounds.to_cube(scale_x, scale_y, scale_z);
 
         // Choose depth so that leaf voxels hold ≤ MAX_LEAF_POINTS on average.
         let depth = {
@@ -942,16 +1033,15 @@ impl OctreeBuilder {
     /// parent. After the loop completes, every node in the resulting map is
     /// written to its canonical temp file location.
     ///
-    /// With `min_level = 0` the loop walks all the way to the global root
-    /// (per-leaf path). With a positive `min_level` the loop stops once it
-    /// has produced parents at `min_level`, leaving any coarser ancestors
-    /// to a later merge step (chunked path: each chunk's bottom-up build
-    /// stops at the chunk's root level).
+    /// With `min_level = 0` the loop walks all the way to the global root.
+    /// With a positive `min_level` the loop stops once it has produced
+    /// parents at `min_level`, leaving any coarser ancestors to a later
+    /// merge step — used by per-chunk builds that stop at the chunk's
+    /// root level.
     ///
     /// `report_progress` controls whether per-level `StageProgress` events
-    /// are emitted. The per-leaf path passes `true` (the level loop is the
-    /// main unit of progress). The chunked path passes `false` because its
-    /// outer stage tracks chunks-done, not levels-done.
+    /// are emitted. Set `false` when the caller's outer stage tracks a
+    /// different unit of progress (e.g. chunks-done).
     fn bottom_up_levels(
         &self,
         mut nodes: HashMap<VoxelKey, Vec<RawPoint>>,
@@ -1251,10 +1341,10 @@ impl OctreeBuilder {
         (parent_pts, remaining)
     }
 
-    /// Chunked distribute. Computes the chunk plan via the counting-sort
-    /// analyzer, builds a fast cell→chunk lookup table, then streams each
-    /// input file in parallel and appends each point to its chunk's temp
-    /// file via a bounded LRU writer cache.
+    /// Distribute points to per-chunk temp files. Computes the chunk plan
+    /// via the counting-sort analyzer, builds a fast cell→chunk lookup
+    /// table, then streams each input file in parallel and appends each
+    /// point to its chunk's temp file via a bounded LRU writer cache.
     pub fn distribute(&mut self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
         // 1. Compute the chunk plan (counting + merge-sparse-cells). This
         //    runs a full pass over the input to populate an occupancy grid,
@@ -1273,7 +1363,7 @@ impl OctreeBuilder {
         )?;
         config.report(crate::ProgressEvent::StageDone);
         info!(
-            "Chunked distribute: {} chunks, target {} points each, grid {}³",
+            "Distribute: {} chunks, target {} points each, grid {}³",
             plan.chunks.len(),
             plan.chunk_target,
             plan.grid_size
@@ -1316,7 +1406,7 @@ impl OctreeBuilder {
             ((per_worker_budget / 8) / BYTES_PER_POINT_TRANSIENT).clamp(50_000, 2_000_000) as usize;
 
         debug!(
-            "Chunked distribute: budget={} MB, workers={}, read_chunk_size={}, open-file cap={} (per worker)",
+            "Distribute: budget={} MB, workers={}, read_chunk_size={}, open-file cap={} (per worker)",
             config.memory_budget / 1_048_576,
             num_workers,
             read_chunk_size,
@@ -1373,7 +1463,7 @@ impl OctreeBuilder {
                         .with_context(|| format!("Cannot open {:?}", path))?;
                     let file_pts = reader.header().number_of_points();
                     debug!(
-                        "Chunked distribute worker {} file {:?}: {} points",
+                        "Distribute worker {} file {:?}: {} points",
                         worker_id,
                         path.file_name().unwrap_or_default(),
                         file_pts
@@ -1391,9 +1481,6 @@ impl OctreeBuilder {
                         // many points per writer call → fewer LRU touches
                         // and better amortization than per-point appends.
                         for p in &points {
-                            // Convert via the same RawPoint conversion the
-                            // per-leaf path uses, so the chunked path stores
-                            // the exact same int-coordinate representation.
                             let raw = self.convert_point(p);
 
                             // Classify to grid cell via point_to_key at the
@@ -1454,11 +1541,19 @@ impl OctreeBuilder {
         Ok(())
     }
 
-    /// Read all `RawPoint`s from a chunk file in one shot.
-    fn read_chunk_file(&self, chunk_idx: u32) -> Result<Vec<RawPoint>> {
+    /// Open a chunk file and stream every point through `f`.
+    ///
+    /// The build path streams points straight into its leaves HashMap
+    /// instead of materialising a full intermediate Vec, so peak memory
+    /// scales with the leaves map alone rather than 2× the chunk size.
+    fn stream_chunk_file<F: FnMut(RawPoint) -> Result<()>>(
+        &self,
+        chunk_idx: u32,
+        f: F,
+    ) -> Result<()> {
         let path = chunk_canonical_path(&self.tmp_dir.join("chunks"), chunk_idx);
-        let f = File::open(&path).with_context(|| format!("opening chunk file {:?}", path))?;
-        read_temp_batches(f, self.temp_compression)
+        let file = File::open(&path).with_context(|| format!("opening chunk file {:?}", path))?;
+        stream_temp_batches(file, self.temp_compression, f)
     }
 
     /// Build a single chunk's sub-octree fully in memory and write its node
@@ -1474,41 +1569,31 @@ impl OctreeBuilder {
         chunk_idx: u32,
         config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
-        // Load all points for this chunk into memory.
-        let points = self.read_chunk_file(chunk_idx)?;
-        let n_points = points.len();
-
-        if n_points == 0 {
-            // Empty chunk → no nodes produced. Should not happen for a plan
-            // generated by `merge_sparse_cells`, but handle defensively.
-            debug!(
-                "Chunk {} (L{} {},{},{}) is empty, skipping",
-                chunk_idx, chunk.level, chunk.gx, chunk.gy, chunk.gz
-            );
-            return Ok(Vec::new());
-        }
-
-        // Compute the chunk-local leaf depth so each leaf holds ~MAX_LEAF_POINTS
-        // on average. Slightly larger leaves are acceptable in dense regions.
-        let extra_levels = chunk_local_extra_levels(n_points as u64);
+        // Compute the chunk-local leaf depth from the plan's point-count
+        // estimate. Adaptive subdivision below corrects for any residual
+        // overflow in dense regions, so using the estimate here (rather
+        // than an exact count that would require a pre-read pass) is safe.
+        let extra_levels = chunk_local_extra_levels(chunk.point_count);
         let leaf_depth = chunk.level + extra_levels;
         debug!(
-            "Chunk {} (L{} {},{},{}): {} points → leaf depth {} (extra {})",
+            "Chunk {} (L{} {},{},{}): ~{} points → leaf depth {} (extra {})",
             chunk_idx,
             chunk.level,
             chunk.gx,
             chunk.gy,
             chunk.gz,
-            n_points,
+            chunk.point_count,
             leaf_depth,
             extra_levels
         );
 
-        // Classify each point into its leaf voxel at the global leaf depth.
-        // This uses point_to_key on round-tripped world coordinates so the
-        // voxel assignment matches what the per-leaf path would compute.
+        // Stream points into their leaf voxels at the global leaf depth.
+        // Classifying directly from the decoder avoids holding the chunk's
+        // full point list in memory alongside the leaves HashMap.
         let mut leaves: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
-        for raw in points {
+        let mut n_points: usize = 0;
+        self.stream_chunk_file(chunk_idx, |raw| {
+            n_points += 1;
             let wx = raw.x as f64 * self.scale_x + self.offset_x;
             let wy = raw.y as f64 * self.scale_y + self.offset_y;
             let wz = raw.z as f64 * self.scale_z + self.offset_z;
@@ -1555,6 +1640,17 @@ impl OctreeBuilder {
             }
 
             leaves.entry(key).or_default().push(raw);
+            Ok(())
+        })?;
+
+        if n_points == 0 {
+            // Empty chunk → no nodes produced. Should not happen for a plan
+            // generated by `merge_sparse_cells`, but handle defensively.
+            debug!(
+                "Chunk {} (L{} {},{},{}) is empty, skipping",
+                chunk_idx, chunk.level, chunk.gx, chunk.gy, chunk.gz
+            );
+            return Ok(Vec::new());
         }
 
         // Adaptive leaf subdivision. The uniform `leaf_depth` computed from
@@ -1627,18 +1723,16 @@ impl OctreeBuilder {
         // Run the bottom-up grid-sample loop, stopping at chunk.level.
         // bottom_up_levels writes every produced node to its canonical temp
         // file path, so the chunk's sub-octree is on disk after this returns.
-        // Suppress per-level progress events: the chunked-build outer stage
-        // tracks chunks-done, not levels.
+        // Suppress per-level progress events: the outer build stage tracks
+        // chunks-done, not levels.
         self.bottom_up_levels(leaves, effective_max_depth, chunk.level, false, config)
     }
 
     /// Merge chunk roots upward from `max_chunk_level` to the global root.
     ///
-    /// This is the chunked-build equivalent of the per-leaf path's coarse
-    /// `bottom_up_on_disk` levels. Starting from a set of "chunk root" keys
-    /// (one per chunk, at varying levels), we walk levels in reverse and at
-    /// each level group nodes by their parent and run `grid_sample` to
-    /// produce the parent.
+    /// Starting from a set of "chunk root" keys (one per chunk, at varying
+    /// levels), we walk levels in reverse and at each level group nodes
+    /// by their parent and run `grid_sample` to produce the parent.
     ///
     /// **Variable-level chunks are handled naturally**: when level `d`'s
     /// children are processed, the set may include both chunk roots that
@@ -1826,22 +1920,22 @@ impl OctreeBuilder {
         Ok(all_new_parents)
     }
 
-    /// Chunked build. Per-chunk in-memory build, then merge across chunks
-    /// at coarse levels up to the global root.
+    /// Build the node map: per-chunk in-memory build, then merge across
+    /// chunks at coarse levels up to the global root.
     pub fn build_node_map(&self, config: &crate::PipelineConfig) -> Result<Vec<(VoxelKey, usize)>> {
         let plan = self
             .chunked_plan
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("build_node_map_chunked called without a chunk plan"))?;
+            .ok_or_else(|| anyhow::anyhow!("build_node_map called without a chunk plan"))?;
 
         let n_chunks = plan.chunks.len();
         if n_chunks == 0 {
-            info!("Chunked build: no chunks (empty input?)");
+            info!("Build: no chunks (empty input?)");
             return Ok(Vec::new());
         }
 
         info!(
-            "Chunked build: {} chunks, max_chunk_level={}",
+            "Build: {} chunks, max_chunk_level={}",
             n_chunks,
             plan.chunks.iter().map(|c| c.level).max().unwrap_or(0)
         );
@@ -1850,9 +1944,11 @@ impl OctreeBuilder {
         //
         // Process chunks in batches sized by memory budget. Within each batch,
         // chunks run fully in parallel via rayon. Per-chunk peak working set
-        // estimate: ~200 B/pt (input vec + leaves HashMap + grid_sample
-        // input/output + scratch). Conservative; matches design §9.4.
-        const PER_CHUNK_BYTES_PER_POINT: u64 = 200;
+        // sums the leaf map (~48 B/pt), the `all_pts` sort buffer that lives
+        // alongside the leaves (~56 B/pt), grid_sample's outputs (~56 B/pt),
+        // plus HashMap growth and allocator fragmentation. 600 B/pt leaves
+        // genuine headroom over the raw 160 B/pt sum.
+        const PER_CHUNK_BYTES_PER_POINT: u64 = 600;
 
         // Sort chunks by descending point count so the greedy batching stays
         // balanced (largest chunks first, smaller ones fill the gaps).
@@ -1891,7 +1987,7 @@ impl OctreeBuilder {
 
             let batch = &chunks_indexed[batch_start..batch_end];
             debug!(
-                "Chunked build batch: {} chunks, est {} MB",
+                "Build batch: {} chunks, est {} MB",
                 batch.len(),
                 batch_mem / 1_048_576
             );
@@ -1962,7 +2058,7 @@ impl OctreeBuilder {
 
         let total_pts: usize = result.iter().map(|(_, c)| *c).sum();
         info!(
-            "Chunked build: {} nodes, {} total points (input: {})",
+            "Build: {} nodes, {} total points (input: {})",
             result.len(),
             total_pts,
             self.total_points
@@ -1979,7 +2075,6 @@ impl OctreeBuilder {
 
         // Ensure every ancestor of every data node is present (the writer
         // requires zero-point ancestors so validators can traverse top-down).
-        // Same logic as the per-leaf path.
         let mut present: HashSet<VoxelKey> = result.iter().map(|(k, _)| *k).collect();
         let mut extra: Vec<VoxelKey> = Vec::new();
         for (key, _) in &result {
@@ -2009,6 +2104,25 @@ impl Drop for OctreeBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_cube_pads_halfsize_by_one_scale_unit() {
+        // Halfsize must grow by at least one scale unit to absorb the
+        // per-depth ULP drift in the spec's node-bound reconstruction.
+        let mut b = Bounds::empty();
+        b.expand_with(184000.0, 426417.72, -13.11);
+        b.expand_with(184100.0, 426500.0, 44.23);
+        let scale = 0.01;
+        let (_, _, _cz, halfsize) = b.to_cube(scale, scale, scale);
+        assert!(
+            halfsize >= 50.0 + scale,
+            "halfsize {halfsize} must add scale pad"
+        );
+        assert!(
+            halfsize <= 50.05,
+            "halfsize {halfsize} must stay close to half x-range"
+        );
+    }
 
     fn sample_point() -> RawPoint {
         RawPoint {
@@ -2198,6 +2312,7 @@ mod tests {
             chunk_target: 1_000_000,
             total_points,
             chunks,
+            header_mismatch: None,
         }
     }
 

@@ -784,14 +784,14 @@ fn temporal_index_custom_stride() {
 // Low-memory / streaming path tests
 // ---------------------------------------------------------------------------
 
-/// Run with a tiny memory limit to exercise the chunked path under tight
-/// memory pressure. Verify the output is a valid COPC file with the correct
+/// Run with a tiny memory limit to exercise the build under tight memory
+/// pressure. Verify the output is a valid COPC file with the correct
 /// total point count.
 #[test]
 fn low_memory_produces_valid_output() {
     let output = Path::new("tests/data/test_low_mem.copc.laz");
-    // 1 MB budget forces the chunked path to produce many small chunks,
-    // exercising the merge step under tight memory pressure.
+    // 1 MB budget forces many small chunks, exercising the merge step
+    // under tight memory pressure.
     run_converter_with_args(
         Path::new("tests/data/input.laz"),
         output,
@@ -930,12 +930,12 @@ fn temporal_index_readable_by_streaming_crate() {
 }
 
 // ---------------------------------------------------------------------------
-// Chunked build tests
+// Build tests
 //
-// The chunked build produces COPC output that is NOT bit-identical to any
-// fixed reference because grid_sample tie-breaking depends on point ordering
-// at the leaf level. These tests verify that output is valid and
-// point-conserving rather than comparing bytes.
+// Build output is NOT bit-identical to any fixed reference because
+// grid_sample tie-breaking depends on point ordering at the leaf level.
+// These tests verify that output is valid and point-conserving rather
+// than comparing bytes.
 // ---------------------------------------------------------------------------
 
 #[test]

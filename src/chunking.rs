@@ -1,10 +1,8 @@
 //! Hierarchical counting-sort chunk planner (Schütz et al. 2020).
 //!
-//! This is a **measurement / planning** tool. It determines what chunks the
-//! chunked-build path **would** produce for a given dataset, without actually
-//! producing them. Used by the `analyze` CLI subcommand to validate the
-//! chunking algorithm against real input data before committing to the full
-//! chunked-build rewrite.
+//! Determines what chunks the build path will produce for a given dataset.
+//! Used by the main pipeline's distribute stage and exposed via the
+//! `analyze` CLI subcommand for inspection without writing output.
 //!
 //! # Algorithm
 //!
@@ -46,22 +44,39 @@ const SENTINEL: i64 = -1;
 /// Default chunk target derivation: budget × this fraction / (workers × per-point overhead).
 const SAFETY_FACTOR: f64 = 0.6;
 
-/// Estimated bytes per point held in memory while a chunk is being processed
-/// during chunked build (`Vec<RawPoint>` + `Vec<(usize, RawPoint)>` sort buffer
-/// + grid_sample output, plus a small constant for `HashSet` working state).
+/// Estimated bytes per point held in memory while a chunk is being built
+/// (`Vec<RawPoint>` + `Vec<(usize, RawPoint)>` sort buffer + grid_sample
+/// output, plus a small constant for `HashSet` working state).
 const PER_POINT_OVERHEAD_BYTES: u64 = 170;
 
 /// Lower clamp on chunk target size (points). Below this, fixed per-chunk
 /// overhead (file open, octree node bookkeeping) dominates point processing.
 const MIN_CHUNK_POINTS: u64 = 1_000_000;
 
-/// Upper clamp on chunk target size (points). Above this, single-chunk
-/// allocations exceed ~2 GB and reduce parallelism on small datasets.
-const MAX_CHUNK_POINTS: u64 = 50_000_000;
+/// Per-chunk peak working set during the in-memory build phase, matching
+/// `PER_CHUNK_BYTES_PER_POINT` in octree.rs. Used here to derive the upper
+/// clamp on chunk target size so a single chunk can never exceed the
+/// configured memory budget.
+const PER_CHUNK_PEAK_BYTES_PER_POINT: u64 = 600;
+
+/// Fraction of the memory budget a single chunk is allowed to occupy.
+/// Set below 0.5 so rayon can run at least two chunks in parallel while
+/// leaving slack for allocator overhead and concurrent stages.
+const SINGLE_CHUNK_BUDGET_FRACTION: f64 = 0.4;
 
 /// Aim for at least this many chunks per worker so small datasets still
 /// have parallelism headroom.
 const PARALLELISM_TARGET_PER_WORKER: u64 = 4;
+
+/// Dynamic upper clamp on chunk target size, derived from the memory
+/// budget so a single chunk's in-memory build can never exceed the
+/// configured budget. Clamped below by `MIN_CHUNK_POINTS` to avoid
+/// degenerate chunking on tiny budgets.
+pub(crate) fn max_chunk_points(memory_budget: u64) -> u64 {
+    let raw = ((memory_budget as f64 * SINGLE_CHUNK_BUDGET_FRACTION)
+        / PER_CHUNK_PEAK_BYTES_PER_POINT as f64) as u64;
+    raw.max(MIN_CHUNK_POINTS)
+}
 
 // ---------------------------------------------------------------------------
 // Chunk plan output
@@ -97,6 +112,36 @@ pub struct ChunkPlan {
     pub total_points: u64,
     /// Every chunk root produced by the merge step.
     pub chunks: Vec<PlannedChunk>,
+    /// Set when the LAS header bounds disagree with the actual point data
+    /// observed during the counting pass (beyond one scale unit per axis).
+    /// The CLI surfaces this as a user-visible warning.
+    pub header_mismatch: Option<HeaderBoundsMismatch>,
+}
+
+/// Per-axis differences between the LAS header bounds and the actual
+/// round-tripped point coordinates observed during counting.
+///
+/// Each tuple is `(header_value, actual_value)`. Only axes whose absolute
+/// difference exceeds one scale unit are populated; the rest are `None`.
+#[derive(Debug, Clone, Copy)]
+pub struct HeaderBoundsMismatch {
+    pub min_x: Option<(f64, f64)>,
+    pub max_x: Option<(f64, f64)>,
+    pub min_y: Option<(f64, f64)>,
+    pub max_y: Option<(f64, f64)>,
+    pub min_z: Option<(f64, f64)>,
+    pub max_z: Option<(f64, f64)>,
+}
+
+impl HeaderBoundsMismatch {
+    fn any(&self) -> bool {
+        self.min_x.is_some()
+            || self.max_x.is_some()
+            || self.min_y.is_some()
+            || self.max_y.is_some()
+            || self.min_z.is_some()
+            || self.max_z.is_some()
+    }
 }
 
 impl ChunkPlan {
@@ -136,23 +181,42 @@ pub fn compute_chunk_target(memory_budget: u64, num_workers: usize, total_points
         u64::MAX
     };
 
+    let max_chunk = max_chunk_points(memory_budget);
     raw.min(max_for_parallelism)
-        .clamp(MIN_CHUNK_POINTS, MAX_CHUNK_POINTS)
+        .clamp(MIN_CHUNK_POINTS, max_chunk)
 }
 
-/// Pick the counting grid resolution based on total point count.
+/// Pick the counting grid resolution based on total point count and the
+/// memory budget.
 ///
-/// Matches Schütz et al. 2020 (paragraph 4.1.2): coarser grids for small
-/// datasets save memory, finer grids for large datasets give better
-/// adaptivity in dense regions.
-pub fn select_grid_size(total_points: u64) -> u32 {
-    if total_points < 100_000_000 {
+/// Point-count tiers follow Schütz et al. 2020 (paragraph 4.1.2): coarser
+/// grids for small datasets save memory, finer grids give better adaptivity
+/// in dense regions. The grid and LUT each occupy `grid_size³ × 4` bytes,
+/// so we also clamp against a fraction of the memory budget to avoid
+/// starving the per-chunk build.
+pub fn select_grid_size(total_points: u64, memory_budget: u64) -> u32 {
+    let preferred = if total_points < 100_000_000 {
         128
     } else if total_points < 500_000_000 {
         256
     } else {
         512
+    };
+
+    // Cap the grid + LUT combined at ~10% of the budget (5% each).
+    const GRID_BUDGET_FRACTION_BP: u64 = 500; // 5% in basis points
+    let budget_bytes = memory_budget.saturating_mul(GRID_BUDGET_FRACTION_BP) / 10_000;
+    let max_cells = budget_bytes / 4;
+    // Walk the tier ladder downward from `preferred` until one fits.
+    let mut allowed = 128u32;
+    for candidate in [512u32, 256, 128] {
+        let cells = (candidate as u64).pow(3);
+        if cells <= max_cells && candidate <= preferred {
+            allowed = candidate;
+            break;
+        }
     }
+    allowed
 }
 
 /// Top-level entry point for the analyze tool: builds an `OctreeBuilder`
@@ -171,9 +235,9 @@ pub fn analyze_chunking(
 ) -> Result<ChunkPlan> {
     let builder = OctreeBuilder::from_scan(scan_results, validated, config)
         .context("constructing OctreeBuilder for chunk analysis")?;
-    // The standalone analyzer treats counting as its own user-visible stage.
-    // (When called from inside the chunked distribute path, the caller owns
-    // the stage events instead.)
+    // The standalone analyzer treats counting as its own user-visible
+    // stage. (When called from inside `distribute`, the caller owns the
+    // stage events instead.)
     config.report(crate::ProgressEvent::StageStart {
         name: "Counting",
         total: builder.total_points,
@@ -185,8 +249,8 @@ pub fn analyze_chunking(
 
 /// Run the counting pass and merge step against an existing `OctreeBuilder`.
 ///
-/// Used by both the analyze CLI tool and the chunked-build distribute path,
-/// so they share the exact same chunking logic and produce the same plan
+/// Used by both the analyze CLI tool and the main distribute stage, so
+/// they share the exact same chunking logic and produce the same plan
 /// for the same inputs.
 ///
 /// **Does not emit `StageStart`/`StageDone` events** — the caller owns the
@@ -199,7 +263,7 @@ pub(crate) fn compute_chunk_plan(
     chunk_target_override: Option<u64>,
 ) -> Result<ChunkPlan> {
     let total_points = builder.total_points;
-    let grid_size = select_grid_size(total_points);
+    let grid_size = select_grid_size(total_points, config.memory_budget);
     let grid_depth = grid_size.trailing_zeros();
     let num_workers = distribute_worker_count(input_files.len());
     let chunk_target = chunk_target_override
@@ -211,7 +275,7 @@ pub(crate) fn compute_chunk_plan(
     );
 
     // ----- Count pass -----
-    let grid = count_points(builder, input_files, grid_size, grid_depth, config)?;
+    let (grid, actual) = count_points(builder, input_files, grid_size, grid_depth, config)?;
 
     let cells_touched = grid
         .iter()
@@ -224,6 +288,8 @@ pub(crate) fn compute_chunk_plan(
         cells_touched as f64 / grid.len() as f64 * 100.0
     );
 
+    let header_mismatch = detect_header_mismatch(builder, &actual);
+
     // ----- Merge sparse cells -----
     let chunks = merge_sparse_cells(&grid, grid_size, grid_depth, chunk_target);
 
@@ -233,6 +299,7 @@ pub(crate) fn compute_chunk_plan(
         chunk_target,
         total_points,
         chunks,
+        header_mismatch,
     })
 }
 
@@ -240,19 +307,80 @@ pub(crate) fn compute_chunk_plan(
 // Counting pass
 // ---------------------------------------------------------------------------
 
+/// Compare the LAS header bounds to the actual point data observed during
+/// counting, returning a [`HeaderBoundsMismatch`] if any axis exceeds one
+/// scale unit of tolerance. The CLI surfaces any mismatch as a warning so
+/// users know their input headers are inaccurate.
+fn detect_header_mismatch(
+    builder: &OctreeBuilder,
+    actual: &ActualBounds,
+) -> Option<HeaderBoundsMismatch> {
+    // Tolerance: one scale unit per axis. Stored point coordinates are
+    // `int32 × scale + offset`, so this is the finest difference that can
+    // be real rather than an artefact of float round-tripping.
+    let flag = |hdr: f64, act: f64, tol: f64| -> Option<(f64, f64)> {
+        ((hdr - act).abs() > tol).then_some((hdr, act))
+    };
+    let hdr = &builder.bounds;
+    let result = HeaderBoundsMismatch {
+        min_x: flag(hdr.min_x, actual.min_x, builder.scale_x),
+        max_x: flag(hdr.max_x, actual.max_x, builder.scale_x),
+        min_y: flag(hdr.min_y, actual.min_y, builder.scale_y),
+        max_y: flag(hdr.max_y, actual.max_y, builder.scale_y),
+        min_z: flag(hdr.min_z, actual.min_z, builder.scale_z),
+        max_z: flag(hdr.max_z, actual.max_z, builder.scale_z),
+    };
+    result.any().then_some(result)
+}
+
+/// Per-axis actual bounds observed during the counting pass. Used to warn
+/// users when the LAS header bounds disagree with the real point data.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActualBounds {
+    pub min_x: f64,
+    pub min_y: f64,
+    pub min_z: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+    pub max_z: f64,
+}
+
+impl ActualBounds {
+    fn empty() -> Self {
+        Self {
+            min_x: f64::INFINITY,
+            min_y: f64::INFINITY,
+            min_z: f64::INFINITY,
+            max_x: f64::NEG_INFINITY,
+            max_y: f64::NEG_INFINITY,
+            max_z: f64::NEG_INFINITY,
+        }
+    }
+
+    fn merge(&mut self, other: &ActualBounds) {
+        self.min_x = self.min_x.min(other.min_x);
+        self.min_y = self.min_y.min(other.min_y);
+        self.min_z = self.min_z.min(other.min_z);
+        self.max_x = self.max_x.max(other.max_x);
+        self.max_y = self.max_y.max(other.max_y);
+        self.max_z = self.max_z.max(other.max_z);
+    }
+}
+
 /// Stream every input file in parallel, classifying each point into the
-/// counting grid via `point_to_key` at the grid depth, and atomically
-/// incrementing the corresponding cell counter.
+/// counting grid via `point_to_key` at the grid depth, atomically
+/// incrementing the corresponding cell counter, and tracking the actual
+/// per-axis bounds of the round-tripped coordinates.
 ///
-/// Returns a flat `Box<[AtomicU32]>` of length `grid_size³`. The cell index
-/// is `gx + gy*G + gz*G²`.
+/// Returns the flat `Box<[AtomicU32]>` of length `grid_size³` (cell index
+/// `gx + gy*G + gz*G²`) plus the observed [`ActualBounds`].
 fn count_points(
     builder: &OctreeBuilder,
     input_files: &[PathBuf],
     grid_size: u32,
     grid_depth: u32,
     config: &PipelineConfig,
-) -> Result<Box<[AtomicU32]>> {
+) -> Result<(Box<[AtomicU32]>, ActualBounds)> {
     let g = grid_size as usize;
     let n_cells = g * g * g;
     debug!(
@@ -278,30 +406,39 @@ fn count_points(
     let files_per_worker = input_files.len().div_ceil(num_workers);
     let progress = AtomicU64::new(0);
 
+    // Transient `las::Point` buffer cost (~120 B/pt). Match distribute:
+    // take 1/8 of the per-worker budget to leave headroom for the LAS
+    // decoder's own buffers.
+    const BYTES_PER_LAS_POINT: u64 = 120;
+    let per_worker_budget = config.memory_budget / num_workers as u64;
+    let read_chunk_size =
+        ((per_worker_budget / 8) / BYTES_PER_LAS_POINT).clamp(50_000, 2_000_000) as usize;
+
     debug!(
-        "Counting with {} workers, {} files per worker",
-        num_workers, files_per_worker
+        "Counting with {} workers, {} files per worker, read_chunk_size={}",
+        num_workers, files_per_worker, read_chunk_size
     );
 
-    (0..num_workers)
+    let per_worker_bounds: Vec<ActualBounds> = (0..num_workers)
         .into_par_iter()
-        .try_for_each(|worker_id| -> Result<()> {
+        .map(|worker_id| -> Result<ActualBounds> {
+            let mut local_bounds = ActualBounds::empty();
             let start = worker_id * files_per_worker;
             let end = (start + files_per_worker).min(input_files.len());
             if start >= end {
-                return Ok(());
+                return Ok(local_bounds);
             }
 
             // Reuse a single point buffer across files in this worker to
             // amortize allocation cost.
-            let mut points: Vec<las::Point> = Vec::with_capacity(1_000_000);
+            let mut points: Vec<las::Point> = Vec::with_capacity(read_chunk_size);
 
             for path in &input_files[start..end] {
                 let mut reader = las::Reader::from_path(path)
                     .with_context(|| format!("Cannot open {:?}", path))?;
                 loop {
                     points.clear();
-                    let n = reader.read_points_into(1_000_000, &mut points)?;
+                    let n = reader.read_points_into(read_chunk_size as u64, &mut points)?;
                     if n == 0 {
                         break;
                     }
@@ -320,6 +457,28 @@ fn count_points(
                         let wx = ix as f64 * builder.scale_x + builder.offset_x;
                         let wy = iy as f64 * builder.scale_y + builder.offset_y;
                         let wz = iz as f64 * builder.scale_z + builder.offset_z;
+                        // Track actual bounds of round-tripped coordinates so
+                        // we can warn when the header bounds disagree with
+                        // the real data (e.g. after a tool rewrote headers
+                        // with coarser precision than the point data).
+                        if wx < local_bounds.min_x {
+                            local_bounds.min_x = wx;
+                        }
+                        if wy < local_bounds.min_y {
+                            local_bounds.min_y = wy;
+                        }
+                        if wz < local_bounds.min_z {
+                            local_bounds.min_z = wz;
+                        }
+                        if wx > local_bounds.max_x {
+                            local_bounds.max_x = wx;
+                        }
+                        if wy > local_bounds.max_y {
+                            local_bounds.max_y = wy;
+                        }
+                        if wz > local_bounds.max_z {
+                            local_bounds.max_z = wz;
+                        }
                         let key = point_to_key(
                             wx,
                             wy,
@@ -347,10 +506,16 @@ fn count_points(
                     config.report(crate::ProgressEvent::StageProgress { done });
                 }
             }
-            Ok(())
-        })?;
+            Ok(local_bounds)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    Ok(grid)
+    let mut actual = ActualBounds::empty();
+    for b in &per_worker_bounds {
+        actual.merge(b);
+    }
+
+    Ok((grid, actual))
 }
 
 // ---------------------------------------------------------------------------
@@ -473,8 +638,8 @@ fn merge_sparse_cells(
 // Worker count helper
 // ---------------------------------------------------------------------------
 
-/// Same heuristic as the per-leaf distribute path: ~2/3 of cores, leaving
-/// headroom for the LAZ parallel decoder. Capped by input file count.
+/// ~2/3 of cores, leaving headroom for the LAZ parallel decoder. Capped
+/// by input file count.
 fn distribute_worker_count(input_file_count: usize) -> usize {
     let cores = rayon::current_num_threads();
     let target = ((cores * 2) / 3).max(2);
@@ -491,30 +656,51 @@ mod tests {
 
     #[test]
     fn select_grid_thresholds() {
-        assert_eq!(select_grid_size(1_000_000), 128);
-        assert_eq!(select_grid_size(99_999_999), 128);
-        assert_eq!(select_grid_size(100_000_000), 256);
-        assert_eq!(select_grid_size(499_999_999), 256);
-        assert_eq!(select_grid_size(500_000_000), 512);
-        assert_eq!(select_grid_size(100_000_000_000), 512);
+        // With a generous budget (16 GB) the point-count tiers dominate.
+        let big_budget = 16 * 1024 * 1024 * 1024;
+        assert_eq!(select_grid_size(1_000_000, big_budget), 128);
+        assert_eq!(select_grid_size(99_999_999, big_budget), 128);
+        assert_eq!(select_grid_size(100_000_000, big_budget), 256);
+        assert_eq!(select_grid_size(499_999_999, big_budget), 256);
+        assert_eq!(select_grid_size(500_000_000, big_budget), 512);
+        assert_eq!(select_grid_size(100_000_000_000, big_budget), 512);
+    }
+
+    #[test]
+    fn select_grid_size_falls_back_on_tiny_budget() {
+        // Tiny budget can't afford 256³ or 512³ grids → fall back to 128.
+        let tiny = 512 * 1024 * 1024;
+        assert_eq!(select_grid_size(10_000_000_000, tiny), 128);
+    }
+
+    #[test]
+    fn select_grid_size_256_fits_mid_budget() {
+        // Mid budget fits 256³ but not 512³ → downgrade preferred 512 to 256.
+        let mid = 4 * 1024 * 1024 * 1024;
+        assert_eq!(select_grid_size(10_000_000_000, mid), 256);
     }
 
     #[test]
     fn chunk_target_scales_with_budget() {
-        // 64 GB budget, 5 workers, large dataset
+        // 64 GB budget, 5 workers: raw target hits the dynamic single-chunk cap.
         let target = compute_chunk_target(64 * 1024 * 1024 * 1024, 5, 42_800_000_000);
-        // Raw: (64 GiB * 0.6) / (5 * 170) ≈ 48.5M; below MAX clamp.
-        assert!((47_000_000..=50_000_000).contains(&target), "got {target}");
+        assert!((45_000_000..=47_000_000).contains(&target), "got {target}");
 
-        // 32 GB budget, 10 workers, large dataset
+        // 32 GB budget, 10 workers: raw target sits below the cap.
         let target = compute_chunk_target(32 * 1024 * 1024 * 1024, 10, 42_800_000_000);
-        // Raw: (32 GiB * 0.6) / (10 * 170) ≈ 12.1M, within bounds
         assert!((11_000_000..=13_000_000).contains(&target), "got {target}");
 
-        // 16 GB budget, 4 workers, large dataset
+        // 16 GB budget, 4 workers: cap is binding.
         let target = compute_chunk_target(16 * 1024 * 1024 * 1024, 4, 42_800_000_000);
-        // Raw: (16 GiB * 0.6) / (4 * 170) ≈ 15.1M, within bounds
-        assert!((14_000_000..=17_000_000).contains(&target), "got {target}");
+        assert!((10_500_000..=11_800_000).contains(&target), "got {target}");
+    }
+
+    #[test]
+    fn chunk_target_dynamic_max_scales_with_budget() {
+        // Tiny budget must shrink the cap so no single chunk can blow it.
+        let target = compute_chunk_target(4 * 1024 * 1024 * 1024, 1, 10_000_000_000);
+        assert!(target <= 3_000_000, "got {target}, must be ≤ 3M");
+        assert!(target >= MIN_CHUNK_POINTS);
     }
 
     #[test]

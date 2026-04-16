@@ -30,15 +30,14 @@ pub(crate) mod octree;
 pub(crate) mod validate;
 pub(crate) mod writer;
 
-/// Hierarchical counting-sort chunk planner (Schütz et al. 2020).
-///
-/// This is a measurement / planning tool used by the `analyze` CLI
-/// subcommand to evaluate the chunked-build approach against real datasets.
-/// Not yet wired into the main conversion pipeline.
+/// Hierarchical counting-sort chunk planner (Schütz et al. 2020). Used
+/// by the distribute stage and by the `analyze` CLI subcommand.
 pub(crate) mod chunking;
 
 /// Re-exported chunk plan types so the binary can build a report from them.
-pub use chunking::{ChunkPlan, PlannedChunk, compute_chunk_target, select_grid_size};
+pub use chunking::{
+    ChunkPlan, HeaderBoundsMismatch, PlannedChunk, compute_chunk_target, select_grid_size,
+};
 
 #[cfg(feature = "tools")]
 pub mod tools;
@@ -156,7 +155,7 @@ pub trait ProgressObserver: Send + Sync {
 // PipelineConfig
 // ---------------------------------------------------------------------------
 
-/// Compression codec for chunked-build scratch files.
+/// Compression codec for distribute-stage scratch files.
 ///
 /// Temp files hold `RawPoint` records and are highly compressible. Enabling
 /// compression trades CPU for scratch-disk footprint — most useful on
@@ -183,10 +182,10 @@ pub struct PipelineConfig {
     pub temporal_stride: u32,
     /// Optional progress observer for reporting pipeline progress.
     pub progress: Option<std::sync::Arc<dyn ProgressObserver>>,
-    /// Optional override for the chunked-build chunk target size (in points).
-    /// `None` uses the dynamic target derived from memory budget. Primarily
-    /// for testing — e.g. forcing multiple chunks on a small input to
-    /// exercise the merge step.
+    /// Optional override for the chunk target size (in points). `None`
+    /// uses the dynamic target derived from memory budget. Primarily for
+    /// testing — e.g. forcing multiple chunks on a small input to exercise
+    /// the merge step.
     pub chunk_target_override: Option<u64>,
     /// Compression codec for scratch temp files.
     pub temp_compression: TempCompression,
@@ -214,6 +213,10 @@ struct PipelineInner {
     input_files: Vec<PathBuf>,
     config: PipelineConfig,
     scan_results: Vec<octree::ScanResult>,
+    /// Single canonical WKT payload from the first scanned file (if any).
+    /// Stored once here instead of once per `ScanResult` so memory stays
+    /// O(1) in the number of input files.
+    canonical_wkt: Option<Vec<u8>>,
     validated: Option<validate::ValidatedInputs>,
     builder: Option<OctreeBuilder>,
     node_keys: Option<Vec<(VoxelKey, usize)>>,
@@ -226,13 +229,14 @@ impl Pipeline<Scanned> {
             name: "Scanning",
             total: input_files.len() as u64,
         });
-        let scan_results = OctreeBuilder::scan(input_files, &config)?;
+        let scan_output = OctreeBuilder::scan(input_files, &config)?;
         config.report(ProgressEvent::StageDone);
         Ok(Pipeline {
             inner: PipelineInner {
                 input_files: input_files.to_vec(),
                 config,
-                scan_results,
+                scan_results: scan_output.results,
+                canonical_wkt: scan_output.canonical_wkt,
                 validated: None,
                 builder: None,
                 node_keys: None,
@@ -247,6 +251,7 @@ impl Pipeline<Scanned> {
         let validated = validate::validate(
             &self.inner.input_files,
             &self.inner.scan_results,
+            self.inner.canonical_wkt.take(),
             self.inner.config.temporal_index,
         )?;
         self.inner.validated = Some(validated);
@@ -259,13 +264,9 @@ impl Pipeline<Scanned> {
 
 impl Pipeline<Validated> {
     /// Run the hierarchical counting-sort chunk planner without proceeding
-    /// through `distribute`/`build`/`write`.
-    ///
-    /// This is a measurement tool: it returns the chunk plan that the
-    /// chunked-build path **would** produce for the given inputs, without
-    /// actually generating any chunks. Useful for evaluating the chunking
-    /// algorithm against real datasets before committing to the full
-    /// chunked-build rewrite.
+    /// through `distribute`/`build`/`write`. Returns the chunk plan that
+    /// `distribute` would produce for the given inputs, without actually
+    /// generating any chunks.
     ///
     /// Pass `chunk_target_override = None` to use the dynamically-derived
     /// target (recommended), or `Some(n)` to do what-if analysis with a
@@ -302,6 +303,18 @@ impl Pipeline<Validated> {
 }
 
 impl Pipeline<Distributed> {
+    /// Header-vs-data bounds mismatch detected during the counting pass.
+    /// `None` when headers agree with the point data to within one scale
+    /// unit per axis. CLIs should surface any `Some(..)` result so users
+    /// know their input headers are inaccurate.
+    pub fn header_bounds_mismatch(&self) -> Option<&HeaderBoundsMismatch> {
+        self.inner
+            .builder
+            .as_ref()
+            .and_then(|b| b.chunked_plan.as_ref())
+            .and_then(|p| p.header_mismatch.as_ref())
+    }
+
     /// Build the octree node map with LOD thinning.
     pub fn build(mut self) -> Result<Pipeline<Built>> {
         let builder = self.inner.builder.as_ref().unwrap();

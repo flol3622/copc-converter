@@ -45,13 +45,13 @@ struct Args {
     #[arg(long)]
     threads: Option<usize>,
 
-    /// Hidden: override the chunked-build chunk target size in points.
-    /// Bypasses the dynamic memory-budget-based calculation. Primarily for
-    /// testing — force multiple chunks on a small input to exercise merge.
+    /// Hidden: override the chunk target size in points. Bypasses the
+    /// dynamic memory-budget-based calculation. Primarily for testing —
+    /// force multiple chunks on a small input to exercise merge.
     #[arg(long, hide = true)]
     chunk_target: Option<u64>,
 
-    /// Compress chunked-build scratch files to reduce temp-dir footprint.
+    /// Compress distribute-stage scratch files to reduce temp-dir footprint.
     /// "none" (default) is fastest on local NVMe; "lz4" cuts disk usage
     /// ~3-4× at a small CPU cost, useful on space-constrained workers and
     /// network filesystems.
@@ -516,11 +516,29 @@ fn main() -> Result<()> {
         temp_compression: args.temp_compression.into(),
     };
 
-    Pipeline::scan(&input_files, config)?
+    let distributed = Pipeline::scan(&input_files, config)?
         .validate()?
-        .distribute()?
-        .build()?
-        .write(&output)?;
+        .distribute()?;
+
+    if let Some(m) = distributed.header_bounds_mismatch() {
+        eprintln!(
+            "Warning: LAS header bounds disagree with actual point data \
+             (output is still correct, but input headers are inaccurate):"
+        );
+        let print_axis = |name: &str, diff: Option<(f64, f64)>| {
+            if let Some((h, a)) = diff {
+                eprintln!("  {name}: header={h} actual={a} (diff {:+})", a - h);
+            }
+        };
+        print_axis("min_x", m.min_x);
+        print_axis("max_x", m.max_x);
+        print_axis("min_y", m.min_y);
+        print_axis("max_y", m.max_y);
+        print_axis("min_z", m.min_z);
+        print_axis("max_z", m.max_z);
+    }
+
+    distributed.build()?.write(&output)?;
 
     Ok(())
 }

@@ -7,7 +7,9 @@ use tracing::debug;
 /// Validated output: consistent properties across all input files.
 #[derive(Debug)]
 pub struct ValidatedInputs {
-    /// WKT CRS string from input files (if present).
+    /// WKT CRS string from input files (if present). Single canonical copy
+    /// from the first scanned file — per-file WKT bytes are discarded
+    /// after hashing during scan to keep memory O(1) in file count.
     pub wkt_crs: Option<Vec<u8>>,
     /// COPC output point format (6, 7, or 8).
     pub point_format: u8,
@@ -24,13 +26,14 @@ fn format_has_gps_time(fmt: u8) -> bool {
 pub fn validate(
     input_files: &[PathBuf],
     results: &[ScanResult],
+    canonical_wkt: Option<Vec<u8>>,
     temporal_index: bool,
 ) -> crate::Result<ValidatedInputs> {
-    let wkt_crs = results[0].wkt_crs.clone();
+    let wkt_hash = results[0].wkt_crs_hash;
     let first_format = results[0].point_format_id;
 
     for (i, r) in results.iter().enumerate().skip(1) {
-        if r.wkt_crs != wkt_crs {
+        if r.wkt_crs_hash != wkt_hash {
             return Err(Error::CrsMismatch {
                 file_a: input_files[0].clone(),
                 file_b: input_files[i].clone(),
@@ -56,7 +59,7 @@ pub fn validate(
     debug!("Input point format: {first_format}, output COPC point format: {point_format}");
 
     Ok(ValidatedInputs {
-        wkt_crs,
+        wkt_crs: canonical_wkt,
         point_format,
     })
 }
@@ -66,7 +69,7 @@ mod tests {
     use super::*;
     use crate::octree::{Bounds, ScanResult};
 
-    fn make_result(wkt: Option<Vec<u8>>, fmt: u8) -> ScanResult {
+    fn make_result(wkt_hash: Option<u64>, fmt: u8) -> ScanResult {
         ScanResult {
             bounds: Bounds::empty(),
             point_count: 100,
@@ -76,7 +79,7 @@ mod tests {
             offset_x: 0.0,
             offset_y: 0.0,
             offset_z: 0.0,
-            wkt_crs: wkt,
+            wkt_crs_hash: wkt_hash,
             point_format_id: fmt,
         }
     }
@@ -85,7 +88,7 @@ mod tests {
     fn validate_single_file() {
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(None, 3)];
-        let v = validate(&files, &results, false).unwrap();
+        let v = validate(&files, &results, None, false).unwrap();
         assert_eq!(v.point_format, 7);
         assert!(v.wkt_crs.is_none());
     }
@@ -93,20 +96,17 @@ mod tests {
     #[test]
     fn validate_matching_files() {
         let files = vec![PathBuf::from("a.laz"), PathBuf::from("b.laz")];
-        let wkt = Some(b"WKT".to_vec());
-        let results = vec![make_result(wkt.clone(), 8), make_result(wkt, 8)];
-        let v = validate(&files, &results, false).unwrap();
+        let results = vec![make_result(Some(42), 8), make_result(Some(42), 8)];
+        let v = validate(&files, &results, Some(b"WKT".to_vec()), false).unwrap();
         assert_eq!(v.point_format, 8);
+        assert_eq!(v.wkt_crs.as_deref(), Some(&b"WKT"[..]));
     }
 
     #[test]
     fn validate_crs_mismatch() {
         let files = vec![PathBuf::from("a.laz"), PathBuf::from("b.laz")];
-        let results = vec![
-            make_result(Some(b"WKT_A".to_vec()), 7),
-            make_result(Some(b"WKT_B".to_vec()), 7),
-        ];
-        let err = validate(&files, &results, false).unwrap_err();
+        let results = vec![make_result(Some(1), 7), make_result(Some(2), 7)];
+        let err = validate(&files, &results, Some(b"WKT_A".to_vec()), false).unwrap_err();
         assert!(matches!(err, Error::CrsMismatch { .. }));
     }
 
@@ -114,7 +114,7 @@ mod tests {
     fn validate_format_mismatch() {
         let files = vec![PathBuf::from("a.laz"), PathBuf::from("b.laz")];
         let results = vec![make_result(None, 3), make_result(None, 7)];
-        let err = validate(&files, &results, false).unwrap_err();
+        let err = validate(&files, &results, None, false).unwrap_err();
         assert!(matches!(err, Error::PointFormatMismatch { .. }));
     }
 
@@ -122,7 +122,7 @@ mod tests {
     fn validate_temporal_index_requires_gps_time() {
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(None, 0)];
-        let err = validate(&files, &results, true).unwrap_err();
+        let err = validate(&files, &results, None, true).unwrap_err();
         assert!(matches!(err, Error::NoGpsTime { .. }));
     }
 
@@ -130,7 +130,7 @@ mod tests {
     fn validate_temporal_index_with_gps_time() {
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(None, 1)];
-        let v = validate(&files, &results, true).unwrap();
+        let v = validate(&files, &results, None, true).unwrap();
         assert_eq!(v.point_format, 6);
     }
 }
