@@ -57,6 +57,12 @@ struct Args {
     /// network filesystems.
     #[arg(long, value_enum, default_value_t = TempCompressionArg::None)]
     temp_compression: TempCompressionArg,
+
+    /// Number of voxel nodes to batch into a single temp file. Higher values
+    /// reduce inode usage on filesystems with limited inodes (useful for HPC
+    /// systems). Lower values may improve random access performance. Default: 5000.
+    #[arg(long, default_value_t = 5000)]
+    temp_file_batch_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -514,6 +520,7 @@ fn main() -> Result<()> {
         progress: Some(progress),
         chunk_target_override: args.chunk_target,
         temp_compression: args.temp_compression.into(),
+        temp_file_batch_size: args.temp_file_batch_size,
     };
 
     let distributed = Pipeline::scan(&input_files, config)?
