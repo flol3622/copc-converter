@@ -24,7 +24,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 // ---------------------------------------------------------------------------
 // Distribute constants and helper types
@@ -1466,7 +1466,16 @@ impl OctreeBuilder {
         // Pass 1: iterate children one at a time, accept points into the parent
         // grid, write remaining back to the child's temp file.
         for (ci, ck) in children.iter().enumerate() {
-            let pts = self.read_node(ck)?;
+            let pts = match self.read_node(ck) {
+                Ok(pts) => pts,
+                Err(e) => {
+                    error!(
+                        "Skipping corrupted child node (level={}, x={}, y={}, z={}) during streaming LOD: {}",
+                        ck.level, ck.x, ck.y, ck.z, e
+                    );
+                    continue;
+                }
+            };
             if pts.is_empty() {
                 continue;
             }
@@ -2153,8 +2162,18 @@ impl OctreeBuilder {
                     .map(|(parent, children, _)| -> Result<()> {
                         let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
                         for (ci, ck) in children.iter().enumerate() {
-                            for p in self.read_node(ck)? {
-                                all_pts.push((ci, p));
+                            match self.read_node(ck) {
+                                Ok(pts) => {
+                                    for p in pts {
+                                        all_pts.push((ci, p));
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Skipping corrupted child node (level={}, x={}, y={}, z={}) during merge batch: {}",
+                                        ck.level, ck.x, ck.y, ck.z, e
+                                    );
+                                }
                             }
                         }
                         if all_pts.is_empty() {
