@@ -19,17 +19,13 @@ name = "copc_converter"
 path = "src/main.rs"
 
 [[bin]]
-name = "copc_analyze"
-path = "src/bin/copc_analyze.rs"
+name = "preview_chunking"
+path = "src/bin/preview_chunking.rs"
+required-features = ["tools"]
 
 [[bin]]
 name = "inspect_copc"
 path = "src/bin/inspect_copc.rs"
-required-features = ["tools"]
-
-[[bin]]
-name = "inspect_temporal"
-path = "src/bin/inspect_temporal.rs"
 required-features = ["tools"]
 
 [features]

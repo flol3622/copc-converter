@@ -1,12 +1,12 @@
-//! Chunk planner analyzer.
+//! Preview how an input LAS/LAZ dataset would be chunked during conversion.
 //!
-//! Runs the hierarchical counting-sort chunk analysis from
-//! `copc_converter::chunking` against real input files and prints a
-//! statistics report. Does not write any output — it's a measurement tool
-//! for inspecting how a dataset would be partitioned during the build.
+//! Runs the hierarchical counting-sort chunk planner from
+//! `copc_converter::chunking` and prints a statistics report. Does not
+//! write any output — it's a read-only preview of the partitioning the
+//! converter would produce for the same inputs.
 //!
 //! Usage:
-//!   copc_analyze <input_file_or_dir> [--memory-limit 16G] [--chunk-target 5M]
+//!   preview_chunking <input_file_or_dir> [--memory-limit 16G] [--chunk-target 5M]
 
 use anyhow::{Context, Result};
 use clap::Parser;

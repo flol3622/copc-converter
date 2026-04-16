@@ -129,17 +129,17 @@ inspect_copc pointcloud.copc.laz
 inspect_copc pointcloud.copc.laz --compare other.copc.laz
 ```
 
-Prints node counts, point distribution, compressed sizes, and compression ratios per octree level.
+Prints node counts, point distribution, compressed sizes, and compression ratios per octree level. When the file has a temporal index EVLR, also prints GPS time range, per-level temporal coverage, a time histogram, and sample density stats.
 
-### inspect_temporal
+### preview_chunking
 
-Inspect the temporal index EVLR of a COPC file:
+Preview how an input LAS/LAZ dataset would be partitioned during conversion, without actually writing anything:
 
 ```sh
-inspect_temporal <url>
+preview_chunking input.laz [--memory-limit 16G] [--chunk-target 5M]
 ```
 
-Prints GPS time range, per-level temporal coverage, a time histogram showing node overlap across time windows, and sample density stats.
+Prints chunk count, target size, grid resolution, and per-chunk size distribution. Useful for tuning `--memory-limit` before running a long conversion.
 
 ## How it works
 
