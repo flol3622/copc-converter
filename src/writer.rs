@@ -27,6 +27,7 @@ use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
 use laz::{LazVlrBuilder, ParLasZipCompressor};
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 use tracing::{debug, error, info};
@@ -368,6 +369,8 @@ pub fn write_copc(
     // Track successfully encoded vs failed nodes
     let mut nodes_encoded: usize = 0;
     let mut nodes_failed: usize = 0;
+    // Track which keys were successfully encoded (for chunk table mapping)
+    let mut encoded_keys: HashSet<VoxelKey> = HashSet::new();
 
     let mut batch_start = 0;
     while batch_start < data_keys.len() {
@@ -478,6 +481,8 @@ pub fn write_copc(
             }
             actual_encoded_bytes += bytes.len() as u64;
             encoded.push(bytes);
+            // Track that this key was successfully encoded
+            encoded_keys.insert(_key);
         }
 
         // Track success vs failure counts
@@ -564,11 +569,11 @@ pub fn write_copc(
     // Verify chunk table
     // -----------------------------------------------------------------------
     let evlr_start = end_pos;
-    if chunk_table.len() != data_keys.len() {
+    if chunk_table.len() != encoded_keys.len() {
         error!(
-            "Chunk table has {} entries but we compressed {} chunks!",
+            "Chunk table has {} entries but we encoded {} chunks!",
             chunk_table.len(),
-            data_keys.len()
+            encoded_keys.len()
         );
     }
 
@@ -585,7 +590,12 @@ pub fn write_copc(
         if pc == 0 {
             // Empty ancestor: present in hierarchy for tree traversal but has no chunk.
             chunk_info.push((*key, 0, 0, 0));
+        } else if !encoded_keys.contains(key) {
+            // Node had points but failed to encode (corrupted temp file).
+            // Mark as empty in the hierarchy.
+            chunk_info.push((*key, 0, 0, 0));
         } else {
+            // Successfully encoded node: use chunk table entry.
             let byte_size = chunk_table[chunk_index].byte_count;
             chunk_info.push((*key, current_offset, byte_size as i32, pc as i32));
             current_offset += byte_size;
