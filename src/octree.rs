@@ -1126,7 +1126,7 @@ impl OctreeBuilder {
 
             // Apply updates to `nodes` (sequential, needs &mut).
             for (parent, children, parent_pts, remaining) in results {
-                for (ck, rem) in children.into_iter().zip(remaining.into_iter()) {
+                for (ck, rem) in children.into_iter().zip(remaining) {
                     if !rem.is_empty() {
                         nodes.insert(ck, rem);
                     }
@@ -1753,7 +1753,7 @@ impl OctreeBuilder {
 
             // Sort small parents by descending estimated memory so the
             // batching greedy stays balanced.
-            small_parents.sort_by(|a, b| b.2.cmp(&a.2));
+            small_parents.sort_by_key(|p| std::cmp::Reverse(p.2));
 
             let mut batch_start = 0;
             while batch_start < small_parents.len() {
@@ -1855,7 +1855,7 @@ impl OctreeBuilder {
             .enumerate()
             .map(|(i, c)| (i as u32, c))
             .collect();
-        chunks_indexed.sort_by(|a, b| b.1.point_count.cmp(&a.1.point_count));
+        chunks_indexed.sort_by_key(|c| std::cmp::Reverse(c.1.point_count));
 
         config.report(crate::ProgressEvent::StageStart {
             name: "Building",
@@ -1901,7 +1901,7 @@ impl OctreeBuilder {
                 .collect::<Result<_>>()?;
 
             // Collect node keys produced by this batch.
-            for ((_chunk_idx, chunk), nodes) in batch.iter().zip(batch_results.into_iter()) {
+            for ((_chunk_idx, chunk), nodes) in batch.iter().zip(batch_results) {
                 let chunk_level_i32 = chunk.level as i32;
                 for (k, _) in &nodes {
                     all_chunk_node_keys.push(*k);

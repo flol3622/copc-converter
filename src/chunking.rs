@@ -175,11 +175,10 @@ pub fn compute_chunk_target(memory_budget: u64, num_workers: usize, total_points
     // Parallelism floor: ensure we have at least N chunks per worker so small
     // datasets don't end up with one-chunk-per-pod.
     let parallelism_target = workers * PARALLELISM_TARGET_PER_WORKER;
-    let max_for_parallelism = if parallelism_target > 0 {
-        (total_points / parallelism_target).max(MIN_CHUNK_POINTS)
-    } else {
-        u64::MAX
-    };
+    let max_for_parallelism = total_points
+        .checked_div(parallelism_target)
+        .map(|v| v.max(MIN_CHUNK_POINTS))
+        .unwrap_or(u64::MAX);
 
     let max_chunk = max_chunk_points(memory_budget);
     raw.min(max_for_parallelism)
