@@ -1124,7 +1124,12 @@ impl OctreeBuilder {
     }
 
     /// Read voxel data from a batch file at the given offset and size.
-    fn read_from_batch_file(&self, batch_id: usize, offset: u64, size: u64) -> Result<Vec<RawPoint>> {
+    fn read_from_batch_file(
+        &self,
+        batch_id: usize,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<RawPoint>> {
         let batch_path = self.batch_file_path(batch_id);
         let mut f = File::open(&batch_path)
             .with_context(|| format!("opening batch file {:?}", batch_path))?;

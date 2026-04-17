@@ -74,6 +74,59 @@ fn encode_point(rp: &RawPoint, fmt: u8, buf: &mut Vec<u8>) {
     }
 }
 
+/// Result of encoding a single node.
+type NodeEncoding = (VoxelKey, Vec<u8>, [u64; 15], f64, f64, Vec<f64>);
+
+/// Encode a single node: read points, sort by GPS time, encode to bytes.
+/// Returns encoded data and statistics (return counts, GPS time range, temporal samples).
+fn encode_node(
+    builder: &OctreeBuilder,
+    key: &VoxelKey,
+    point_format: u8,
+    point_record_len: u16,
+    temporal_index: bool,
+    temporal_stride: usize,
+) -> Result<NodeEncoding> {
+    let mut pts = builder.read_node(key)?;
+    pts.sort_unstable_by(|a, b| {
+        a.gps_time
+            .partial_cmp(&b.gps_time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut local_returns = [0u64; 15];
+    let mut local_gps_min = f64::MAX;
+    let mut local_gps_max = f64::MIN;
+    let mut samples = Vec::new();
+    let mut raw_bytes = Vec::with_capacity(point_record_len as usize * pts.len());
+
+    for (i, rp) in pts.iter().enumerate() {
+        let rn = rp.return_number as usize;
+        if (1..=15).contains(&rn) {
+            local_returns[rn - 1] += 1;
+        }
+        if rp.gps_time < local_gps_min {
+            local_gps_min = rp.gps_time;
+        }
+        if rp.gps_time > local_gps_max {
+            local_gps_max = rp.gps_time;
+        }
+        if temporal_index && (i % temporal_stride == 0 || i == pts.len() - 1) {
+            samples.push(rp.gps_time);
+        }
+        encode_point(rp, point_format, &mut raw_bytes);
+    }
+
+    Ok((
+        *key,
+        raw_bytes,
+        local_returns,
+        local_gps_min,
+        local_gps_max,
+        samples,
+    ))
+}
+
 /// Write a complete COPC file to `output_path`.
 ///
 /// Reads nodes from temp files and compresses them in parallel using
@@ -366,10 +419,14 @@ pub fn write_copc(
     let temporal_index = config.temporal_index;
     let temporal_stride = config.temporal_stride as usize;
 
-    // Track successfully encoded vs failed nodes
+    // -----------------------------------------------------------------------
+    // Resilience: Track successfully encoded vs failed nodes
+    // -----------------------------------------------------------------------
+    // When temp files are corrupted (e.g., on HPC scratch filesystems), we
+    // skip the corrupted nodes and continue with partial data. This tracking
+    // allows us to map only successfully encoded nodes to the chunk table.
     let mut nodes_encoded: usize = 0;
     let mut nodes_failed: usize = 0;
-    // Track which keys were successfully encoded (for chunk table mapping)
     let mut encoded_keys: HashSet<VoxelKey> = HashSet::new();
 
     let mut batch_start = 0;
@@ -407,85 +464,59 @@ pub fn write_copc(
         // buffers are dropped inside each closure, so the memory that
         // survives into `results` is only the encoded Vec<u8> per node.
         //
-        // We use filter_map to skip nodes that fail to read (e.g., corrupted
-        // temp files on HPC scratch filesystems). This allows the conversion
-        // to complete with partial data rather than failing entirely.
-        type NodeResult = (VoxelKey, Vec<u8>, [u64; 15], f64, f64, Vec<f64>);
-        let results: Vec<NodeResult> = batch
+        // Resilience: We use filter_map to skip nodes that fail to encode
+        // (e.g., corrupted temp files). This allows the conversion to complete
+        // with partial data rather than failing entirely.
+        let results: Vec<NodeEncoding> = batch
             .par_iter()
-            .filter_map(|key| match builder.read_node(key) {
-                Ok(mut pts) => {
-                    pts.sort_unstable_by(|a, b| {
-                        a.gps_time
-                            .partial_cmp(&b.gps_time)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    let mut local_returns = [0u64; 15];
-                    let mut local_gps_min = f64::MAX;
-                    let mut local_gps_max = f64::MIN;
-                    let mut samples = Vec::new();
-                    let mut raw_bytes = Vec::with_capacity(point_record_len as usize * pts.len());
-                    for (i, rp) in pts.iter().enumerate() {
-                        let rn = rp.return_number as usize;
-                        if (1..=15).contains(&rn) {
-                            local_returns[rn - 1] += 1;
-                        }
-                        if rp.gps_time < local_gps_min {
-                            local_gps_min = rp.gps_time;
-                        }
-                        if rp.gps_time > local_gps_max {
-                            local_gps_max = rp.gps_time;
-                        }
-                        if temporal_index && (i % temporal_stride == 0 || i == pts.len() - 1) {
-                            samples.push(rp.gps_time);
-                        }
-                        encode_point(rp, point_format, &mut raw_bytes);
-                    }
-                    Some((
-                        *key,
-                        raw_bytes,
-                        local_returns,
-                        local_gps_min,
-                        local_gps_max,
-                        samples,
-                    ))
-                }
-                Err(e) => {
+            .filter_map(|key| {
+                encode_node(
+                    builder,
+                    key,
+                    point_format,
+                    point_record_len,
+                    temporal_index,
+                    temporal_stride,
+                )
+                .map_err(|e| {
                     error!(
                         "Skipping corrupted node (level={}, x={}, y={}, z={}): {}",
                         key.level, key.x, key.y, key.z, e
                     );
-                    None
-                }
+                })
+                .ok()
             })
             .collect();
 
-        // Drain per-node stats into the running aggregates, and split the
-        // encoded bytes out into a separate Vec so we can drop it in
-        // mini-batch chunks without holding onto the NodeResult tuples.
+        // Accumulate statistics and track successfully encoded nodes.
+        // Resilience: Track which nodes were successfully encoded vs failed.
         let batch_size = batch.len();
         let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(results.len());
         let mut actual_encoded_bytes: u64 = 0;
-        for (_key, bytes, local_returns, local_min, local_max, samples) in results.into_iter() {
+
+        for (key, bytes, local_returns, local_min, local_max, samples) in results.into_iter() {
+            // Aggregate return counts
             for j in 0..15 {
                 return_counts[j] += local_returns[j];
             }
+            // Track GPS time range
             if local_min < gpstime_min {
                 gpstime_min = local_min;
             }
             if local_max > gpstime_max {
                 gpstime_max = local_max;
             }
+            // Store temporal samples
             if temporal_index {
-                temporal_entries.push(TemporalIndexEntry { key: _key, samples });
+                temporal_entries.push(TemporalIndexEntry { key, samples });
             }
+            // Track size and mark as successfully encoded
             actual_encoded_bytes += bytes.len() as u64;
             encoded.push(bytes);
-            // Track that this key was successfully encoded
-            encoded_keys.insert(_key);
+            encoded_keys.insert(key);
         }
 
-        // Track success vs failure counts
+        // Update failure tracking
         nodes_encoded += encoded.len();
         nodes_failed += batch_size - encoded.len();
 
@@ -580,6 +611,9 @@ pub fn write_copc(
     // -----------------------------------------------------------------------
     // Build chunk_info for the hierarchy EVLR
     // -----------------------------------------------------------------------
+    // Resilience: Nodes that failed to encode are marked as empty (offset=0,
+    // byte_size=0, point_count=0) in the hierarchy. This allows the COPC file
+    // to remain valid even when some temp files are corrupted.
     let first_chunk_start = offset_to_point_data as u64 + 8;
     let mut current_offset = first_chunk_start;
     let mut chunk_info: Vec<(VoxelKey, u64, i32, i32)> = Vec::new();
