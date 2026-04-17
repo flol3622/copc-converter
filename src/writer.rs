@@ -335,11 +335,14 @@ pub fn write_copc(
     // budget allows (maximum CPU utilization); Phase 2 memory is capped at a
     // few hundred MB regardless of batch size.
     //
-    // Fragmentation safety factor (1.3×) accounts for heap fragmentation
-    // during heavy Vec allocation churn in long-running Rust processes.
-    // Empirically calibrated to match observed peak RSS on large runs
-    // (~28% overshoot vs the naive estimate).
-    const FRAGMENTATION_FACTOR: u64 = 13; // 1.3× as integer math
+    // Fragmentation safety factor accounts for everything the
+    // `batch_points × point_record_len` naive estimate misses: concurrent
+    // RawPoint worker buffers held during parallel encoding, the NodeResult
+    // tuple overhead in the rayon output Vec, per-node temporal sample Vecs
+    // (when the temporal index is enabled), Phase 2 compressor scratch, and
+    // allocator retention across many batches. 2× gives genuine headroom
+    // without halving batch size so aggressively that wall-time suffers.
+    const FRAGMENTATION_FACTOR: u64 = 20; // 2.0× as integer math
     let phase1_bytes_per_point = (point_record_len as u64 * FRAGMENTATION_FACTOR).div_ceil(10);
 
     // Mini-batch size for Phase 2. 32 nodes is enough to keep laz's internal

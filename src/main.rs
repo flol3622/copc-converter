@@ -7,6 +7,14 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+// glibc's default allocator retains freed memory in per-arena caches and
+// rarely returns pages to the OS, which caused monotonic RSS growth across
+// the writer's batched alloc/free cycles on multi-billion-point inputs.
+// mimalloc aggressively trims freed allocations back to the OS and handles
+// the high-churn multi-threaded workload better for this pipeline.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Maximum fraction of the stated memory limit to actually use.
 const MEMORY_SAFETY_FACTOR: f64 = 0.75;
 
