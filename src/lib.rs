@@ -15,6 +15,7 @@
 //!     progress: None,
 //!     chunk_target_override: None,
 //!     temp_compression: copc_converter::TempCompression::None,
+//!     node_storage: copc_converter::NodeStorage::Files,
 //! };
 //! let files = copc_converter::collect_input_files("input.laz".into()).unwrap();
 //!
@@ -26,6 +27,7 @@
 //! ```
 
 pub(crate) mod copc_types;
+pub(crate) mod node_store;
 pub(crate) mod octree;
 pub(crate) mod validate;
 pub(crate) mod writer;
@@ -170,6 +172,25 @@ pub enum TempCompression {
     Lz4,
 }
 
+/// Storage layout for per-node point data during the build stage.
+///
+/// Large conversions can create hundreds of thousands of octree nodes.
+/// Picking the right backend depends on whether the scratch filesystem
+/// is constrained by disk space or by inode count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NodeStorage {
+    /// One temp file per node (default). Zero dead space, simplest
+    /// layout. Inode-hungry — can exhaust the inode budget on shared
+    /// scratch filesystems with inode limits.
+    #[default]
+    Files,
+    /// One append-only pack file per rayon worker plus an in-memory
+    /// key → location index. Uses a handful of files regardless of node
+    /// count; trades disk space for inodes because overwrites during
+    /// merge leak dead space into the pack files.
+    Packed,
+}
+
 /// Configuration for the conversion pipeline.
 pub struct PipelineConfig {
     /// Effective memory budget in bytes.
@@ -189,6 +210,8 @@ pub struct PipelineConfig {
     pub chunk_target_override: Option<u64>,
     /// Compression codec for scratch temp files.
     pub temp_compression: TempCompression,
+    /// Storage layout for per-node point data during build.
+    pub node_storage: NodeStorage,
 }
 
 impl PipelineConfig {

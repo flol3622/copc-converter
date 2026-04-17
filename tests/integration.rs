@@ -848,6 +848,42 @@ fn low_memory_produces_valid_output() {
     let _ = std::fs::remove_file(output);
 }
 
+/// Same end-to-end path as `low_memory_produces_valid_output`, but with
+/// `--node-storage packed` so the pack-file backend runs through the full
+/// build + merge + writer pipeline.
+#[test]
+fn packed_storage_produces_valid_output() {
+    let output = Path::new("tests/data/test_packed_storage.copc.laz");
+    run_converter_with_args(
+        Path::new("tests/data/input.laz"),
+        output,
+        &["--memory-limit", "1M", "--node-storage", "packed"],
+    );
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let reference = read_file(Path::new("tests/data/untwine_reference.copc.laz"));
+    let ref_header = read_las_header(&reference);
+
+    assert_eq!(
+        header.total_points, ref_header.total_points,
+        "total points must match reference with packed storage"
+    );
+
+    let hier = read_hierarchy(&data);
+    let hier_total: i64 = hier
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as i64)
+        .sum();
+    assert_eq!(
+        hier_total, header.total_points as i64,
+        "hierarchy point sum must match header with packed storage"
+    );
+
+    let _ = std::fs::remove_file(output);
+}
+
 // ---------------------------------------------------------------------------
 // copc-streaming / copc-temporal round-trip test
 // ---------------------------------------------------------------------------

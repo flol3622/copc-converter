@@ -61,20 +61,45 @@ copc_converter ./tiles/ merged.copc.laz
 | `--temporal-stride` | Sampling stride for the temporal index (every n-th point) | `1000` |
 | `--progress` | Progress output format: `bar`, `plain`, or `json` | `bar` |
 | `--temp-compression` | Compress scratch temp files: `none` or `lz4` | `none` |
+| `--node-storage` | Per-node temp layout: `files` or `packed` | `files` |
 
-#### Temp file compression
+#### Temp file compression and node storage layout
 
-Chunked-build scratch files hold `RawPoint` records (38 bytes each) and are
-highly compressible. On a large run (tens of billions of points) the temp
-directory can approach the full raw-point footprint, which becomes the
-limiting resource on space-constrained workers.
+Large conversions create a lot of scratch data. Two independent knobs
+shape the temp directory's footprint:
 
-`--temp-compression=lz4` wraps each temp-file write in a self-contained LZ4
-frame. Expect roughly a 3-4× reduction in scratch-disk usage at a modest CPU
-cost (LZ4 compresses at >1 GB/s per core). On fast local NVMe this trades CPU
-for disk without a clear wall-time win; on network filesystems (EFS/NFS) it
-typically also reduces wall time because the bottleneck shifts from I/O to
-compute.
+- **`--temp-compression`** controls the on-disk encoding of each batch of
+  `RawPoint` records. `none` (default) writes raw bytes; `lz4` wraps each
+  batch in a self-contained LZ4 frame. LZ4 compresses at >1 GB/s per core
+  so CPU cost is modest, and on network filesystems (EFS/NFS) it often
+  reduces wall time because the bottleneck shifts from I/O to compute.
+- **`--node-storage`** controls the filesystem layout of per-node point
+  data during build. `files` (default) writes a separate file per octree
+  node; on very large inputs node counts reach the hundred-thousands,
+  which can exhaust inode budgets on shared scratch filesystems.
+  `packed` writes all node data into a handful of append-only pack files
+  (one per worker thread) with an in-memory key→offset index,
+  independent of node count.
+
+Both flags can be combined freely.
+
+**Measured on a 168M-point / 701 MB LAZ input, 32 GB budget:**
+
+| `--node-storage` | `--temp-compression` | wall  | peak inodes | peak temp bytes | output   |
+|------------------|----------------------|-------|-------------|-----------------|----------|
+| files            | none                 | 61.7s | 6 716       | 12 161 MB       | 1028 MB  |
+| files            | lz4                  | 71.3s | 6 716       |  5 848 MB       | 1028 MB  |
+| packed           | none                 | 66.7s | 76          | 11 894 MB       | 1028 MB  |
+| packed           | lz4                  | 73.8s | 76          |  5 849 MB       | 1028 MB  |
+
+LZ4 cuts peak temp bytes by ~52% regardless of storage mode; packed cuts
+peak inodes by ~99% regardless of compression. Output is byte-identical
+across all four combinations (within hash-order noise of a few KB). Dead
+space from pack-file overwrites was not observable on this workload.
+
+Use `packed` when the scratch filesystem has an inode limit, `lz4` when
+it is space-constrained, and both together for the most disk-friendly
+run on a modest wall-time budget.
 
 ### Examples
 

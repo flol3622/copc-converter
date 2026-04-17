@@ -16,6 +16,7 @@
 /// Memory usage is bounded by the configurable memory budget.
 use crate::PipelineConfig;
 use crate::copc_types::VoxelKey;
+use crate::node_store::{FileNodeStore, NodeStore, PackedNodeStore};
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rayon::prelude::*;
@@ -23,6 +24,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
 
@@ -465,7 +467,7 @@ impl<R: std::io::Read> std::io::Read for MultiFrameReader<R> {
 /// Write a single batch: a 4-byte little-endian point count followed by
 /// `points.len() × RawPoint::BYTE_SIZE` payload bytes. If `codec` is
 /// `Lz4`, the entire batch is encapsulated in a self-contained LZ4 frame.
-fn write_temp_batch<W: Write>(
+pub(crate) fn write_temp_batch<W: Write>(
     w: &mut W,
     points: &[RawPoint],
     codec: TempCompression,
@@ -489,7 +491,10 @@ fn write_temp_batch<W: Write>(
 /// For `Lz4` the reader is wrapped in a `FrameDecoder` + `MultiFrameReader`,
 /// which together walk multi-frame streams transparently. An empty reader
 /// produces an empty Vec.
-fn read_temp_batches<R: std::io::Read>(r: R, codec: TempCompression) -> Result<Vec<RawPoint>> {
+pub(crate) fn read_temp_batches<R: std::io::Read>(
+    r: R,
+    codec: TempCompression,
+) -> Result<Vec<RawPoint>> {
     match codec {
         TempCompression::None => read_batches_loop(&mut BufReader::new(r)),
         TempCompression::Lz4 => {
@@ -553,7 +558,7 @@ fn stream_temp_batches<R: std::io::Read, F: FnMut(RawPoint) -> Result<()>>(
 /// cheap way to skip a compressed payload, so we run the decoder and count
 /// headers (still cheaper than materialising all points — payload bytes are
 /// streamed through a throwaway sink). Returns 0 if the file does not exist.
-fn count_temp_file_points(path: &Path, codec: TempCompression) -> Result<u64> {
+pub(crate) fn count_temp_file_points(path: &Path, codec: TempCompression) -> Result<u64> {
     let f = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -841,6 +846,9 @@ pub struct OctreeBuilder {
     pub(crate) chunked_plan: Option<crate::chunking::ChunkPlan>,
     /// Compression codec applied to scratch temp files.
     pub(crate) temp_compression: crate::TempCompression,
+    /// Storage backend for per-node point data. `Arc` so rayon workers
+    /// share a single instance.
+    pub(crate) node_store: Arc<dyn NodeStore>,
 }
 
 impl OctreeBuilder {
@@ -953,6 +961,17 @@ impl OctreeBuilder {
         }
         std::fs::create_dir_all(&tmp_dir)?;
 
+        let node_store: Arc<dyn NodeStore> = match config.node_storage {
+            crate::NodeStorage::Files => {
+                Arc::new(FileNodeStore::new(tmp_dir.clone(), config.temp_compression))
+            }
+            crate::NodeStorage::Packed => Arc::new(PackedNodeStore::new(
+                &tmp_dir,
+                config.temp_compression,
+                rayon::current_num_threads().max(1),
+            )?),
+        };
+
         Ok(OctreeBuilder {
             bounds,
             total_points,
@@ -971,13 +990,14 @@ impl OctreeBuilder {
             point_format: validated.point_format,
             chunked_plan: None,
             temp_compression: config.temp_compression,
+            node_store,
         })
     }
 
-    /// Path for a node's temp file.
-    fn node_path(&self, key: &VoxelKey) -> PathBuf {
-        self.tmp_dir
-            .join(format!("{}_{}_{}_{}", key.level, key.x, key.y, key.z))
+    /// Point count for a given node key, consulting the active node store.
+    /// Returns 0 when the key has never been written.
+    pub(crate) fn count_node(&self, key: &VoxelKey) -> Result<u64> {
+        self.node_store.count(key)
     }
 
     /// Convert a `las::Point` to a `RawPoint` using the builder's scale/offset.
@@ -1004,26 +1024,15 @@ impl OctreeBuilder {
         }
     }
 
-    /// Read all raw points for a given node key from disk.
+    /// Read all raw points for a given node key from the active node store.
+    /// Returns an empty Vec when the key has never been written.
     pub fn read_node(&self, key: &VoxelKey) -> Result<Vec<RawPoint>> {
-        let path = self.node_path(key);
-        let f = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(e) => return Err(e.into()),
-        };
-        read_temp_batches(f, self.temp_compression)
+        self.node_store.read(key)
     }
 
-    /// Write points to a temp file for the given node key (overwrites if
-    /// exists). Always writes exactly one batch, even for an empty slice.
+    /// Write points for the given node key (overwrites any prior content).
     pub fn write_node_to_temp(&self, key: &VoxelKey, points: &[RawPoint]) -> Result<()> {
-        let path = self.node_path(key);
-        let f = File::create(&path)?;
-        let mut w = BufWriter::new(f);
-        write_temp_batch(&mut w, points, self.temp_compression)?;
-        w.flush().context("flush node temp file")?;
-        Ok(())
+        self.node_store.write(key, points)
     }
 
     /// Bottom-up grid-sample loop over an in-memory `nodes` HashMap.
@@ -1139,114 +1148,6 @@ impl OctreeBuilder {
             .filter(|(_, pts)| !pts.is_empty())
             .map(|(k, pts)| (*k, pts.len()))
             .collect())
-    }
-
-    /// Streaming grid-sample for a single oversized parent.
-    ///
-    /// Used as a fallback by `merge_chunk_tops` when a parent group's combined
-    /// child points exceed the memory budget. Processes one child at a time so
-    /// only one child's points are ever in memory. The grid occupancy set
-    /// (max 128³ entries ≈ 48 MB) and the parent accumulator (max 128³ points
-    /// ≈ 80 MB) stay resident; everything else is streamed from/to disk.
-    ///
-    /// In practice this path is rarely hit for well-formed chunk plans
-    /// (merge-sparse-cells sizes chunks to fit the budget by construction),
-    /// but it's kept as a safety net for degenerate inputs.
-    ///
-    /// Tradeoff: points are not Morton-sorted across children, so spatial
-    /// coherence of the parent is slightly worse than in-memory grid_sample.
-    fn grid_sample_streaming(&self, parent: &VoxelKey, children: &[VoxelKey]) -> Result<()> {
-        let voxel_size_world = 2.0 * self.halfsize / (1u64 << parent.level) as f64;
-        let origin_x = ((self.cx - self.halfsize + parent.x as f64 * voxel_size_world
-            - self.offset_x)
-            / self.scale_x)
-            .round() as i64;
-        let origin_y = ((self.cy - self.halfsize + parent.y as f64 * voxel_size_world
-            - self.offset_y)
-            / self.scale_y)
-            .round() as i64;
-        let origin_z = ((self.cz - self.halfsize + parent.z as f64 * voxel_size_world
-            - self.offset_z)
-            / self.scale_z)
-            .round() as i64;
-        let int_size =
-            (voxel_size_world / self.scale_x.min(self.scale_y).min(self.scale_z)).round() as i64;
-        let cell = (int_size / GRID_CELLS_PER_AXIS).max(1);
-
-        let grid_key = |p: &RawPoint| -> (i32, i32, i32) {
-            (
-                ((p.x as i64 - origin_x) / cell) as i32,
-                ((p.y as i64 - origin_y) / cell) as i32,
-                ((p.z as i64 - origin_z) / cell) as i32,
-            )
-        };
-
-        let max_accepted =
-            (GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS) as usize;
-        let mut occupied: HashSet<(i32, i32, i32)> = HashSet::new();
-        let mut parent_pts: Vec<RawPoint> = Vec::new();
-
-        // Track which children had points, to guarantee at least one per child.
-        let mut child_donated: Vec<bool> = vec![false; children.len()];
-
-        // Pass 1: iterate children one at a time, accept points into the parent
-        // grid, write remaining back to the child's temp file.
-        for (ci, ck) in children.iter().enumerate() {
-            let pts = self.read_node(ck)?;
-            if pts.is_empty() {
-                continue;
-            }
-            debug!(
-                "    streaming child {}/{}: {:?} → {} points ({} MB), grid {}/{} full",
-                ci + 1,
-                children.len(),
-                ck,
-                pts.len(),
-                (pts.len() * std::mem::size_of::<RawPoint>()) / 1_048_576,
-                occupied.len(),
-                max_accepted,
-            );
-            let mut remaining: Vec<RawPoint> = Vec::new();
-            for p in pts {
-                if parent_pts.len() < max_accepted && occupied.insert(grid_key(&p)) {
-                    child_donated[ci] = true;
-                    parent_pts.push(p);
-                } else {
-                    remaining.push(p);
-                }
-            }
-            // If this child had points but none remain (all promoted), we need to
-            // return at least one. Done in pass 2 below.
-            if remaining.is_empty() && child_donated[ci] {
-                // Will be fixed in pass 2.
-                child_donated[ci] = false;
-            }
-            self.write_node_to_temp(ck, &remaining)?;
-        }
-
-        // Pass 2: guarantee every child that contributed keeps at least one point.
-        for (ci, ck) in children.iter().enumerate() {
-            if !child_donated[ci] {
-                // Check if this child originally had points (file might now be
-                // empty because all were promoted).
-                let n =
-                    count_temp_file_points(&self.node_path(ck), self.temp_compression).unwrap_or(0);
-                if n == 0 && !parent_pts.is_empty() {
-                    // Return one point from the parent back to this child.
-                    // Find the last parent point that came from any child — we
-                    // can't track origin in the streaming path, so just pop the last.
-                    if let Some(p) = parent_pts.pop() {
-                        self.write_node_to_temp(ck, &[p])?;
-                    }
-                }
-            }
-        }
-
-        if !parent_pts.is_empty() {
-            self.write_node_to_temp(parent, &parent_pts)?;
-        }
-
-        Ok(())
     }
 
     /// Grid-based spatial sampling for one parent node.
@@ -1813,10 +1714,7 @@ impl OctreeBuilder {
             for (parent, children) in parent_children {
                 let est_points: u64 = children
                     .iter()
-                    .map(|ck| {
-                        count_temp_file_points(&self.node_path(ck), self.temp_compression)
-                            .unwrap_or(0)
-                    })
+                    .map(|ck| self.count_node(ck).unwrap_or(0))
                     .sum();
                 let est_mem = est_points * MEM_PER_POINT;
                 if est_mem > config.memory_budget {
@@ -1836,22 +1734,21 @@ impl OctreeBuilder {
                 config.memory_budget / 1_048_576,
             );
 
-            if !large_parents.is_empty() {
-                // Should not happen with a well-formed chunk plan, but if it
-                // does, fall back to grid_sample_streaming which is bounded
-                // (one child at a time, ~80 MB per parent for the grid set
-                // and accumulator).
-                for (parent, children, est_mem) in &large_parents {
-                    debug!(
-                        "  STREAMING merge parent {:?}: {} children, est {} MB",
-                        parent,
-                        children.len(),
-                        est_mem / 1_048_576
-                    );
-                    self.grid_sample_streaming(parent, children)?;
-                    all_new_parents.push(*parent);
-                    keys_by_level.entry(d).or_default().insert(*parent);
-                }
+            if let Some((parent, children, est_mem)) = large_parents.first() {
+                // Chunks are sized by `merge_sparse_cells` to fit the
+                // memory budget, so a parent whose combined children
+                // exceed it signals either a pathological chunk plan or a
+                // memory budget set too low for the input. Bail out with
+                // a message the user can act on.
+                return Err(anyhow::anyhow!(
+                    "merge parent {:?} has {} children with combined estimate {} MB, \
+                     exceeding memory budget {} MB. Raise --memory-limit or investigate \
+                     the chunk plan.",
+                    parent,
+                    children.len(),
+                    est_mem / 1_048_576,
+                    config.memory_budget / 1_048_576,
+                ));
             }
 
             // Sort small parents by descending estimated memory so the
@@ -2047,7 +1944,7 @@ impl OctreeBuilder {
         let mut result: Vec<(VoxelKey, usize)> = all_keys
             .par_iter()
             .map(|k| -> Result<(VoxelKey, usize)> {
-                let n = count_temp_file_points(&self.node_path(k), self.temp_compression)? as usize;
+                let n = self.count_node(k)? as usize;
                 Ok((*k, n))
             })
             .collect::<Result<Vec<_>>>()?;

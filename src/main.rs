@@ -65,6 +65,16 @@ struct Args {
     /// network filesystems.
     #[arg(long, value_enum, default_value_t = TempCompressionArg::None)]
     temp_compression: TempCompressionArg,
+
+    /// Storage layout for per-node point data during build. "files"
+    /// (default) writes one temp file per octree node; simple and zero
+    /// dead space but can create 100k+ files on very large inputs.
+    /// "packed" writes all node data into a handful of pack files with
+    /// an in-memory index — use this when the scratch filesystem has
+    /// inode limits (shared storage). Trades disk space for inodes:
+    /// overwrites during merge leak dead space into the packs.
+    #[arg(long, value_enum, default_value_t = NodeStorageArg::Files)]
+    node_storage: NodeStorageArg,
 }
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -79,6 +89,22 @@ impl From<TempCompressionArg> for TempCompression {
         match a {
             TempCompressionArg::None => TempCompression::None,
             TempCompressionArg::Lz4 => TempCompression::Lz4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum NodeStorageArg {
+    #[default]
+    Files,
+    Packed,
+}
+
+impl From<NodeStorageArg> for copc_converter::NodeStorage {
+    fn from(a: NodeStorageArg) -> Self {
+        match a {
+            NodeStorageArg::Files => copc_converter::NodeStorage::Files,
+            NodeStorageArg::Packed => copc_converter::NodeStorage::Packed,
         }
     }
 }
@@ -522,6 +548,7 @@ fn main() -> Result<()> {
         progress: Some(progress),
         chunk_target_override: args.chunk_target,
         temp_compression: args.temp_compression.into(),
+        node_storage: args.node_storage.into(),
     };
 
     let distributed = Pipeline::scan(&input_files, config)?

@@ -416,6 +416,7 @@ fn main() -> Result<()> {
         // than via the PipelineConfig field used by the convert path.
         chunk_target_override: None,
         temp_compression: copc_converter::TempCompression::None,
+        node_storage: copc_converter::NodeStorage::Files,
     };
 
     // Run scan + validate via the standard pipeline so the analyzer sees the
