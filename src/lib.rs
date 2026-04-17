@@ -27,6 +27,7 @@
 //! ```
 
 pub(crate) mod copc_types;
+pub(crate) mod hierarchy_pages;
 pub(crate) mod node_store;
 pub(crate) mod octree;
 pub(crate) mod validate;

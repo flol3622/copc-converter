@@ -169,30 +169,38 @@ fn read_copc_info(data: &[u8]) -> CopcInfo {
     }
 }
 
+/// Read all hierarchy entries, recursively following child-page pointers
+/// (entries with `point_count == -1`). Only leaf (data + empty-ancestor)
+/// entries are returned; subpage pointers are consumed internally.
 fn read_hierarchy(data: &[u8]) -> Vec<HierarchyEntry> {
     let info = read_copc_info(data);
-    let offset = info.root_hier_offset as usize;
-    let size = info.root_hier_size as usize;
-    let payload = &data[offset..offset + size];
-    let mut r = Cursor::new(payload);
     let mut entries = Vec::new();
-
-    while r.position() < size as u64 {
-        let key = VoxelKey {
-            level: r.read_i32::<LittleEndian>().unwrap(),
-            x: r.read_i32::<LittleEndian>().unwrap(),
-            y: r.read_i32::<LittleEndian>().unwrap(),
-            z: r.read_i32::<LittleEndian>().unwrap(),
-        };
-        let entry_offset = r.read_u64::<LittleEndian>().unwrap();
-        let byte_size = r.read_i32::<LittleEndian>().unwrap();
-        let point_count = r.read_i32::<LittleEndian>().unwrap();
-        entries.push(HierarchyEntry {
-            key,
-            offset: entry_offset,
-            byte_size,
-            point_count,
-        });
+    let mut queue: Vec<(u64, u64)> = vec![(info.root_hier_offset, info.root_hier_size)];
+    while let Some((page_offset, page_size)) = queue.pop() {
+        let page = &data[page_offset as usize..(page_offset + page_size) as usize];
+        let mut r = Cursor::new(page);
+        while r.position() < page_size {
+            let key = VoxelKey {
+                level: r.read_i32::<LittleEndian>().unwrap(),
+                x: r.read_i32::<LittleEndian>().unwrap(),
+                y: r.read_i32::<LittleEndian>().unwrap(),
+                z: r.read_i32::<LittleEndian>().unwrap(),
+            };
+            let entry_offset = r.read_u64::<LittleEndian>().unwrap();
+            let byte_size = r.read_i32::<LittleEndian>().unwrap();
+            let point_count = r.read_i32::<LittleEndian>().unwrap();
+            if point_count == -1 {
+                // Child-page pointer: recurse.
+                queue.push((entry_offset, byte_size as u64));
+            } else {
+                entries.push(HierarchyEntry {
+                    key,
+                    offset: entry_offset,
+                    byte_size,
+                    point_count,
+                });
+            }
+        }
     }
     entries
 }
@@ -1203,6 +1211,141 @@ fn temp_compression_lz4_multi_chunk_preserves_all_points() {
         max_level >= 3,
         "lz4 multi-chunk test must produce a multi-level tree (got max_level={})",
         max_level
+    );
+
+    let _ = std::fs::remove_file(output);
+}
+
+// ---------------------------------------------------------------------------
+// Paged hierarchy tests (issue #12)
+// ---------------------------------------------------------------------------
+
+/// Walk the root hierarchy page only and return `(leaf_entries, subpage_pointers)`.
+fn parse_root_page_only(data: &[u8]) -> (Vec<HierarchyEntry>, Vec<(u64, u64)>) {
+    let info = read_copc_info(data);
+    let page = &data
+        [info.root_hier_offset as usize..(info.root_hier_offset + info.root_hier_size) as usize];
+    let mut r = Cursor::new(page);
+    let mut leaves = Vec::new();
+    let mut pointers = Vec::new();
+    while r.position() < info.root_hier_size {
+        let key = VoxelKey {
+            level: r.read_i32::<LittleEndian>().unwrap(),
+            x: r.read_i32::<LittleEndian>().unwrap(),
+            y: r.read_i32::<LittleEndian>().unwrap(),
+            z: r.read_i32::<LittleEndian>().unwrap(),
+        };
+        let off = r.read_u64::<LittleEndian>().unwrap();
+        let bsize = r.read_i32::<LittleEndian>().unwrap();
+        let pcount = r.read_i32::<LittleEndian>().unwrap();
+        if pcount == -1 {
+            pointers.push((off, bsize as u64));
+        } else {
+            leaves.push(HierarchyEntry {
+                key,
+                offset: off,
+                byte_size: bsize,
+                point_count: pcount,
+            });
+        }
+    }
+    (leaves, pointers)
+}
+
+/// Count all hierarchy pages in a COPC file by walking every referenced
+/// subpage from the root.
+fn count_hierarchy_pages(data: &[u8]) -> usize {
+    let info = read_copc_info(data);
+    let mut queue: Vec<(u64, u64)> = vec![(info.root_hier_offset, info.root_hier_size)];
+    let mut pages = 0;
+    while let Some((off, size)) = queue.pop() {
+        pages += 1;
+        let page = &data[off as usize..(off + size) as usize];
+        let mut r = Cursor::new(page);
+        while r.position() < size {
+            r.seek(SeekFrom::Current(16)).unwrap(); // skip VoxelKey
+            let entry_offset = r.read_u64::<LittleEndian>().unwrap();
+            let byte_size = r.read_i32::<LittleEndian>().unwrap();
+            let point_count = r.read_i32::<LittleEndian>().unwrap();
+            if point_count == -1 {
+                queue.push((entry_offset, byte_size as u64));
+            }
+        }
+    }
+    pages
+}
+
+/// Even on the tiny reference tileset there shouldn't be a regression:
+/// the root page is only as large as strictly required to reach every leaf.
+#[test]
+fn hierarchy_root_page_is_readable() {
+    let output = Path::new("tests/data/test_hier_root_page.copc.laz");
+    run_converter(Path::new("tests/data/input.laz"), output);
+
+    let data = read_file(output);
+    let (leaves, pointers) = parse_root_page_only(&data);
+    let all = read_hierarchy(&data);
+
+    // The root page alone must expose every leaf reachable via subpage
+    // pointers and the leaves it contains directly.
+    let root_leaf_keys: std::collections::HashSet<_> =
+        leaves.iter().map(|e| e.key.clone()).collect();
+    let pointer_count = pointers.len();
+
+    // The COPC info's `root_hier_size` points at exactly one page, so its
+    // total contents are either leaves or pointers.
+    let page_entries = root_leaf_keys.len() + pointer_count;
+    let info = read_copc_info(&data);
+    assert_eq!(
+        page_entries as u64 * 32,
+        info.root_hier_size,
+        "root page entry count must fill the declared page size"
+    );
+
+    // Every leaf in the root page must appear in the fully-walked hierarchy.
+    for leaf in &leaves {
+        assert!(
+            all.iter().any(|e| e.key == leaf.key),
+            "root-page leaf {:?} missing from full walk",
+            leaf.key
+        );
+    }
+
+    let _ = std::fs::remove_file(output);
+}
+
+/// Force a deep, node-dense octree by lowering `--chunk-target`; verify the
+/// writer then emits more than one hierarchy page. This is the regression
+/// test for issue #12 (29 MB single-page hierarchy crashing Potree).
+#[test]
+fn hierarchy_splits_into_multiple_pages_on_deep_trees() {
+    let output = Path::new("tests/data/test_hier_paged.copc.laz");
+    // Chunk target of 100 points forces many small nodes, producing enough
+    // descendants at level-4 subtrees to trigger paging.
+    run_converter_with_args(
+        Path::new("tests/data/input.laz"),
+        output,
+        &["--chunk-target", "100"],
+    );
+
+    let data = read_file(output);
+    let pages = count_hierarchy_pages(&data);
+    assert!(
+        pages >= 2,
+        "expected at least 2 hierarchy pages on a dense tree, got {pages}"
+    );
+
+    // And the complete walk must still see every node.
+    let header = read_las_header(&data);
+    let hier = read_hierarchy(&data);
+    let total: u64 = hier
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as u64)
+        .sum();
+    assert_eq!(
+        total, header.total_points,
+        "paged hierarchy must preserve every point"
     );
 
     let _ = std::fs::remove_file(output);

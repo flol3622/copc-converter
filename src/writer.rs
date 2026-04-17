@@ -19,9 +19,10 @@ use crate::PipelineConfig;
 /// compressed in parallel via compress_chunks(). The chunk table is read
 /// back from the file to recover per-chunk byte sizes for the hierarchy.
 use crate::copc_types::{
-    CopcInfo, EVLR_HEADER_SIZE, HierarchyEntry, TEMPORAL_HEADER_SIZE, TemporalIndexEntry,
-    TemporalIndexHeader, TemporalPagePointer, VoxelKey, write_evlr, write_vlr,
+    CopcInfo, EVLR_HEADER_SIZE, TEMPORAL_HEADER_SIZE, TemporalIndexEntry, TemporalIndexHeader,
+    TemporalPagePointer, VoxelKey, write_evlr, write_vlr,
 };
+use crate::hierarchy_pages::{ChunkEntry, build_paged_hierarchy};
 use crate::octree::{OctreeBuilder, RawPoint};
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -554,36 +555,51 @@ pub fn write_copc(
     // -----------------------------------------------------------------------
     let first_chunk_start = offset_to_point_data as u64 + 8;
     let mut current_offset = first_chunk_start;
-    let mut chunk_info: Vec<(VoxelKey, u64, i32, i32)> = Vec::new();
+    let mut chunk_info: Vec<ChunkEntry> = Vec::with_capacity(ordered_keys.len());
     let mut chunk_index = 0usize;
 
     for key in &ordered_keys {
         let pc = point_counts.get(key).copied().unwrap_or(0);
         if pc == 0 {
             // Empty ancestor: present in hierarchy for tree traversal but has no chunk.
-            chunk_info.push((*key, 0, 0, 0));
+            chunk_info.push(ChunkEntry {
+                key: *key,
+                offset: 0,
+                byte_size: 0,
+                point_count: 0,
+            });
         } else {
             let byte_size = chunk_table[chunk_index].byte_count;
-            chunk_info.push((*key, current_offset, byte_size as i32, pc as i32));
+            chunk_info.push(ChunkEntry {
+                key: *key,
+                offset: current_offset,
+                byte_size: byte_size as i32,
+                point_count: pc as i32,
+            });
             current_offset += byte_size;
             chunk_index += 1;
         }
     }
 
     // -----------------------------------------------------------------------
-    // EVLR: copc hierarchy
+    // EVLR: copc hierarchy (paged, following untwine's layout)
+    //
+    // The hierarchy is split into a tree of pages so large files don't force
+    // readers (e.g. Potree in a browser) to parse hundreds of thousands of
+    // entries up front. The root page stays small and references descendant
+    // subtrees by absolute file offset; each referenced page is concatenated
+    // into the same EVLR payload.
     // -----------------------------------------------------------------------
-
-    let mut hier_payload: Vec<u8> = Vec::with_capacity(chunk_info.len() * 32);
-    for (key, offset, byte_size, point_count) in &chunk_info {
-        HierarchyEntry {
-            key: *key,
-            offset: *offset,
-            byte_size: *byte_size,
-            point_count: *point_count,
-        }
-        .write(&mut hier_payload)?;
-    }
+    let hier_evlr_data_start = evlr_start + EVLR_HEADER_SIZE as u64;
+    let paged = build_paged_hierarchy(&chunk_info, hier_evlr_data_start)?;
+    let hier_payload = paged.payload;
+    let root_hier_size = paged.root_page_size;
+    debug!(
+        "Hierarchy EVLR: {} total bytes, root page {} bytes, {} entries",
+        hier_payload.len(),
+        root_hier_size,
+        chunk_info.len(),
+    );
 
     file.seek(SeekFrom::Start(evlr_start))?;
     let mut w = BufWriter::new(file);
@@ -624,8 +640,11 @@ pub fn write_copc(
         center_z: builder.cz,
         halfsize: builder.halfsize,
         spacing: builder.halfsize / (1u64 << actual_max_depth) as f64,
-        root_hier_offset: evlr_start + EVLR_HEADER_SIZE as u64,
-        root_hier_size: hier_payload.len() as u64,
+        // The root page always starts at the top of the EVLR data payload.
+        // Only its size is reported here; descendant pages are reached via
+        // subpage-pointer entries (see `hierarchy_pages`).
+        root_hier_offset: hier_evlr_data_start,
+        root_hier_size,
         gpstime_minimum: gpstime_min,
         gpstime_maximum: gpstime_max,
     };
