@@ -1053,16 +1053,15 @@ impl OctreeBuilder {
         let index_path = self.batch_index_path(batch_id);
 
         if index_path.exists() {
-            // Read from batched format
-            return self.read_node_batched(key, batch_id).with_context(|| {
-                format!(
-                    "Failed to read node (level={}, x={}, y={}, z={}) from batch {}",
-                    key.level, key.x, key.y, key.z, batch_id
-                )
-            });
+            return self.read_node_batched(key, batch_id);
         }
 
         // Fallback to legacy single-file format
+        self.read_node_legacy(key)
+    }
+
+    /// Read a node from the legacy single-file format.
+    fn read_node_legacy(&self, key: &VoxelKey) -> Result<Vec<RawPoint>> {
         let path = self.node_path(key);
         let f = match File::open(&path) {
             Ok(f) => f,
@@ -1079,10 +1078,25 @@ impl OctreeBuilder {
 
     /// Read a node from the batched temp file format.
     fn read_node_batched(&self, key: &VoxelKey, batch_id: usize) -> Result<Vec<RawPoint>> {
+        // Find the voxel's entry in the index
+        let entry = self.find_batch_entry(key, batch_id)?;
+
+        // If not found, return empty
+        let Some((offset, size)) = entry else {
+            return Ok(vec![]);
+        };
+
+        // Read the voxel data from the batch file
+        self.read_from_batch_file(batch_id, offset, size)
+    }
+
+    /// Find a voxel's entry in a batch index file.
+    /// Returns Some((offset, size)) if found, None if not in the index.
+    fn find_batch_entry(&self, key: &VoxelKey, batch_id: usize) -> Result<Option<(u64, u64)>> {
         let index_path = self.batch_index_path(batch_id);
         let index_data = match std::fs::read(&index_path) {
             Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
 
@@ -1102,43 +1116,35 @@ impl OctreeBuilder {
             let size = cursor.read_u64::<LittleEndian>()?;
 
             if level == key.level && x == key.x && y == key.y && z == key.z {
-                // Found the entry - read from batch file
-                let batch_path = self.batch_file_path(batch_id);
-                let mut f = File::open(&batch_path)
-                    .with_context(|| format!("Failed to open batch file {:?}", batch_path))?;
-
-                // Validate file size before reading
-                let file_size = f.metadata()?.len();
-                if offset + size > file_size {
-                    return Err(anyhow::anyhow!(
-                        "Temp file {:?} is truncated: expected at least {} bytes but file is only {} bytes \
-                         (voxel at level={}, x={}, y={}, z={}, offset={}, size={})",
-                        batch_path,
-                        offset + size,
-                        file_size,
-                        key.level,
-                        key.x,
-                        key.y,
-                        key.z,
-                        offset,
-                        size
-                    ));
-                }
-
-                use std::io::Seek;
-                f.seek(std::io::SeekFrom::Start(offset))?;
-                let mut limited = f.take(size);
-                return read_temp_batches(&mut limited, self.temp_compression).with_context(|| {
-                    format!(
-                        "Failed to read {} bytes at offset {} from batch file {:?}",
-                        size, offset, batch_path
-                    )
-                });
+                return Ok(Some((offset, size)));
             }
         }
 
-        // Not found in index
-        Ok(vec![])
+        Ok(None)
+    }
+
+    /// Read voxel data from a batch file at the given offset and size.
+    fn read_from_batch_file(&self, batch_id: usize, offset: u64, size: u64) -> Result<Vec<RawPoint>> {
+        let batch_path = self.batch_file_path(batch_id);
+        let mut f = File::open(&batch_path)
+            .with_context(|| format!("opening batch file {:?}", batch_path))?;
+
+        // Validate file size before reading
+        let file_size = f.metadata()?.len();
+        if offset + size > file_size {
+            return Err(anyhow::anyhow!(
+                "Batch file {:?} is truncated: expected {} bytes but only has {}",
+                batch_path,
+                offset + size,
+                file_size
+            ));
+        }
+
+        use std::io::Seek;
+        f.seek(std::io::SeekFrom::Start(offset))?;
+        let mut limited = f.take(size);
+        read_temp_batches(&mut limited, self.temp_compression)
+            .with_context(|| format!("reading {} bytes from {:?}", size, batch_path))
     }
 
     /// Write points to a temp file for the given node key (overwrites if
